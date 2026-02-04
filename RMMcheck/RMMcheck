@@ -1,0 +1,253 @@
+"""
+Missing Device Checker - RMMcheck2.py
+(Compares an Intune/Entra export against an RMM export to identify corporate
+ devices present in Intune but missing from RMM.)
+
+Author: Stuart Villanti <svillanti@kenstra.com>
+Date: 2025-08-06
+
+Key Decisions:
+- We define a device as “corporate” if it is either:
+    • joinType contains “JOINED” (and not “REGISTERED”), or
+    • Ownership == “CORPORATE”
+- We build lookup sets from RMM by both serial number and a normalized name key,
+  then flag any Intune corporate device that matches neither as missing.
+- Serial‐number matches take precedence; devices without serials fall back to name.
+- Sign-in timestamps are parsed in three passes (precise → ISO → relative) for
+  freshness filtering.
+"""
+
+import pandas as pd
+import os
+import traceback
+import tkinter as tk
+from tkinter import filedialog, messagebox
+import re
+
+# ------------------------------------------------------------------------------
+# Helper Functions
+# ------------------------------------------------------------------------------
+
+def parse_last_checkin(age_str: str) -> pd.Timestamp:
+    """Relative “HH:MM.SS” → absolute Timestamp; NaT on error."""
+    try:
+        hrs, rest = age_str.split(':', 1)
+        mins, secs = (rest.split('.', 1) + ['0'])[:2]
+        delta = pd.Timedelta(
+            hours=int(hrs),
+            minutes=int(mins),
+            seconds=float('0.' + secs) * 60
+        )
+        return pd.Timestamp.now() - delta
+    except:
+        return pd.NaT
+
+def standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Trim headers and map:
+      - Device/DisplayName → Device name
+      - serial…number      → Serial number
+      - Last check-in      → Last check-in
+      - any joinType/trustType variant → joinType
+    """
+    df.rename(columns=lambda c: c.strip(), inplace=True)
+    mapping = {}
+    for col in df.columns:
+        low = col.lower()
+        if low in ('device', 'displayname'):
+            mapping[col] = 'Device name'
+        elif 'serial' in low and 'number' in low:
+            mapping[col] = 'Serial number'
+        elif low == 'last check-in':
+            mapping[col] = 'Last check-in'
+        elif 'jointype' in low or 'trusttype' in low:
+            mapping[col] = 'joinType'
+    return df.rename(columns=mapping)
+
+def normalize(df: pd.DataFrame) -> pd.DataFrame:
+    """Uppercase & trim key fields; replace 'nan' with empty."""
+    df = standardize_columns(df)
+    for f in ('Device name','Serial number','Ownership','operatingSystem','joinType'):
+        if f in df.columns:
+            df[f] = (df[f].astype(str)
+                         .str.strip()
+                         .str.upper()
+                         .replace({'NAN': ''}))
+    return df
+
+def normalize_name(name: str) -> str:
+    """Make a simple key: uppercase, strip LAPTOP-/DESKTOP-, drop non-alphanum."""
+    nm = str(name).upper()
+    for p in ('LAPTOP-','DESKTOP-'):
+        if nm.startswith(p):
+            nm = nm[len(p):]
+    return re.sub(r'[^A-Z0-9]', '', nm).strip()
+
+# ------------------------------------------------------------------------------
+# Core Logic
+# ------------------------------------------------------------------------------
+
+def find_missing_devices(rmm_file: str, intune_file: str, output_file: str):
+    """
+    1. Load & normalize RMM export.
+    2. Ensure serial numbers exist & extract from Description if blank.
+    3. Load & normalize Intune/Entra export.
+    4. Filter to corporate devices (joinType='JOINED' OR Ownership='CORPORATE').
+    5. Parse LastSignInDT (precise → ISO → relative).
+    6. Drop stale (<2025-01-01) and non-Windows devices.
+    7. De-duplicate by Device name.
+    8. Flag as missing any device matching neither serial nor normalized name.
+    9. Write results or a “no missing” text file.
+    """
+    try:
+        # Step 1: RMM import & clean
+        rmm = pd.read_csv(rmm_file)
+        rmm = normalize(rmm)
+        rmm['Device name'] = rmm['Device name'].str.strip()
+        if 'Serial number' not in rmm.columns:
+            rmm['Serial number'] = ''
+        if 'Description' in rmm.columns:
+            blank = rmm['Serial number'].str.strip() == ''
+            extracted = (
+                rmm.loc[blank, 'Description']
+                   .str.extract(r'(?:S/N|SN)[:\s]*([A-Za-z0-9\-]+)', expand=False)
+                   .fillna('').str.upper().str.strip()
+            )
+            rmm.loc[blank, 'Serial number'] = extracted
+
+        # Build RMM lookup sets
+        serials = {s for s in rmm['Serial number']
+                   .dropna().str.strip().str.upper() if s}
+        rmm['NormalizedName'] = rmm['Device name'].apply(normalize_name)
+        names = set(rmm['NormalizedName'])
+
+        # Step 2: Intune/Entra import & clean
+        df = pd.read_csv(intune_file)
+        df = normalize(df)
+        if 'Serial number' not in df.columns:
+            df['Serial number'] = ''
+        if 'Ownership' not in df.columns:
+            df['Ownership'] = 'UNKNOWN'
+
+        # Step 3: Corporate filter
+        joined_mask = False
+        if 'joinType' in df.columns:
+            joined_mask = (
+                df['joinType'].str.contains('JOINED', na=False) &
+                ~df['joinType'].str.contains('REGISTERED', na=False)
+            )
+        corp = df[(joined_mask) | (df['Ownership'] == 'CORPORATE')].copy()
+
+        # Step 4: Parse LastSignInDT
+        if 'approximateLastSignInDateTime' in corp.columns:
+            corp['LastSignInDT'] = pd.to_datetime(
+                corp['approximateLastSignInDateTime'], errors='coerce'
+            )
+        if 'Last check-in' in corp.columns:
+            iso = pd.to_datetime(corp['Last check-in'], errors='coerce')
+            corp['LastSignInDT'] = iso
+            m = corp['LastSignInDT'].isna() & corp['Last check-in'].notna()
+            corp.loc[m, 'LastSignInDT'] = corp.loc[m, 'Last check-in'].apply(parse_last_checkin)
+        if 'LastSignInDT' not in corp.columns:
+            corp['LastSignInDT'] = pd.NaT
+
+        # Step 5: Drop stale & non-Windows
+        cutoff = pd.Timestamp(2025, 1, 1)
+        corp = corp[corp['LastSignInDT'] >= cutoff]
+        if 'operatingSystem' in corp.columns:
+            corp = corp[corp['operatingSystem'].str.contains('WINDOWS', na=False)]
+
+        # Step 6: De-duplicate
+        if 'Device name' in corp.columns:
+            corp.drop_duplicates(subset='Device name', keep='last', inplace=True)
+
+        # Normalize names in corp set
+        corp['NormalizedName'] = corp['Device name'].apply(normalize_name)
+
+        # Step 7: Identify missing
+        present_by_sn = corp['Serial number'].str.strip().str.upper().isin(serials)
+        present_by_nm = corp['NormalizedName'].isin(names)
+        present = present_by_sn | present_by_nm
+        missing = corp[~present].copy()
+
+        # Step 8: Output
+        cols = [
+            'Device ID','Device name','Primary user UPN','operatingSystem',
+            'Last check-in','approximateLastSignInDateTime','LastSignInDT',
+            'Serial number','Ownership','joinType'
+        ]
+        out_cols = [c for c in cols if c in missing.columns]
+        os.makedirs(os.path.dirname(output_file) or '.', exist_ok=True)
+
+        if missing.empty:
+            txt_path = os.path.splitext(output_file)[0] + '_nodata.txt'
+            with open(txt_path, 'w') as f:
+                f.write('No Intune corporate devices missing from RMM.\n')
+            messagebox.showinfo(
+                'No Missing Devices',
+                f'All corporate Intune devices are in RMM.\nOutput: {txt_path}'
+            )
+        else:
+            missing[out_cols].to_csv(output_file, index=False)
+            messagebox.showinfo(
+                'Missing Devices Found',
+                f'{len(missing)} device(s) missing saved to:\n{output_file}'
+            )
+
+    except Exception as e:
+        traceback.print_exc()
+        messagebox.showerror('Error', f'{type(e).__name__}: {e}')
+
+# ------------------------------------------------------------------------------
+# GUI Launcher
+# ------------------------------------------------------------------------------
+
+def launch_gui():
+    """
+    Simple Tk form:
+      - Select RMM CSV
+      - Select Intune/Entra CSV
+      - Select output CSV
+      - Run comparison
+    """
+    root = tk.Tk()
+    root.title('Intune → RMM Missing Devices')
+
+    rmm_var    = tk.StringVar()
+    intune_var = tk.StringVar()
+    out_var    = tk.StringVar()
+
+    # RMM CSV selection
+    tk.Label(root, text='RMM CSV:').grid(row=0, column=0, sticky='e')
+    tk.Entry(root, textvariable=rmm_var, width=50).grid(row=0, column=1)
+    tk.Button(root, text='Browse…',
+              command=lambda: rmm_var.set(
+                  filedialog.askopenfilename(filetypes=[("CSV","*.csv")])
+              )).grid(row=0, column=2)
+
+    # Intune CSV selection
+    tk.Label(root, text='Intune/Entra CSV:').grid(row=1, column=0, sticky='e')
+    tk.Entry(root, textvariable=intune_var, width=50).grid(row=1, column=1)
+    tk.Button(root, text='Browse…',
+              command=lambda: intune_var.set(
+                  filedialog.askopenfilename(filetypes=[("CSV","*.csv")])
+              )).grid(row=1, column=2)
+
+    # Output CSV selection
+    tk.Label(root, text='Output CSV:').grid(row=2, column=0, sticky='e')
+    tk.Entry(root, textvariable=out_var, width=50).grid(row=2, column=1)
+    tk.Button(root, text='Save As…',
+              command=lambda: out_var.set(
+                  filedialog.asksaveasfilename(defaultextension='.csv')
+              )).grid(row=2, column=2)
+
+    # Run button
+    tk.Button(root, text='Run Check',
+              command=lambda: find_missing_devices(
+                  rmm_var.get(), intune_var.get(), out_var.get()
+              )).grid(row=3, column=1, pady=10)
+
+    root.mainloop()
+
+if __name__ == '__main__':
+    launch_gui()
