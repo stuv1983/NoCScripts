@@ -1,0 +1,118 @@
+# ==============================
+# Scan-to-SMB Health Check Script
+# ==============================
+
+$ErrorActionPreference = "Stop"
+$ComputerName = $env:COMPUTERNAME
+$ShareName = "Scans"
+$ScanPath  = "C:\Scans"
+$SvcUser   = "$ComputerName\svc_scanner"
+$TestFile  = "rmm_smb_test.txt"
+
+$Failures = @()
+
+Write-Output "=== Scan-to-SMB Validation on $ComputerName ==="
+
+# 1. SMB Server Service
+try {
+    $svc = Get-Service LanmanServer
+    if ($svc.Status -ne "Running") {
+        $Failures += "LanmanServer service not running"
+    } else {
+        Write-Output "PASS: LanmanServer running"
+    }
+} catch {
+    $Failures += "Unable to query LanmanServer service"
+}
+
+# 2. SMB Version Check
+try {
+    $smb = Get-SmbServerConfiguration
+    if (-not $smb.EnableSMB2Protocol) {
+        $Failures += "SMBv2/3 is disabled"
+    } else {
+        Write-Output "PASS: SMBv2/3 enabled"
+    }
+} catch {
+    $Failures += "Unable to read SMB server configuration"
+}
+
+# 3. Network Profile
+try {
+    $net = Get-NetConnectionProfile | Select-Object -First 1
+    Write-Output "INFO: Network profile is $($net.NetworkCategory)"
+} catch {
+    Write-Output "WARN: Unable to determine network profile"
+}
+
+# 4. Firewall Rules for SMB
+try {
+    $fw = Get-NetFirewallRule -DisplayGroup "File and Printer Sharing" -Enabled True -Action Allow
+    if (-not $fw) {
+        $Failures += "No enabled File and Printer Sharing firewall rules"
+    } else {
+        Write-Output "PASS: File and Printer Sharing firewall rules enabled"
+    }
+} catch {
+    $Failures += "Unable to query firewall rules"
+}
+
+# 5. Share Exists
+try {
+    $share = Get-SmbShare -Name $ShareName
+    Write-Output "PASS: SMB share '$ShareName' exists at $($share.Path)"
+} catch {
+    $Failures += "SMB share '$ShareName' does not exist"
+}
+
+# 6. Share Permissions
+try {
+    $shareAccess = Get-SmbShareAccess -Name $ShareName
+    if (-not ($shareAccess | Where-Object {$_.AccountName -eq $SvcUser -and $_.AccessRight -in @("Change","Full")})) {
+        $Failures += "svc_scanner does not have Change/Full access on SMB share"
+    } else {
+        Write-Output "PASS: svc_scanner has Change access on SMB share"
+    }
+} catch {
+    $Failures += "Unable to read SMB share permissions"
+}
+
+# 7. NTFS Permissions
+try {
+    $acl = icacls $ScanPath
+    if ($acl -notmatch "svc_scanner:\(OI\)\(CI\)\(M\)") {
+        Write-Output "WARN: svc_scanner NTFS permission not explicitly Modify (may still inherit)"
+    } else {
+        Write-Output "PASS: svc_scanner NTFS Modify permissions present"
+    }
+} catch {
+    $Failures += "Unable to read NTFS permissions on $ScanPath"
+}
+
+# 8. SMB Write Test (Gold Test)
+try {
+    cmd /c "net use \\$ComputerName\$ShareName /user:$SvcUser Yavaka10293$" | Out-Null
+    cmd /c "echo rmm_test > \\$ComputerName\$ShareName\$TestFile" | Out-Null
+    cmd /c "net use \\$ComputerName\$ShareName /delete" | Out-Null
+
+    if (Test-Path "$ScanPath\$TestFile") {
+        Remove-Item "$ScanPath\$TestFile" -Force
+        Write-Output "PASS: SMB write test as svc_scanner succeeded"
+    } else {
+        $Failures += "SMB write test failed (file not created)"
+    }
+} catch {
+    $Failures += "SMB authentication/write test failed"
+}
+
+# ==============================
+# Final Result
+# ==============================
+if ($Failures.Count -eq 0) {
+    Write-Output "=== RESULT: PASS – Device ready for Scan-to-SMB ==="
+    exit 0
+} else {
+    Write-Output "=== RESULT: FAIL ==="
+    $Failures | ForEach-Object { Write-Output "FAIL: $_" }
+    exit 1
+}
