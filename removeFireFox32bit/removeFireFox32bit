@@ -1,0 +1,222 @@
+# Remove 32-bit Firefox and back up bookmarks
+
+Write-Host "Starting Firefox 32-bit cleanup with bookmark backup"
+
+# ============================================
+# STEP 1: Backup bookmarks from all profiles
+# ============================================
+
+$backupRoot = "C:\Temp\FirefoxBackup"
+
+if (-not (Test-Path $backupRoot)) {
+    try {
+        New-Item -Path $backupRoot -ItemType Directory -Force | Out-Null
+        Write-Host "Created backup root at $backupRoot"
+    }
+    catch {
+        Write-Host "Failed to create backup root folder"
+    }
+}
+
+# Enumerate all user profile folders under C:\Users
+$userFolders = Get-ChildItem -Path "C:\Users" -Directory -ErrorAction SilentlyContinue
+
+foreach ($user in $userFolders) {
+
+    $userName = $user.Name
+    $ffProfileRoot = "C:\Users\{0}\AppData\Roaming\Mozilla\Firefox\Profiles" -f $userName
+
+    if (-not (Test-Path $ffProfileRoot)) {
+        continue
+    }
+
+    Write-Host ("User {0} has Firefox profile folder {1}" -f $userName, $ffProfileRoot)
+
+    # Get each Firefox profile under this user
+    $profiles = Get-ChildItem -Path $ffProfileRoot -Directory -ErrorAction SilentlyContinue
+
+    foreach ($profile in $profiles) {
+
+        $profileName = $profile.Name
+        $placesPath = Join-Path -Path $profile.FullName -ChildPath "places.sqlite"
+
+        if (-not (Test-Path $placesPath)) {
+            continue
+        }
+
+        $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+        $backupFileName = "Firefox_{0}_{1}_{2}.sqlite" -f $userName, $profileName, $timestamp
+        $backupPath = Join-Path -Path $backupRoot -ChildPath $backupFileName
+
+        Write-Host "Backing up bookmarks"
+        Write-Host (" User    : {0}" -f $userName)
+        Write-Host (" Profile : {0}" -f $profileName)
+        Write-Host (" Source  : {0}" -f $placesPath)
+        Write-Host (" Target  : {0}" -f $backupPath)
+
+        try {
+            Copy-Item -Path $placesPath -Destination $backupPath -Force
+            Write-Host " Backup completed"
+        }
+        catch {
+            Write-Host (" Failed to back up profile {0}" -f $profileName)
+        }
+    }
+}
+
+Write-Host "Bookmark backup step completed"
+
+# ============================================
+# STEP 2: Remove ONLY 32-bit Firefox
+# ============================================
+
+$Firefox32Found = $false
+$ff32InstallPath = Join-Path -Path ${env:ProgramFiles(x86)} -ChildPath "Mozilla Firefox"
+$ff32HelperPath  = Join-Path -Path $ff32InstallPath -ChildPath "uninstall\helper.exe"
+
+Write-Host "Checking for 32-bit Firefox under Program Files (x86)"
+
+if (Test-Path $ff32HelperPath) {
+    Write-Host "Found 32-bit Firefox uninstaller, attempting silent uninstall"
+
+    try {
+        Start-Process -FilePath $ff32HelperPath -ArgumentList "/S" -Wait -ErrorAction Stop
+        Write-Host "Uninstaller completed"
+        $Firefox32Found = $true
+    }
+    catch {
+        Write-Host "Uninstaller failed; proceeding with manual cleanup"
+        $Firefox32Found = $true
+    }
+}
+else {
+    Write-Host "No helper.exe found; 32-bit Firefox may not be installed"
+}
+
+# Remove the 32-bit install directory if it still exists
+if (Test-Path $ff32InstallPath) {
+    Write-Host ("Removing 32-bit Firefox folder at {0}" -f $ff32InstallPath)
+    try {
+        Remove-Item -Path $ff32InstallPath -Recurse -Force -ErrorAction Stop
+        $Firefox32Found = $true
+    }
+    catch {
+        Write-Host "Failed to remove Program Files (x86)\Mozilla Firefox folder"
+    }
+}
+else {
+    Write-Host "No Program Files (x86)\Mozilla Firefox folder found"
+}
+
+# ============================================
+# STEP 3: Clean 32-bit Firefox uninstall entries
+# ============================================
+
+$wowUninstallRoot = "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+
+if (Test-Path $wowUninstallRoot) {
+
+    Write-Host "Checking WOW6432Node uninstall entries for Firefox"
+
+    Get-ChildItem -Path $wowUninstallRoot | ForEach-Object {
+
+        $keyPath = $_.PsPath
+
+        try {
+            $props = Get-ItemProperty -Path $keyPath -ErrorAction Stop
+        }
+        catch {
+            return
+        }
+
+        $displayName = $props.DisplayName
+
+        if (-not $displayName) {
+            return
+        }
+
+        if ($displayName -like "*Firefox*") {
+            Write-Host ("Removing 32-bit Firefox uninstall key: {0}" -f $keyPath)
+            try {
+                Remove-Item -Path $keyPath -Recurse -Force -ErrorAction Stop
+                $Firefox32Found = $true
+            }
+            catch {
+                Write-Host "Failed to remove uninstall registry key"
+            }
+        }
+    }
+}
+else {
+    Write-Host "WOW6432Node uninstall hive not found"
+}
+
+# ============================================
+# STEP 4: Remove shortcuts that target Program Files (x86)
+# ============================================
+
+$shortcutCandidates = @(
+    "$env:PUBLIC\Desktop\Firefox.lnk",
+    "$env:USERPROFILE\Desktop\Firefox.lnk",
+    "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Firefox.lnk"
+)
+
+foreach ($sc in $shortcutCandidates) {
+    if (-not (Test-Path $sc)) { continue }
+
+    $removeThisShortcut = $false
+
+    # Simple heuristic: if the .lnk file content mentions "Program Files (x86)"
+    try {
+        $content = Get-Content -Path $sc -ErrorAction SilentlyContinue | Out-String
+        if ($content -like "*Program Files (x86)*") {
+            $removeThisShortcut = $true
+        }
+    }
+    catch {
+        $removeThisShortcut = $false
+    }
+
+    if ($removeThisShortcut) {
+        Write-Host ("Removing 32-bit Firefox shortcut {0}" -f $sc)
+        try {
+            Remove-Item -Path $sc -Force -ErrorAction SilentlyContinue
+            $Firefox32Found = $true
+        }
+        catch {
+            Write-Host "Failed to remove shortcut"
+        }
+    }
+}
+
+# ============================================
+# STEP 5: Create Intune detection marker
+# ============================================
+
+$flagDir  = "C:\ProgramData\Kenstra\IntuneFlags"
+$flagFile = Join-Path -Path $flagDir -ChildPath "Firefox32Removed.flag"
+
+try {
+    if (-not (Test-Path $flagDir)) {
+        New-Item -Path $flagDir -ItemType Directory -Force | Out-Null
+    }
+
+    New-Item -Path $flagFile -ItemType File -Force | Out-Null
+    Write-Host ("Created Intune detection flag at {0}" -f $flagFile)
+}
+catch {
+    Write-Host "Failed to create Intune detection flag file"
+}
+
+# ============================================
+# STEP 6: Final status
+# ============================================
+
+if ($Firefox32Found) {
+    Write-Host ("32-bit Firefox cleanup complete. Bookmark backups stored under {0}" -f $backupRoot)
+}
+else {
+    Write-Host ("No 32-bit Firefox installation detected. Bookmark backups (if any) stored under {0}" -f $backupRoot)
+}
+
+exit 0
