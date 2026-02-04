@@ -1,0 +1,42 @@
+# PaperCut Follow Me – Silent RMM Remediation
+# Runs as SYSTEM, no UI
+
+$ErrorActionPreference = "SilentlyContinue"
+$PrinterConn = "\\POPUP-PRNTSVR\Pop-Up Follow Me Printer"
+$Log = "C:\ProgramData\PaperCut_FollowMe_Remediation.log"
+
+function Log {
+    param($msg)
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    "$ts - $msg" | Out-File -FilePath $Log -Append -Encoding utf8
+}
+
+Log "Starting silent remediation"
+
+# Ensure Print Spooler is running
+Start-Service Spooler
+Log "Spooler ensured running"
+
+# Remove existing Follow Me / PaperCut printers (silent)
+Get-Printer |
+    Where-Object { $_.Name -match "Follow Me|PaperCut|Pop-Up" } |
+    ForEach-Object {
+        Log "Removing printer: $($_.Name)"
+        Remove-Printer -Name $_.Name
+    }
+
+Start-Sleep -Seconds 3
+
+# Add shared Follow Me printer (silent)
+Log "Adding printer connection: $PrinterConn"
+Add-Printer -ConnectionName $PrinterConn
+
+# Validate
+$check = Get-Printer | Where-Object Name -match "Follow Me"
+if ($check) {
+    Log "Printer present: $($check.Name -join ', ')"
+} else {
+    Log "Printer NOT detected after add attempt"
+}
+
+Log "Silent remediation complete"
