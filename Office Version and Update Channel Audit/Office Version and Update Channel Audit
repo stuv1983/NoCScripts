@@ -1,0 +1,61 @@
+# Office Version & Update Channel Audit
+# Purpose:
+#   - Identify Office Click-to-Run version
+#   - Identify Update Channel (human readable)
+#   - Optional comparison against a minimum secure version
+#
+# Usage:
+#   .\Office-Audit.ps1
+#   .\Office-Audit.ps1 -MinSecureVersion 16.0.14326.21336
+#
+# Safe for N-able / Take Control
+
+[CmdletBinding()]
+param (
+    [Parameter(Mandatory = $false)]
+    [version]$MinSecureVersion
+)
+
+$regPath = "HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration"
+
+if (-not (Test-Path $regPath)) {
+    Write-Output "Office Click-to-Run not detected"
+    return
+}
+
+$config = Get-ItemProperty $regPath
+
+$version = [version]$config.VersionToReport
+$channelUrl = $config.UpdateChannel
+
+# Channel map
+$channelMap = @{
+    "492350f6-3a01-4f97-b9c0-c7c6ddf67d60" = "Current Channel"
+    "55336b82-a18d-4dd6-b5f6-9e5095c314a6" = "Monthly Enterprise Channel"
+    "7ffbc6bf-bc32-4f92-8982-f9dd17fd3114" = "Semi-Annual Enterprise Channel (Preview)"
+    "b8f9b850-328d-4355-9145-c59439a0c4cf" = "Semi-Annual Enterprise Channel"
+    "f2e724c1-748f-4b47-8c6f-37a8a7a8f48c" = "Beta Channel"
+}
+
+$channelGuid = ($channelUrl -split "/")[-1]
+$channelName = $channelMap[$channelGuid]
+
+if (-not $channelName) {
+    $channelName = "Unknown / Custom Channel"
+}
+
+# Version comparison
+$atRisk = $null
+if ($MinSecureVersion) {
+    $atRisk = $version -lt $MinSecureVersion
+}
+
+# Output object
+[PSCustomObject]@{
+    ComputerName      = $env:COMPUTERNAME
+    OfficeVersion     = $version.ToString()
+    UpdateChannel     = $channelName
+    UpdateChannelGuid = $channelGuid
+    AtRisk            = $atRisk
+    Timestamp         = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+}
