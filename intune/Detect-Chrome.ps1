@@ -1,57 +1,61 @@
-param(
-    [string]$TargetVersion = '145.0.7632.75'
-)
+<#
+.SYNOPSIS
+  Production Detection Script for Chrome Enterprise Migration.
+  Logic Flow:
+  1. If any AppData Chrome exists -> exit 1 (Trigger Migration)
+  2. Else if Program Files Chrome exists:
+     a. If version < target -> exit 1 (Trigger Update)
+     b. If version >= target -> exit 0 (Compliant)
+  3. Else (no Chrome anywhere) -> exit 0 (Skip Net-New Install)
+#>
 
-Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
+$TargetVersion = [version]"145.0.7632.110"
+$ErrorActionPreference = "SilentlyContinue"
 
-function Convert-ToVersion {
-    param([string]$v)
-    try { [version]$v } catch { [version]'0.0.0.0' }
-}
-
-function Get-ChromeMachineExe {
-    $paths = @()
-    if ($env:ProgramFiles) {
-        $paths += Join-Path $env:ProgramFiles 'Google\Chrome\Application\chrome.exe'
+# ==============================================================================
+# 1. If any AppData Chrome exists -> exit 1
+# ==============================================================================
+if (Test-Path "C:\Users") {
+    $PerUserChrome = Get-ChildItem -Path "C:\Users\*\AppData\Local\Google\Chrome\Application\chrome.exe"
+    if ($PerUserChrome) {
+        Write-Output "Non-Compliant: Consumer Chrome detected in AppData. Migration required."
+        exit 1
     }
-    $pf86 = ${env:ProgramFiles(x86)}
-    if ($pf86) {
-        $paths += Join-Path $pf86 'Google\Chrome\Application\chrome.exe'
+}
+
+# ==============================================================================
+# 2. Else if Program Files Chrome exists
+# ==============================================================================
+$System64 = "$env:ProgramFiles\Google\Chrome\Application\chrome.exe"
+$System32 = "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe"
+
+$SystemChromeFound = $false
+$NeedsUpdate = $false
+
+foreach ($path in @($System64, $System32)) {
+    if (Test-Path $path) {
+        $SystemChromeFound = $true
+        $LocalVer = [version]((Get-Item $path).VersionInfo.ProductVersion -split '\s+')[0]
+        
+        if ($LocalVer -lt $TargetVersion) {
+            Write-Output "Non-Compliant: Enterprise MSI is outdated ($LocalVer < $TargetVersion)."
+            $NeedsUpdate = $true
+        } else {
+            Write-Output "Found compliant Enterprise MSI version ($LocalVer)."
+        }
     }
-    foreach ($p in $paths) {
-        if (Test-Path $p) { return $p }
+}
+
+if ($SystemChromeFound) {
+    if ($NeedsUpdate) {
+        exit 1 # version < target
+    } else {
+        exit 0 # version >= target
     }
-    return $null
 }
 
-function Get-ChromeVersion {
-    param([string]$ExePath)
-    $vi = (Get-Item $ExePath).VersionInfo
-    $v  = $vi.ProductVersion
-    if ([string]::IsNullOrWhiteSpace($v)) { $v = $vi.FileVersion }
-    Convert-ToVersion $v
-}
-
-$target = Convert-ToVersion $TargetVersion
-$chromeExe = Get-ChromeMachineExe
-
-if (-not $chromeExe) {
-    # For "Update Only" Win32 apps, we report compliant if not installed to avoid forced installs
-    Write-Output "Installed=No; Compliant=Yes (UpdateOnly)"
-    exit 0
-}
-
-$current = Get-ChromeVersion -ExePath $chromeExe
-$appFolder = Split-Path $chromeExe -Parent
-$targetFolder = Join-Path $appFolder $TargetVersion
-
-# COMPLIANCE LOGIC: 
-# Compliant if the running version is >= target OR if the target version folder is staged on disk
-$isStaged = Test-Path $targetFolder
-$compliant = ($current -ge $target) -or $isStaged
-
-$compText = if ($compliant) { 'Yes' } else { 'No' }
-Write-Output ("Installed=Yes; Version={0}; Staged={1}; Target={2}; Compliant={3}" -f $current, $isStaged, $target, $compText)
-
-if ($compliant) { exit 0 } else { exit 1 }
+# ==============================================================================
+# 3. Else (no Chrome anywhere) -> exit 0 (skip)
+# ==============================================================================
+Write-Output "Chrome is not installed anywhere. Compliant (Skip Install)."
+exit 0
