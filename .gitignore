@@ -46,3 +46,6 @@ AVCheck(beta).ps1
 bin/
 obj/
 node_modules/
+# Local folders
+CheckTVInstall/
+UpdateMS365C2R/
