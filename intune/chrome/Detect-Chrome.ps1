@@ -9,7 +9,7 @@
 
 $ChromeSystem64 = "C:\Program Files\Google\Chrome\Application\chrome.exe"
 $Chromex86 = "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
-$MinimumVersion = [version]"120.0.0.0" # Update this to your organizational security floor
+$MinimumVersion = [version]"145.0.7632.117" # Update this to your organizational security floor
 $AppDataInstallFound = $false
 
 # ------------------------------------------------------------------------
