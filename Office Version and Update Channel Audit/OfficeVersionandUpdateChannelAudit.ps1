@@ -1,144 +1,135 @@
-<#
-.SYNOPSIS
-    Office Version & Update Channel Audit
+# ==============================================================================
+# 1. Initialization & Guardrails
+# ==============================================================================
+$configPath  = "HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration"
+$updatesPath = "HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Updates"
+$policyPath  = "HKLM:\SOFTWARE\Policies\Microsoft\office\16.0\common\officeupdate"
 
-.NOTES
-    Name:       OfficeVersionandUpdateChannelAudit.ps1
-    Author:     Stu Villanti (s.villanti@kenstra.com.au)
-    Version:    4.0
-
-
-.DESCRIPTION
-    Audits Microsoft Office Click-to-Run (C2R) on the local machine and reports:
-      - Office Version (VersionToReport)
-      - Update Channel (resolved to a human-readable name)
-      - Update Channel GUID
-      - Optional “AtRisk” boolean if a minimum secure version is supplied
-
-    This is safe for MSP/RMM execution (N-able / Take Control):
-      - No changes are made to the system
-      - Output is a single structured object (easy to paste into ticket notes)
-      - If Office C2R is not detected, outputs a clear message/object and exits cleanly
-
-.PARAMETER MinSecureVersion
-    Optional minimum secure Office version to compare against.
-    If provided, AtRisk will be:
-      - $true  = installed version is below minimum
-      - $false = installed version is equal/above minimum
-    If not provided, AtRisk is $null.
-
-.EXAMPLE
-    .\Office-Audit.ps1
-
-.EXAMPLE
-    .\Office-Audit.ps1 -MinSecureVersion 16.0.14326.21336
-
-.OUTPUTS
-    PSCustomObject with audit results.
-
-.EXITCODES
-    0 = success / not detected / informational only
-    (This script is designed NOT to generate “failed” noise in RMM.)
-
-#>
-
-[CmdletBinding()]
-param (
-    # Optional minimum secure version for comparison
-    [Parameter(Mandatory = $false)]
-    [version]$MinSecureVersion
-)
-
-# ------------------------------------------------------------
-# 1) Locate Office Click-to-Run configuration registry key
-# ------------------------------------------------------------
-# This key exists when Office is installed via Click-to-Run (most M365 installs).
-$RegPath = "HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration"
-
-# If C2R isn't installed, report and exit cleanly (avoid RMM alert storms).
-if (-not (Test-Path $RegPath)) {
-    # You can choose either a simple message OR an object.
-    # Object is nicer for consistent reporting.
-    [PSCustomObject]@{
-        ComputerName      = $env:COMPUTERNAME
-        OfficeDetected    = $false
-        OfficeVersion     = $null
-        UpdateChannel     = $null
-        UpdateChannelGuid = $null
-        AtRisk            = $null
-        Timestamp         = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-        Note              = "Office Click-to-Run not detected"
-    }
+if (-not (Test-Path $configPath)) {
+    Write-Output "STATUS=NOT_APPLICABLE"
+    Write-Output "Message: Office Click-to-Run configuration not found."
     exit 0
 }
 
-# ------------------------------------------------------------
-# 2) Read config values
-# ------------------------------------------------------------
-# VersionToReport: Office version that Office reports (what you normally care about)
-# UpdateChannel:   URL including a GUID for the channel (Current/Monthly Enterprise/etc.)
-$config = Get-ItemProperty -Path $RegPath
+$initialConfig = Get-ItemProperty -Path $configPath -ErrorAction SilentlyContinue
+$initialVersion = $initialConfig.VersionToReport
 
-# Defensive parsing:
-# If VersionToReport is missing or malformed, this will throw — we handle below.
+$c2rPaths = @(
+    "$env:ProgramFiles\Common Files\Microsoft Shared\ClickToRun\OfficeC2RClient.exe",
+    "${env:ProgramFiles(x86)}\Common Files\Microsoft Shared\ClickToRun\OfficeC2RClient.exe"
+)
+$updaterExe = $c2rPaths | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+if (-not $updaterExe) {
+    Write-Output "STATUS=FAILED"
+    Write-Output "Message: OfficeC2RClient.exe not found."
+    exit 1
+}
+
+# ==============================================================================
+# 2. Trigger Background Update
+# ==============================================================================
+Write-Output "Message: Initial Build: $initialVersion. Triggering silent update..."
+$updateArgs = "/update user updatepromptuser=False forceappshutdown=False displaylevel=False"
+
 try {
-    $Version = [version]$config.VersionToReport
+    Start-Process -FilePath $updaterExe -ArgumentList $updateArgs -NoNewWindow -Wait
 } catch {
-    $Version = $null
+    Write-Output "STATUS=FAILED"
+    Write-Output "Message: Failed to execute updater. Exception: $_"
+    exit 1
 }
 
-$ChannelUrl = [string]$config.UpdateChannel
+# ==============================================================================
+# 3. Bounded Wait Loop
+# ==============================================================================
+$maxWaitMinutes = 3
+$sleepIntervalSeconds = 15
+$maxIterations = ($maxWaitMinutes * 60) / $sleepIntervalSeconds
+$iteration = 0
+$updateTriggered = $false
+$updateData = $null
 
-# ------------------------------------------------------------
-# 3) Resolve channel GUID -> human-readable name
-# ------------------------------------------------------------
-# Channel GUID is typically the final path segment of the UpdateChannel URL.
-# Example:
-#   http://officecdn.microsoft.com/pr/492350f6-3a01-4f97-b9c0-c7c6ddf67d60
-$ChannelGuid = $null
-if ($ChannelUrl) {
-    $ChannelGuid = ($ChannelUrl -split "/")[-1]
+Write-Output "Message: Polling registry for update targeting (Timeout: $maxWaitMinutes min)..."
+
+while ($iteration -lt $maxIterations) {
+    Start-Sleep -Seconds $sleepIntervalSeconds
+    $iteration++
+    
+    try {
+        $updateData = Get-ItemProperty -Path $updatesPath -ErrorAction Stop
+    } catch {
+        $updateData = $null
+    }
+    
+    $hasNewTarget = ($updateData -and $null -ne $updateData.UpdateToVersion -and $updateData.UpdateToVersion -ne $initialVersion)
+    $hasValidPayload = ($updateData -and $null -ne $updateData.UpdatesReadyToApply -and $updateData.UpdatesReadyToApply -notin @("", "0"))
+
+    if ($hasNewTarget -or $hasValidPayload) {
+        $updateTriggered = $true
+        break
+    }
 }
 
-# Known channel mappings (common Microsoft 365 channels)
-$ChannelMap = @{
-    "492350f6-3a01-4f97-b9c0-c7c6ddf67d60" = "Current Channel"
-    "55336b82-a18d-4dd6-b5f6-9e5095c314a6" = "Monthly Enterprise Channel"
-    "7ffbc6bf-bc32-4f92-8982-f9dd17fd3114" = "Semi-Annual Enterprise Channel (Preview)"
-    "b8f9b850-328d-4355-9145-c59439a0c4cf" = "Semi-Annual Enterprise Channel"
-    "f2e724c1-748f-4b47-8c6f-37a8a7a8f48c" = "Beta Channel"
+# ==============================================================================
+# 4. Post-Update Validation Checks
+# ==============================================================================
+# Re-check actual version
+$finalConfig  = Get-ItemProperty -Path $configPath -ErrorAction SilentlyContinue
+$finalVersion = if ($finalConfig) { $finalConfig.VersionToReport } else { "Unknown" }
+$versionChanged = ($finalVersion -and $initialVersion -and $finalVersion -ne $initialVersion)
+
+# Check Service
+$svc = Get-Service ClickToRunSvc -ErrorAction SilentlyContinue
+$svcStatus = if ($svc) { $svc.Status.ToString() } else { "NotFound" }
+
+# Check Policies (Deep Inspection)
+$policyBlocked = "No"
+if (Test-Path $policyPath) {
+    $policies = Get-ItemProperty -Path $policyPath -ErrorAction SilentlyContinue
+    $activePolicies = @()
+    if ($null -ne $policies.EnableAutomaticUpdates) { $activePolicies += "EnableAutoUpdates=$($policies.EnableAutomaticUpdates)" }
+    if ($null -ne $policies.HideEnableDisableUpdates) { $activePolicies += "HideUI=$($policies.HideEnableDisableUpdates)" }
+    if ($null -ne $policies.UpdateBranch) { $activePolicies += "Branch=$($policies.UpdateBranch)" }
+    
+    if ($activePolicies.Count -gt 0) {
+        $policyBlocked = "Yes ($($activePolicies -join ', '))"
+    } else {
+        $policyBlocked = "Key exists, but no blocking values found."
+    }
 }
 
-$ChannelName = $null
-if ($ChannelGuid -and $ChannelMap.ContainsKey($ChannelGuid)) {
-    $ChannelName = $ChannelMap[$ChannelGuid]
-} else {
-    $ChannelName = "Unknown / Custom Channel"
+# Check Pending Reboots
+$cbsReboot = Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending"
+$wuReboot  = Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired"
+$sysReboot = $false
+try {
+    if (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" -Name "PendingFileRenameOperations" -ErrorAction SilentlyContinue) { $sysReboot = $true }
+} catch {}
+$rebootPending = ($cbsReboot -or $wuReboot -or $sysReboot)
+
+# ==============================================================================
+# 5. Final Output & Exit Codes
+# ==============================================================================
+Write-Output "--- Validation Details ---"
+Write-Output "Service State  : $svcStatus"
+Write-Output "Policy Blocker : $policyBlocked"
+Write-Output "Reboot Pending : $rebootPending"
+Write-Output "--------------------------"
+
+if ($versionChanged) {
+    Write-Output "STATUS=UPDATED"
+    Write-Output "Message: Office immediately updated from $initialVersion to $finalVersion."
+    if ($rebootPending) { exit 2 } else { exit 0 }
 }
 
-# ------------------------------------------------------------
-# 4) Optional version comparison (AtRisk)
-# ------------------------------------------------------------
-# If MinSecureVersion is supplied:
-#   AtRisk = installed version is less than minimum
-# Otherwise:
-#   AtRisk = $null
-$AtRisk = $null
-if ($MinSecureVersion -and $Version) {
-    $AtRisk = ($Version -lt $MinSecureVersion)
+if ($updateTriggered) {
+    $target = if ($updateData -and $updateData.UpdateToVersion) { $updateData.UpdateToVersion } else { "Unknown" }
+    Write-Output "STATUS=UPDATE_TRIGGERED"
+    Write-Output "Message: Update staged/indicated (target: $target). Current build: $finalVersion"
+    if ($rebootPending) { exit 2 } else { exit 0 }
 }
 
-# ------------------------------------------------------------
-# 5) Output (structured object for RMM / ticket notes)
-# ------------------------------------------------------------
-[PSCustomObject]@{
-    ComputerName      = $env:COMPUTERNAME
-    OfficeDetected    = $true
-    OfficeVersion     = if ($Version) { $Version.ToString() } else { $null }
-    UpdateChannel     = $ChannelName
-    UpdateChannelGuid = $ChannelGuid
-    AtRisk            = $AtRisk
-    Timestamp         = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-}
-
-exit 0
+Write-Output "STATUS=NO_CHANGE"
+Write-Output "Message: No update signal observed within ${maxWaitMinutes}m. Current build: $finalVersion (initial: $initialVersion)."
+if ($rebootPending) { exit 2 } else { exit 0 }
