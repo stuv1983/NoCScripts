@@ -139,24 +139,15 @@ def toggle_rmm_state():
     Date filtering is only valid when Device Report is loaded.
     """
     if skip_rmm_var.get():
-        # Disable RMM file selection
         rmm_entry.config(state=tk.DISABLED)
         rmm_button.config(state=tk.DISABLED)
-
-        # Force 'Show All Dates' ON and lock it
         show_all_dates_var.set(True)
         show_all_dates_checkbox.config(state=tk.DISABLED)
-
-        # Disable calendar explicitly
         cal.config(state='disabled')
     else:
         rmm_entry.config(state=tk.NORMAL)
         rmm_button.config(state=tk.NORMAL)
-
-        # Re-enable checkbox
         show_all_dates_checkbox.config(state=tk.NORMAL)
-
-        # Re-evaluate calendar state
         toggle_date_state()
 
 def toggle_date_state():
@@ -405,7 +396,6 @@ def build_all_detections_sheet(writer, merged_df, link_format, missing_row_forma
     if 'Last Response' in cols_export_list:
         lr_idx = cols_export_list.index('Last Response')
         lr_col_letter = get_col_letter(lr_idx)
-        # Keeps red highlighting on the All Detections tab
         ws_all.conditional_format(1, 0, len(merged_df_export), len(cols_export_list) - 1, {
             'type': 'formula',
             'criteria': f'=${lr_col_letter}2="Not Found in RMM"',
@@ -444,6 +434,24 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_format):
             ws_p.set_column(final_cols.index('Name'), final_cols.index('Name'), 25)
         if 'Device Type' in final_cols:
             ws_p.set_column(final_cols.index('Device Type'), final_cols.index('Device Type'), 15)
+
+def build_stale_excluded_sheet(writer, stale_excluded_df):
+    """Builds a tracking sheet for devices meeting the score threshold but excluded by the date filter."""
+    if stale_excluded_df.empty:
+        return
+        
+    export_df = stale_excluded_df[['Name', 'Last Response', 'Device Type']].drop_duplicates(subset=['Name']).copy()
+    export_df = export_df.sort_values(by='Last Response')
+    export_df.rename(columns={'Name': 'Device Name'}, inplace=True)
+    
+    sheet_name = 'Stale Excluded Devices'
+    export_df.to_excel(writer, sheet_name=sheet_name, index=False)
+    
+    ws = writer.sheets[sheet_name]
+    ws.set_column('A:A', 35)
+    ws.set_column('B:B', 25)
+    ws.set_column('C:C', 20)
+    ws.autofilter(0, 0, len(export_df), len(export_df.columns) - 1)
 
 def build_raw_data_sheet(writer, raw_df):
     """Dumps the completely unfiltered, pre-threshold dataset to a final tab for reference/auditing."""
@@ -492,13 +500,27 @@ def process_reports():
         df_rmm = None if skip_rmm else load_rmm_data(rmm_path)
         merged_df = merge_data(df_vuln, df_rmm, skip_rmm)
 
-        # --- NEW: Capture raw, totally unfiltered dataset before date or score filters apply ---
+        # Capture raw, totally unfiltered dataset before date or score filters apply
         raw_df = merged_df.copy()
+
+        # Initialize an empty dataframe to safely hold excluded stale devices
+        stale_excluded_df = pd.DataFrame()
 
         # 2. Filter by Calendar Date (if enabled)
         if not show_all_dates_var.get():
             try:
                 cutoff_date = pd.to_datetime(date_var.get())
+                
+                # --- NEW: Capture devices that meet the score but fail the date filter ---
+                # First, find records meeting the score threshold
+                high_score_df = merged_df[merged_df['Vulnerability Score'] >= threshold]
+                # Then, isolate the ones that are older than the cutoff AND actually exist in RMM
+                stale_excluded_df = high_score_df[
+                    (high_score_df['_Sort_Time'] < cutoff_date) & 
+                    (high_score_df['Last Response'] != "Not Found in RMM")
+                ].copy()
+
+                # Filter the main dataset
                 merged_df = merged_df[
                     (merged_df['_Sort_Time'] >= cutoff_date) | 
                     (merged_df['Last Response'] == "Not Found in RMM")
@@ -526,7 +548,7 @@ def process_reports():
         filtered_for_sheets_df = merged_df[merged_df['Vulnerability Score'] >= threshold].copy()
         triage_df = filtered_for_sheets_df[filtered_for_sheets_df['Last Response'] != "Not Found in RMM"].copy()
         
-        used_sheet_names = set(['overview', 'all detections', 'raw data'])
+        used_sheet_names = set(['overview', 'all detections', 'raw data', 'stale excluded devices'])
         product_to_sheet = {}
         for product, _ in triage_df.groupby('Base Product'):
             product_to_sheet[product] = clean_sheet_name(product, used_sheet_names)
@@ -543,7 +565,10 @@ def process_reports():
             build_all_detections_sheet(writer, merged_df, link_format, missing_row_format)
             build_product_sheets(writer, triage_df, product_to_sheet, link_format)
             
-            # --- NEW: Append the raw data to the very end of the workbook ---
+            # --- NEW: Append Stale Excluded tracking sheet if data exists ---
+            if not stale_excluded_df.empty:
+                build_stale_excluded_sheet(writer, stale_excluded_df)
+                
             build_raw_data_sheet(writer, raw_df)
 
         progress.stop()
