@@ -3,41 +3,51 @@
     Hardened Detection for TeamViewer Eradication via Intune.
 .DESCRIPTION
     Scans HKLM registry, background services, and per-user AppData for TeamViewer footprints.
-    
-    INTUNE DETECTION LOGIC:
-    - Exit 0 (Success): TeamViewer IS detected. This tells Intune the app is present, 
-      which triggers the Uninstall assignment to execute the removal script.
-    - Exit 1 (Fail): TeamViewer is NOT detected. This tells Intune the device is clean 
-      (Compliant) and the uninstaller does not need to run.
+
+    INTUNE DETECTION LOGIC (UNINSTALL ASSIGNMENT):
+    - Exit 0 (Success): TeamViewer IS detected. Intune sees the app as present
+      and triggers the uninstall assignment to execute the removal script.
+    - Exit 1 (Fail):    TeamViewer is NOT detected. Intune considers the device
+      clean and the removal script does not run.
+
+    OUTPUT:
+    Intune captures stdout from this script. Full output is visible in the
+    Intune Management Extension log at:
+    C:\ProgramData\Microsoft\IntuneManagementExtension\Logs\IntuneManagementExtension.log
 #>
 
 # --- CONFIGURATION TOGGLES ---
 $AllowOnServers = $false    # Set to $true to allow detection on Servers and Domain Controllers
 
 # --- STEP 1: WORKSTATION GUARDRAIL ---
-# Intune primarily manages workstations. We skip Servers (3) and Domain Controllers (2) 
-# by default to prevent accidental removal from critical support infrastructure.
+# Intune primarily manages workstations. We skip Servers (ProductType 3) and
+# Domain Controllers (ProductType 2) by default to prevent accidental removal
+# from critical infrastructure.
 $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
 
-if ((-not $os -or $os.ProductType -ne 1) -and -not $AllowOnServers) { 
-    Write-Output "COMPLIANT: Target is not a workstation. Skipping detection."
-    exit 1 
-} elseif ($os -and $os.ProductType -ne 1 -and $AllowOnServers) {
-    Write-Output "Target is a server, but `$AllowOnServers is enabled. Proceeding with detection..."
+if (-not $os) {
+    Write-Output "[Warning] Could not determine OS type via WMI/CIM. Proceeding with detection anyway."
+} elseif ($os.ProductType -ne 1) {
+    if (-not $AllowOnServers) {
+        Write-Output "COMPLIANT: Target is not a workstation (ProductType=$($os.ProductType)). Skipping detection."
+        exit 1
+    } else {
+        Write-Output "[Warning] Target is a server (ProductType=$($os.ProductType)), but `$AllowOnServers is enabled. Proceeding with detection..."
+    }
 }
 
 $targetFound = $false
 
 # --- STEP 2: REGISTRY DETECTION (HKLM) ---
-# We use an anchored regex '^TeamViewer\b' to ensure we strictly match "TeamViewer" 
-# or "TeamViewer Host", while avoiding false positives like "TeamViewerMeeting" or other plugins.
-$pattern = "^TeamViewer\b" 
+# Anchored regex '^TeamViewer\b' strictly matches "TeamViewer" and "TeamViewer Host"
+# while avoiding false positives from "TeamViewerMeeting" or vendor plugins.
+$pattern = "^TeamViewer\b"
 $registryPaths = @(
-    'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*', 
+    'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
     'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
 )
 
-$installedApps = Get-ItemProperty -Path $registryPaths -ErrorAction SilentlyContinue | 
+$installedApps = Get-ItemProperty -Path $registryPaths -ErrorAction SilentlyContinue |
     Where-Object { $_.DisplayName -match $pattern }
 
 if ($installedApps) {
@@ -46,41 +56,46 @@ if ($installedApps) {
 }
 
 # --- STEP 3: SERVICE DETECTION ---
-# Catch "Ghost" installations. Sometimes a botched uninstallation removes the registry keys 
-# and program files, but leaves the background service running, keeping the vulnerability alive.
+# Catches "ghost" installations where a botched uninstall removed the binaries
+# and registry keys but left the background service running.
 if (Get-Service -Name "*TeamViewer*" -ErrorAction SilentlyContinue) {
     Write-Output "NON-COMPLIANT: TeamViewer background service detected."
     $targetFound = $true
 }
 
 # --- STEP 4: PER-USER APPDATA DETECTION ---
-# TeamViewer offers a "Consumer" install that does not require Admin rights. It bypasses 
-# Program Files and HKLM entirely, installing directly into the user's AppData folder. 
-# We must scan all user profiles to catch these stealth deployments.
-$skipList = @("All Users","Default","Default User","Public","WDAGUtilityAccount","DefaultAppPool","Administrator")
-$userProfiles = Get-ChildItem -LiteralPath "C:\Users" -Directory -ErrorAction SilentlyContinue | 
-                Where-Object { $skipList -notcontains $_.Name }
+# TeamViewer's consumer installer requires no admin rights and bypasses Program Files
+# and HKLM entirely. We scan all real user profiles (identified by NTUSER.DAT) to
+# catch these stealth deployments.
+#
+# Checked paths cover:
+#   - AppData\Local\TeamViewer          (standard consumer install)
+#   - AppData\Roaming\TeamViewer        (roaming/legacy variant)
+#   - AppData\Local\Programs\TeamViewer (TV15+ per-user Programs variant)
+$userProfiles = Get-ChildItem -LiteralPath "C:\Users" -Directory -ErrorAction SilentlyContinue |
+                Where-Object { Test-Path (Join-Path $_.FullName "NTUSER.DAT") }
 
 foreach ($u in $userProfiles) {
     $checkPaths = @(
         (Join-Path $u.FullName "AppData\Local\TeamViewer\TeamViewer.exe"),
-        (Join-Path $u.FullName "AppData\Roaming\TeamViewer\TeamViewer.exe")
+        (Join-Path $u.FullName "AppData\Roaming\TeamViewer\TeamViewer.exe"),
+        (Join-Path $u.FullName "AppData\Local\Programs\TeamViewer\TeamViewer.exe")
     )
     foreach ($cp in $checkPaths) {
-        if (Test-Path -LiteralPath $cp) { 
-            Write-Output "NON-COMPLIANT: Per-user binary found in $($u.Name)'s AppData."
+        if (Test-Path -LiteralPath $cp) {
+            Write-Output "NON-COMPLIANT: Per-user binary found at: $cp"
             $targetFound = $true
-            break # Break inner loop for this specific user, but continue scanning other users
+            break  # Stop checking paths for this user; continue scanning other profiles
         }
     }
 }
 
 # --- STEP 5: INTUNE EXIT LOGIC ---
-if ($targetFound) { 
-    # Exit 0 tells Intune: "Yes, it's here. Run the uninstaller."
-    exit 0 
-} else { 
-    # Exit non-zero tells Intune: "Nothing found. The machine is clean."
-    Write-Output "COMPLIANT: TeamViewer is not detected on this system."
-    exit 1 
+if ($targetFound) {
+    # Exit 0 tells Intune: "App is present — run the uninstaller."
+    exit 0
+} else {
+    # Exit 1 tells Intune: "Nothing found — machine is clean."
+    Write-Output "COMPLIANT: No TeamViewer footprint detected on this system."
+    exit 1
 }
