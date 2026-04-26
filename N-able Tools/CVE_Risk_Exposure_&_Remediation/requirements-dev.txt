@@ -1,0 +1,14 @@
+# Development dependencies — install with: pip install -r requirements-dev.txt
+# These are NOT needed to run the dashboard — only for development and testing.
+-r requirements.txt
+
+# Testing
+pytest>=7.0
+pytest-cov>=4.0     # coverage reports: pytest --cov=. --cov-report=term-missing
+
+# Code quality
+ruff>=0.4           # fast linter + formatter (replaces flake8 + isort + black)
+
+# Type checking
+mypy>=1.9
+pandas-stubs>=2.0   # type stubs for pandas so mypy understands DataFrames

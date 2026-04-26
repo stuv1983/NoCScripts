@@ -1,0 +1,138 @@
+{
+  "_comment": "N-able CVE Dashboard \u2014 product configuration. Add rows to 'product_map' to match software N-able detects against your patch report. Keys are lowercased substrings matched against the patch report product name; values are the internal canonical name. Entries are matched top-to-bottom \u2014 put more-specific strings before less-specific ones. 'fixed_version_rules' maps canonical_name \u2192 {CVE-ID: minimum_fixed_version}.",
+  "product_map": [
+    [
+      "microsoft sql server management studio",
+      "ssms"
+    ],
+    [
+      "microsoft office 365",
+      "office365"
+    ],
+    [
+      "microsoft office",
+      "office"
+    ],
+    [
+      "microsoft edge",
+      "edge"
+    ],
+    [
+      "mozilla firefox",
+      "firefox"
+    ],
+    [
+      "google chrome",
+      "chrome"
+    ],
+    [
+      "windows 11",
+      "windows"
+    ],
+    [
+      "windows 10",
+      "windows"
+    ],
+    [
+      "windows",
+      "windows"
+    ],
+    [
+      "vlc media player",
+      "vlc"
+    ],
+    [
+      "zoom",
+      "zoom"
+    ],
+    [
+      "adobe acrobat",
+      "acrobat"
+    ],
+    [
+      "adobe reader",
+      "acrobat"
+    ],
+    [
+      "7-zip",
+      "7zip"
+    ],
+    [
+      "notepad++",
+      "notepadpp"
+    ]
+  ],
+  "fixed_version_rules": {
+    "_comment": "Per-CVE minimum fixed versions + optional rolling baseline. Add '_baseline': 'version' to enforce a minimum version even without a specific CVE rule. Update baselines monthly as vendors release new versions.",
+    "chrome": {
+      "_baseline": "136.0.7103.116",
+      "CVE-2026-5289": "136.0.7103.116",
+      "CVE-2026-5290": "136.0.7103.116",
+      "CVE-2026-5288": "136.0.7103.116"
+    },
+    "firefox": {
+      "_baseline": "149.0",
+      "CVE-2026-3916": "147.0",
+      "CVE-2026-4710": "149.0",
+      "CVE-2026-4689": "149.0",
+      "CVE-2026-4692": "149.0",
+      "CVE-2026-53766": "147.0"
+    },
+    "edge": {
+      "_baseline": "136.0.3240.64",
+      "CVE-2026-5289": "136.0.3240.64",
+      "CVE-2026-5290": "136.0.3240.64",
+      "CVE-2026-5288": "136.0.3240.64"
+    },
+    "vlc": {
+      "_baseline": "3.0.21"
+    },
+    "ssms": {},
+    "office": {},
+    "office365": {}
+  },
+  "remediation_rules": {
+    "_comment": "Product-specific remediation steps. Keys match canonical product names from product_map.",
+    "firefox": [
+      "Deploy Firefox update via RMM software deployment",
+      "Enable Firefox auto-update policy via Group Policy (DisableAppUpdate = 0)",
+      "AppData installs (%APPDATA%\\Mozilla) bypass managed update \u2014 redeploy as SYSTEM install"
+    ],
+    "chrome": [
+      "Deploy Chrome update via RMM software deployment",
+      "Verify Google Update service is running: services.msc \u2192 gupdate/gupdatem",
+      "Enforce update policy via Group Policy: Computer Config \u2192 Google \u2192 Update \u2192 Auto-update",
+      "AppData installs (%LOCALAPPDATA%\\Google\\Chrome) bypass managed update \u2014 redeploy as SYSTEM"
+    ],
+    "edge": [
+      "Run: winget upgrade Microsoft.Edge or deploy via RMM",
+      "Check Microsoft Edge Update service status in services.msc",
+      "For AppData installs (%LOCALAPPDATA%\\Microsoft\\Edge) \u2014 redeploy as managed package"
+    ],
+    "vlc": [
+      "Deploy VLC update via RMM software deployment",
+      "VLC has no background updater \u2014 manual or RMM deployment required on each affected device"
+    ],
+    "ssms": [
+      "Download latest SSMS from Microsoft and deploy via RMM",
+      "SSMS does not auto-update \u2014 schedule quarterly manual update cycle"
+    ]
+  },
+  "rmm_inventory_columns": {
+    "_comment": "Expected column order when N-able Device Inventory has no header row. Update if N-able changes the export format.",
+    "positional_headers": [
+      "Type",
+      "Client",
+      "Site",
+      "Device",
+      "Description",
+      "OS",
+      "Username",
+      "Last Response",
+      "Last Boot"
+    ],
+    "device_col": "Device",
+    "last_response_col": "Last Response",
+    "os_col": "OS"
+  }
+}

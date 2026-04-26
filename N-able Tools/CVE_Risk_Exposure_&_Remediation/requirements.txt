@@ -1,0 +1,11 @@
+# Production dependencies — install with: pip install -r requirements.txt
+#
+# Version strategy: minimum compatible version pinned (>=), not exact.
+# Exact pinning (==) is preferred for reproducible builds but requires
+# a lockfile workflow (pip-compile). For a team tool without CI, >= is
+# the practical balance between stability and security patch uptake.
+
+pandas>=2.0
+xlsxwriter>=3.1
+openpyxl>=3.1       # pandas needs this engine to read .xlsx files
+tkcalendar>=1.6     # DateEntry widget in the GUI
