@@ -266,8 +266,7 @@ def build_overview_sheet(workbook, merged_df, filtered_df, triage_df, threshold,
                           patch_confirmed_count=0, redetected_count=0,
                           sheet_name='Detections', trend_metrics=None,
                           health_score: Optional[dict] = None,
-                          evidence_summary: Optional[dict] = None,
-                          recommended_actions: Optional[list] = None):
+                          evidence_summary: Optional[dict] = None):
     ws = workbook.add_worksheet(sheet_name)
 
     # ── Format definitions ────────────────────────────────────────────────────
@@ -321,13 +320,13 @@ def build_overview_sheet(workbook, merged_df, filtered_df, triage_df, threshold,
     # Build patch status counts from evidence_summary (if available)
     # Map display labels to their tile category
     _TILE_ORDER = [
-        ('Patch required',                           alert_fmt, 'Patch Required'),
-        ('Device missing from patch report',          warn_fmt,  'Missing from Patch Report'),
-        ('Patched but still detected (rescan required)', warn_fmt, 'Patched / Rescan Needed'),
-        ('Patched but still vulnerable (rescan required)', warn_fmt, 'Patched / Rescan Needed'),
-        ('Product not tracked',                       warn_fmt,  'Product Not Tracked'),
-        ('Installed but version unknown',             warn_fmt,  'Version Unknown'),
-        ('No patch baseline defined',                 info_fmt,  'No Baseline Defined'),
+        ('Patch required',                               alert_fmt, 'Patch Required',           'patch required'),
+        ('Device missing from patch report',             warn_fmt,  'Missing from Patch Report', 'missing from report'),
+        ('Patched but still detected (rescan required)', warn_fmt,  'Patched / Rescan Needed',   'rescan needed'),
+        ('Patched but still vulnerable (rescan required)', warn_fmt, 'Patched / Rescan Needed',  'rescan needed'),
+        ('Product not tracked',                          warn_fmt,  'Product Not Tracked',       'not tracked'),
+        ('Installed but version unknown',                warn_fmt,  'Version Unknown',           'version unknown'),
+        ('No patch baseline defined',                    info_fmt,  'No Baseline Defined',       'no baseline'),
     ]
 
     if evidence_summary:
@@ -338,7 +337,7 @@ def build_overview_sheet(workbook, merged_df, filtered_df, triage_df, threshold,
                  'not confirmed root cause.', note_fmt)
 
         tile_col = 0
-        for label, tile_colour, tile_title in _TILE_ORDER:
+        for label, tile_colour, tile_title, sub_label in _TILE_ORDER:
             count = evidence_summary.get(label, 0)
             if count == 0:
                 continue
@@ -347,31 +346,12 @@ def build_overview_sheet(workbook, merged_df, filtered_df, triage_df, threshold,
             ws.merge_range(row_offset + 3, tile_col, row_offset + 3, tile_col + 1,
                            count, count_fmt)
             ws.merge_range(row_offset + 4, tile_col, row_offset + 4, tile_col + 1,
-                           'devices', lbl_sm)
+                           sub_label, lbl_sm)
             tile_col += 2
             if tile_col > 8:
                 break
 
-        # Recommended Actions immediately below tiles
-        if recommended_actions:
-            act_row = row_offset + 6
-            act_hdr_fmt = workbook.add_format({
-                'bold': True, 'font_size': 11,
-                'bg_color': '#2E4057', 'font_color': 'white', 'border': 1,
-            })
-            act_num_fmt = workbook.add_format({'bold': True, 'font_color': '#2E4057'})
-            act_txt_fmt = workbook.add_format({'text_wrap': True, 'valign': 'top'})
-            ws.merge_range(act_row, 0, act_row, 9, 'Recommended Actions', act_hdr_fmt)
-            for i, act in enumerate(recommended_actions, start=1):
-                r = act_row + i
-                ws.write(r, 0, f'{i}.', act_num_fmt)
-                ws.merge_range(r, 1, r, 7, act['action'], act_txt_fmt)
-                ws.write(r, 8, act['count'], workbook.add_format({'align': 'center', 'bold': True}))
-                ws.write(r, 9, 'devices', lbl_sm)
-                ws.set_row(r, 28)
-            row_offset = act_row + len(recommended_actions) + 2
-        else:
-            row_offset = row_offset + 8
+        row_offset = row_offset + 8
     else:
         row_offset = row_offset  # no patch data — keep at 2
 

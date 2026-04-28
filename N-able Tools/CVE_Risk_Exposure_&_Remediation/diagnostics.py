@@ -115,47 +115,6 @@ _GENERIC: dict[str, list[str]] = {
 }
 
 
-def compute_recommended_actions(root_cause_df: pd.DataFrame,
-                                max_actions: int = 3) -> list[dict]:
-    """
-    Top N prioritised actions from the evidence data — sorted by device count.
-    Returns list of dicts ready for the overview sheet or a stakeholder summary.
-    """
-    if root_cause_df.empty or 'Patch Evidence Notes' not in root_cause_df.columns:
-        return []
-
-    _rev = {v: k for k, v in DISPLAY_MAP.items()}
-    _TEMPLATE: dict[str, str] = {
-        'version_below_fixed': 'Update {product} on {n} device(s) — installed version is below the required fix',
-        'coverage_gap':        'Investigate {n} device(s) missing from patch report — check RMM agent status',
-        'version_compliant':   'Trigger re-scan on {n} device(s) — patch installed but CVE still detected',
-        'detection_mismatch':  'Trigger re-scan on {n} device(s) — patched but still showing as vulnerable',
-        'unmanaged_app':       'Add {product} to patch tracking — {n} device(s) affected and untracked',
-        'no_fixed_baseline':   'Define fixed version for {product} in config.json — {n} device(s) unverifiable',
-        'no_version_data':     'Fix RMM telemetry on {n} device(s) — patch installed but version not recorded',
-    }
-
-    agg: dict[tuple[str, str], set[str]] = {}
-    for _, row in root_cause_df.iterrows():
-        label  = str(row.get('Patch Evidence Notes', ''))
-        prod   = str(row.get('Product', ''))
-        device = str(row.get('Device', ''))
-        agg.setdefault((label, prod), set()).add(device)
-
-    actions = []
-    for (label, prod), devices in agg.items():
-        cause = _rev.get(label, '')
-        n     = len(devices)
-        bp    = get_base_product(prod).title()
-        actions.append({
-            'label':   label,
-            'cause':   cause,
-            'product': bp,
-            'count':   n,
-            'action':  _TEMPLATE.get(cause, f'{label} on {{n}} device(s)').format(n=n, product=bp),
-        })
-
-    return sorted(actions, key=lambda x: -x['count'])[:max_actions]
 
 def get_recommendations(cause: str, product: str,
                         product_rules: Optional[dict] = None) -> list[str]:
@@ -258,5 +217,4 @@ def compute_patch_diagnostics(patch_full_df: pd.DataFrame,
         "root_cause_df":       root_cause_df,
         "health_score":        health,
         "evidence_summary":    summary,
-        "recommended_actions": compute_recommended_actions(root_cause_df),
     }

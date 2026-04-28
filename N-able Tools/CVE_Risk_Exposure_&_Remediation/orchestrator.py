@@ -274,7 +274,6 @@ def run(request: DashboardRequest) -> DashboardResult:
                 trend_metrics=trend_data['metrics'] if trend_data else None,
                 health_score=diagnostics.get('health_score'),
                 evidence_summary=diagnostics.get('evidence_summary'),
-                recommended_actions=diagnostics.get('recommended_actions'),
             )
 
             if trend_data:
