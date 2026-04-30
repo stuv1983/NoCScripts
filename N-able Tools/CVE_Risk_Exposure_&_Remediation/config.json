@@ -42,6 +42,22 @@
       "vlc"
     ],
     [
+      "firefox",
+      "firefox"
+    ],
+    [
+      "chrome",
+      "chrome"
+    ],
+    [
+      "edge",
+      "edge"
+    ],
+    [
+      "vlc",
+      "vlc"
+    ],
+    [
       "zoom",
       "zoom"
     ],
@@ -66,14 +82,12 @@
     "_comment": "Per-CVE minimum fixed versions + optional rolling baseline. Add '_baseline': 'version' to enforce a minimum version even without a specific CVE rule. Update baselines monthly as vendors release new versions.",
     "chrome": {
       "_baseline": "136.0.7103.116",
-      "_baseline_updated": "2026-04-28",
       "CVE-2026-5289": "136.0.7103.116",
       "CVE-2026-5290": "136.0.7103.116",
       "CVE-2026-5288": "136.0.7103.116"
     },
     "firefox": {
       "_baseline": "149.0",
-      "_baseline_updated": "2026-04-28",
       "CVE-2026-3916": "147.0",
       "CVE-2026-4710": "149.0",
       "CVE-2026-4689": "149.0",
@@ -82,14 +96,12 @@
     },
     "edge": {
       "_baseline": "136.0.3240.64",
-      "_baseline_updated": "2026-04-28",
       "CVE-2026-5289": "136.0.3240.64",
       "CVE-2026-5290": "136.0.3240.64",
       "CVE-2026-5288": "136.0.3240.64"
     },
     "vlc": {
-      "_baseline": "3.0.21",
-      "_baseline_updated": "2026-04-28"
+      "_baseline": "3.0.21"
     },
     "ssms": {},
     "office": {},

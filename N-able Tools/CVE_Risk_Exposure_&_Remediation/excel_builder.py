@@ -266,7 +266,8 @@ def build_overview_sheet(workbook, merged_df, filtered_df, triage_df, threshold,
                           patch_confirmed_count=0, redetected_count=0,
                           sheet_name='Detections', trend_metrics=None,
                           health_score: Optional[dict] = None,
-                          evidence_summary: Optional[dict] = None):
+                          evidence_summary: Optional[dict] = None,
+                          recommended_actions: Optional[list] = None):
     ws = workbook.add_worksheet(sheet_name)
 
     # ── Format definitions ────────────────────────────────────────────────────
@@ -320,13 +321,13 @@ def build_overview_sheet(workbook, merged_df, filtered_df, triage_df, threshold,
     # Build patch status counts from evidence_summary (if available)
     # Map display labels to their tile category
     _TILE_ORDER = [
-        ('Patch required',                               alert_fmt, 'Patch Required',           'patch required'),
-        ('Device missing from patch report',             warn_fmt,  'Missing from Patch Report', 'missing from report'),
-        ('Patched but still detected (rescan required)', warn_fmt,  'Patched / Rescan Needed',   'rescan needed'),
-        ('Patched but still vulnerable (rescan required)', warn_fmt, 'Patched / Rescan Needed',  'rescan needed'),
-        ('Product not tracked',                          warn_fmt,  'Product Not Tracked',       'not tracked'),
-        ('Installed but version unknown',                warn_fmt,  'Version Unknown',           'version unknown'),
-        ('No patch baseline defined',                    info_fmt,  'No Baseline Defined',       'no baseline'),
+        ('Patch required',                           alert_fmt, 'Patch Required'),
+        ('Device missing from patch report',          warn_fmt,  'Missing from Patch Report'),
+        ('Patched but still detected (rescan required)', warn_fmt, 'Patched / Rescan Needed'),
+        ('Patched but still vulnerable (rescan required)', warn_fmt, 'Patched / Rescan Needed'),
+        ('Product not tracked',                       warn_fmt,  'Product Not Tracked'),
+        ('Installed but version unknown',             warn_fmt,  'Version Unknown'),
+        ('No patch baseline defined',                 info_fmt,  'No Baseline Defined'),
     ]
 
     if evidence_summary:
@@ -337,7 +338,7 @@ def build_overview_sheet(workbook, merged_df, filtered_df, triage_df, threshold,
                  'not confirmed root cause.', note_fmt)
 
         tile_col = 0
-        for label, tile_colour, tile_title, sub_label in _TILE_ORDER:
+        for label, tile_colour, tile_title in _TILE_ORDER:
             count = evidence_summary.get(label, 0)
             if count == 0:
                 continue
@@ -346,12 +347,31 @@ def build_overview_sheet(workbook, merged_df, filtered_df, triage_df, threshold,
             ws.merge_range(row_offset + 3, tile_col, row_offset + 3, tile_col + 1,
                            count, count_fmt)
             ws.merge_range(row_offset + 4, tile_col, row_offset + 4, tile_col + 1,
-                           sub_label, lbl_sm)
+                           'devices', lbl_sm)
             tile_col += 2
             if tile_col > 8:
                 break
 
-        row_offset = row_offset + 8
+        # Recommended Actions immediately below tiles
+        if recommended_actions:
+            act_row = row_offset + 6
+            act_hdr_fmt = workbook.add_format({
+                'bold': True, 'font_size': 11,
+                'bg_color': '#2E4057', 'font_color': 'white', 'border': 1,
+            })
+            act_num_fmt = workbook.add_format({'bold': True, 'font_color': '#2E4057'})
+            act_txt_fmt = workbook.add_format({'text_wrap': True, 'valign': 'top'})
+            ws.merge_range(act_row, 0, act_row, 9, 'Recommended Actions', act_hdr_fmt)
+            for i, act in enumerate(recommended_actions, start=1):
+                r = act_row + i
+                ws.write(r, 0, f'{i}.', act_num_fmt)
+                ws.merge_range(r, 1, r, 7, act['action'], act_txt_fmt)
+                ws.write(r, 8, act['count'], workbook.add_format({'align': 'center', 'bold': True}))
+                ws.write(r, 9, 'devices', lbl_sm)
+                ws.set_row(r, 28)
+            row_offset = act_row + len(recommended_actions) + 2
+        else:
+            row_offset = row_offset + 8
     else:
         row_offset = row_offset  # no patch data — keep at 2
 
@@ -754,6 +774,119 @@ def build_diagnostics_sheets(writer, diagnostics: dict) -> None:
             ws.set_row(i, None, red if spread >= 4 else amb if spread >= 2 else grn)
         ws.write(len(drift_df) + 2, 0,
                  'High distinct-version count = inconsistent update cadence across fleet.', note)
+        # Note products with no version data (patch tool not tracking them)
+        no_data = diagnostics.get('version_drift_no_data', [])
+        if no_data:
+            ws.write(len(drift_df) + 4, 0,
+                     f'ℹ  No version data for: {", ".join(no_data)} — '
+                     f'these products are not returning version numbers from the patch tool. '
+                     f'Version drift cannot be assessed until they are tracked.',
+                     wb.add_format({'italic': True, 'font_color': '#7F6000', 'text_wrap': True}))
+    else:
+        # Still create the sheet with an explanation
+        ws = writer.book.add_worksheet('Version Drift')
+        no_data = diagnostics.get('version_drift_no_data', [])
+        if no_data:
+            ws.write(0, 0,
+                     f'No version data available for: {", ".join(no_data)}. '
+                     f'These products are detected by N-able but the patch tool is not '
+                     f'returning installed version numbers — they may not be in your patch '
+                     f'policy scope. Version drift cannot be assessed.',
+                     wb.add_format({'italic': True, 'font_color': '#7F6000', 'text_wrap': True}))
+            ws.set_column('A:A', 80)
+            ws.set_row(0, 50)
+
+
+def build_patch_failure_sheet(writer, failure_df: 'pd.DataFrame',
+                              failure_lookup: dict,
+                              cve_device_overlap: 'pd.DataFrame',
+                              inventory_devices: 'set | None' = None) -> None:
+    """
+    inventory_devices: normalised device names from the RMM inventory.
+    If supplied, devices absent from the inventory are excluded — they are
+    decommissioned and patch failures on them are not actionable.
+    """
+    import pandas as pd
+    wb  = writer.book
+    red = wb.add_format({'bg_color': '#FCE4D6'})
+    amb = wb.add_format({'bg_color': '#FFF2CC'})
+    grn = wb.add_format({'bg_color': '#E2EFDA'})
+    hdr = wb.add_format({'bold': True, 'bg_color': '#D9D9D9', 'border': 1})
+    note_fmt = wb.add_format({'italic': True, 'font_color': '#595959'})
+
+    # ── Sheet 1: Device failure summary ──────────────────────────────────────
+    # Filter to active (inventoried) devices only — decommissioned devices
+    # appear in patch reports but are not actionable.
+    active_lookup = failure_lookup
+    excluded_count = 0
+    if inventory_devices:
+        active_lookup  = {d: info for d, info in failure_lookup.items()
+                          if d in inventory_devices}
+        excluded_count = len(failure_lookup) - len(active_lookup)
+        if excluded_count:
+            log.info("Patch Failures: excluded %d decommissioned device(s) "
+                     "not in Device Inventory", excluded_count)
+
+    rows = []
+    for device, info in sorted(active_lookup.items(),
+                               key=lambda x: -x[1]['failure_count']):
+        rows.append({
+            'Device':               device,
+            'Total Failures':       info['failure_count'],
+            'Unique KBs Failing':   info['unique_kbs'],
+            'Primary Failure Type': info['top_category'].replace('_', ' ').title(),
+            'Description':          info['top_description'],
+            'All Categories':       ', '.join(f"{k.replace('_',' ').title()}: {v}"
+                                             for k, v in info['categories'].items()),
+        })
+    if not rows:
+        return
+
+    summary_df = pd.DataFrame(rows)
+    summary_df.to_excel(writer, sheet_name='Patch Failures', index=False)
+    ws = writer.sheets['Patch Failures']
+    ws.autofilter(0, 0, len(summary_df), len(summary_df.columns) - 1)
+    ws.set_column('A:A', 26); ws.set_column('D:D', 30)
+    ws.set_column('E:E', 55); ws.set_column('F:F', 55)
+
+    # Colour by failure count severity
+    for i, row in enumerate(rows, start=1):
+        fc = row['Total Failures']
+        ws.set_row(i, None, red if fc >= 20 else amb if fc >= 5 else grn)
+
+    # Category totals (active devices only)
+    active_devices_set = set(active_lookup.keys())
+    active_fail = failure_df[failure_df['_device_norm'].isin(active_devices_set)]
+    cat_totals = active_fail['_failure_cat'].value_counts()
+    ws.write(len(summary_df) + 2, 0, 'Failure category totals (active devices):', hdr)
+    for i, (cat, count) in enumerate(cat_totals.items()):
+        ws.write(len(summary_df) + 3 + i, 0, f'  {cat.replace("_"," ").title()}')
+        ws.write(len(summary_df) + 3 + i, 1, count)
+
+    if excluded_count:
+        ws.write(len(summary_df) + 3 + len(cat_totals) + 1, 0,
+                 f'  ℹ  {excluded_count} device(s) excluded — not in Device Inventory '
+                 f'(decommissioned)',
+                 wb.add_format({'italic': True, 'font_color': '#595959'}))
+
+    # ── CVEs on failing devices ───────────────────────────────────────────────
+    if not cve_device_overlap.empty:
+        out_cols = [c for c in ['Name', 'Vulnerability Name', 'Vulnerability Score',
+                                'Affected Products', 'Has Known Exploit']
+                    if c in cve_device_overlap.columns]
+        overlap = cve_device_overlap[out_cols].drop_duplicates().sort_values(
+            'Vulnerability Score', ascending=False) if 'Vulnerability Score' in out_cols else cve_device_overlap[out_cols]
+        overlap.to_excel(writer, sheet_name='CVEs on Failing Devices', index=False)
+        ws2 = writer.sheets['CVEs on Failing Devices']
+        ws2.autofilter(0, 0, len(overlap), len(overlap.columns) - 1)
+        ws2.set_column('A:A', 26); ws2.set_column('B:B', 22); ws2.set_column('D:D', 32)
+        ws2.write(len(overlap) + 2, 0,
+                  'These CVEs are on devices where patches are actively failing. '
+                  'Resolving the patch delivery issue (see Patch Failures sheet) '
+                  'should also clear these CVEs.', note_fmt)
+        log.debug("CVEs on Failing Devices sheet: %d rows", len(overlap))
+
+    log.debug("Patch Failures sheet: %d devices", len(rows))
 
 
 def build_stale_excluded_sheet(writer, stale_df) -> None:

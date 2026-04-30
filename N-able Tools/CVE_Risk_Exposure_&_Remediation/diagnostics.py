@@ -115,6 +115,47 @@ _GENERIC: dict[str, list[str]] = {
 }
 
 
+def compute_recommended_actions(root_cause_df: pd.DataFrame,
+                                max_actions: int = 3) -> list[dict]:
+    """
+    Top N prioritised actions from the evidence data — sorted by device count.
+    Returns list of dicts ready for the overview sheet or a stakeholder summary.
+    """
+    if root_cause_df.empty or 'Patch Evidence Notes' not in root_cause_df.columns:
+        return []
+
+    _rev = {v: k for k, v in DISPLAY_MAP.items()}
+    _TEMPLATE: dict[str, str] = {
+        'version_below_fixed': 'Update {product} on {n} device(s) — installed version is below the required fix',
+        'coverage_gap':        'Investigate {n} device(s) missing from patch report — check RMM agent status',
+        'version_compliant':   'Trigger re-scan on {n} device(s) — patch installed but CVE still detected',
+        'detection_mismatch':  'Trigger re-scan on {n} device(s) — patched but still showing as vulnerable',
+        'unmanaged_app':       'Add {product} to patch tracking — {n} device(s) affected and untracked',
+        'no_fixed_baseline':   'Define fixed version for {product} in config.json — {n} device(s) unverifiable',
+        'no_version_data':     'Fix RMM telemetry on {n} device(s) — patch installed but version not recorded',
+    }
+
+    agg: dict[tuple[str, str], set[str]] = {}
+    for _, row in root_cause_df.iterrows():
+        label  = str(row.get('Patch Evidence Notes', ''))
+        prod   = str(row.get('Product', ''))
+        device = str(row.get('Device', ''))
+        agg.setdefault((label, prod), set()).add(device)
+
+    actions = []
+    for (label, prod), devices in agg.items():
+        cause = _rev.get(label, '')
+        n     = len(devices)
+        bp    = get_base_product(prod).title()
+        actions.append({
+            'label':   label,
+            'cause':   cause,
+            'product': bp,
+            'count':   n,
+            'action':  _TEMPLATE.get(cause, f'{label} on {{n}} device(s)').format(n=n, product=bp),
+        })
+
+    return sorted(actions, key=lambda x: -x['count'])[:max_actions]
 
 def get_recommendations(cause: str, product: str,
                         product_rules: Optional[dict] = None) -> list[str]:
@@ -196,12 +237,17 @@ def compute_patch_diagnostics(patch_full_df: pd.DataFrame,
 
     # ── Version drift ─────────────────────────────────────────────────────────
     drift_rows = []
+    no_version_data_products = []
     if "Matched Patch Version" in df.columns:
         df["_bp"] = df["Affected Products"].apply(get_base_product)
         for prod, grp in df.groupby("_bp"):
             vers = (grp["Matched Patch Version"].dropna().astype(str).str.strip()
                     .loc[lambda s: s.str.len() > 0].unique().tolist())
-            if len(set(vers)) < 2: continue
+            if len(set(vers)) < 2:
+                if len(vers) == 0:
+                    # Product detected but patch tool returns no version data
+                    no_version_data_products.append(prod)
+                continue
             drift_rows.append({
                 "Product":           prod,
                 "Distinct Versions": len(set(vers)),
@@ -211,10 +257,16 @@ def compute_patch_diagnostics(patch_full_df: pd.DataFrame,
     version_drift_df = (pd.DataFrame(drift_rows).sort_values(
         "Distinct Versions", ascending=False, ignore_index=True) if drift_rows else _e)
 
+    if no_version_data_products:
+        log.info("Version drift: no version data for %s — not in patch tool scope",
+                 ", ".join(no_version_data_products))
+
     return {
-        "patch_lag_df":        patch_lag_df,
-        "version_drift_df":    version_drift_df,
-        "root_cause_df":       root_cause_df,
-        "health_score":        health,
-        "evidence_summary":    summary,
+        "patch_lag_df":            patch_lag_df,
+        "version_drift_df":        version_drift_df,
+        "version_drift_no_data":   no_version_data_products,
+        "root_cause_df":           root_cause_df,
+        "health_score":            health,
+        "evidence_summary":        summary,
+        "recommended_actions":     compute_recommended_actions(root_cause_df),
     }

@@ -8,7 +8,6 @@ No product data lives in this file or any other Python file.
 import json
 import logging
 import re
-from datetime import date
 from pathlib import Path
 from typing import Optional, Set, Tuple
 
@@ -103,42 +102,3 @@ STATUS_LABEL: dict = {
     'Failed':          'Matched - failed',
 }
 INSTALLED_STATUSES: Set[str] = {'Installed', 'Reboot Required'}
-
-
-def _check_baseline_freshness(rules: dict, stale_days: int = 30) -> None:
-    today = date.today()
-    for product, entry in rules.items():
-        if product.startswith('_'):
-            continue
-        baseline = entry.get('_baseline')
-        updated  = entry.get('_baseline_updated')
-        if not baseline or not updated:
-            continue
-        try:
-            updated_date = date.fromisoformat(updated)
-        except ValueError:
-            log.warning("config.json: %s '_baseline_updated' is not a valid ISO date: %r", product, updated)
-            continue
-        age = (today - updated_date).days
-        if age > stale_days:
-            log.warning(
-                "%s baseline (%s) last updated %s — consider reviewing (%d days ago)",
-                product, baseline, updated, age,
-            )
-
-
-def _check_product_map_order(pm: list) -> None:
-    keys = [k for k, _ in pm]
-    for i, ki in enumerate(keys):
-        for j in range(i + 1, len(keys)):
-            kj = keys[j]
-            if ki in kj:
-                log.warning(
-                    "product_map order issue: %r (index %d) is a substring of %r (index %d) — "
-                    "more specific entries must come first",
-                    ki, i, kj, j,
-                )
-
-
-_check_baseline_freshness(FIXED_VERSION_RULES)
-_check_product_map_order(PRODUCT_MAP)

@@ -441,14 +441,27 @@ def merge_data(df_vuln, df_rmm, skip_rmm):
         if not vuln_has_dt: rmm_pull.append('Device Type')
 
         if len(rmm_pull) > 1:
+            before = len(df_vuln)
+            # INNER join: devices absent from the inventory are decommissioned.
+            # Their CVEs are excluded entirely — no "Not Found in RMM" tracking.
             merged = pd.merge(df_vuln, df_rmm[rmm_pull],
-                              left_on='Name_Join', right_on='Device_Join', how='left')
-            if not vuln_has_lr:
-                merged['Last Response'] = merged['Last Response'].fillna('Not Found in RMM')
+                              left_on='Name_Join', right_on='Device_Join', how='inner')
+            dropped = before - len(merged)
+            if dropped:
+                decom_names = (
+                    set(df_vuln['Name_Join'].unique())
+                    - set(df_rmm['Device_Join'].unique())
+                )
+                log.info(
+                    "Excluded %d CVE rows for %d decommissioned device(s) "
+                    "(not in Device Inventory): %s%s",
+                    dropped, len(decom_names),
+                    ', '.join(sorted(decom_names)[:5]),
+                    ' ...' if len(decom_names) > 5 else '',
+                )
             if not vuln_has_dt:
                 merged['Device Type'] = merged['Device Type'].fillna('Unknown')
         else:
-            # CVE export already has both columns — no merge needed
             merged = df_vuln.copy()
     else:
         merged = df_vuln.copy()
@@ -524,6 +537,123 @@ def merge_data(df_vuln, df_rmm, skip_rmm):
 # ==============================================================================
 # DATA PIPELINE: PATCH MATCH
 # ==============================================================================
+
+def _apply_cascade_resolution(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Version-based cascade resolution.
+
+    After per-row `_classify_resolution`, find any rows still Unresolved where
+    we already know from another row that the device has a product version that
+    satisfies the fixed-version threshold for that CVE.
+
+    Logic:
+      1. Collect best known (device, product_key, installed_version, install_date)
+         from any rows where Matched Patch Version is populated.
+      2. For each CVE in FIXED_VERSION_RULES, check whether any device's known
+         version for that product_key >= fixed version AND install_date >= first_detected.
+      3. If so, mark the Unresolved row as 'Resolved (cascade)'.
+
+    This specifically handles the case where CVE-5288, 5289, 5290 all share the
+    same Edge fixed version. Once we confirm Edge is at 147.x (which resolves 5290),
+    5288 and 5289 are also satisfied by the same installed version.
+
+    Does NOT cross product boundaries — an Edge install never resolves a Chrome CVE.
+    """
+    if df.empty or 'Matched Patch Version' not in df.columns:
+        return df
+
+    df = df.copy()
+
+    # Step 1: build best installed version per (device, product_key)
+    df['_cascade_pk'] = df.get('_pk', df['Affected Products'].apply(
+        lambda v: _detect_product(str(v).lower())))
+    has_ver = df[df['Matched Patch Version'].astype(str).str.strip().str.len() > 2].copy()
+    has_ver['_vt'] = has_ver['Matched Patch Version'].apply(_parse_version)
+    has_ver = has_ver[has_ver['_vt'].notna()]
+    if has_ver.empty:
+        return df
+
+    best_ver: dict[tuple, dict] = {}
+    for _, row in has_ver.iterrows():
+        key = (str(row['Name']), str(row['_cascade_pk']))
+        vt  = row['_vt']
+        if key not in best_ver or vt > best_ver[key]['_vt']:
+            best_ver[key] = {
+                '_vt':          vt,
+                'version_str':  str(row['Matched Patch Version']),
+                'install_date': row.get('Patch Install Date', pd.NaT),
+            }
+
+    # Step 2: build set of (device, product_key, cve_id) that cascade-satisfy
+    # Priority: explicit CVE rule > _baseline for that product.
+    # For CVEs with no explicit rule, the product _baseline acts as the threshold —
+    # "if the device is above the minimum safe version, all CVEs fixed by that release
+    # are considered resolved."
+    cascade_resolve: set[tuple[str, str, str]] = set()
+
+    # Build per-product baseline lookup for CVEs without explicit rules
+    product_baselines: dict[str, tuple] = {}
+    for pk, rules in FIXED_VERSION_RULES.items():
+        if isinstance(rules, dict) and '_baseline' in rules:
+            bt = _parse_version(rules['_baseline'])
+            if bt:
+                product_baselines[pk] = bt
+
+    for (device, pk), ver_info in best_ver.items():
+        rules = FIXED_VERSION_RULES.get(pk, {})
+        if not isinstance(rules, dict):
+            continue
+
+        # Explicit per-CVE rules first
+        for cve_id, fixed_str in rules.items():
+            if cve_id.startswith('_'):
+                continue
+            fixed_t = _parse_version(fixed_str)
+            if fixed_t and ver_info['_vt'] >= fixed_t:
+                cascade_resolve.add((device, pk, cve_id.upper()))
+
+        # Baseline fallback: covers all CVEs on this product that have no explicit rule.
+        # We don't know the per-CVE threshold, but if the device is above the
+        # minimum safe release we treat all unresolved CVEs on that product as covered.
+        if pk in product_baselines and ver_info['_vt'] >= product_baselines[pk]:
+            # Mark with a sentinel so we can apply to any CVE on this product
+            cascade_resolve.add((device, pk, '_BASELINE_'))
+
+    if not cascade_resolve:
+        return df
+
+    # Step 3: apply to Unresolved rows that match (device, product_key, cve_id)
+    cascade_applied = 0
+    for idx, row in df.iterrows():
+        if str(row.get('Resolved (from Patch Report)', '')).strip() != 'Unresolved':
+            continue
+        device  = str(row['Name'])
+        pk      = str(row.get('_cascade_pk', ''))
+        cve_ids = [c.upper() for c in _extract_cves(str(row.get('Vulnerability Name', '')))]
+
+        # Date check: known install date must post-date first_detected for this row
+        key = (device, pk)
+        if key not in best_ver:
+            continue
+        install_dt = pd.to_datetime(best_ver[key]['install_date'], errors='coerce')
+        first_dt   = pd.to_datetime(row.get('First detected', pd.NaT), errors='coerce')
+        if pd.isna(install_dt) or pd.isna(first_dt) or install_dt < first_dt:
+            continue
+
+        for cve_id in cve_ids:
+            # Match explicit CVE rule OR baseline sentinel
+            if (device, pk, cve_id) in cascade_resolve or \
+               (device, pk, '_BASELINE_') in cascade_resolve:
+                df.at[idx, 'Resolved (from Patch Report)'] = 'Resolved'
+                cascade_applied += 1
+                break
+
+    if cascade_applied:
+        log.info("Cascade resolution: %d additional rows resolved via version compliance",
+                 cascade_applied)
+
+    return df
+
 
 def process_patch_match(patch_path, cve_df, min_score=9.0):
     """
@@ -607,6 +737,18 @@ def process_patch_match(patch_path, cve_df, min_score=9.0):
     # date-comparison logic can find the column by its final name.
     best = best.rename(columns={'Patch': 'Matched Patch', '_pd': 'Patch Install Date'})
     best['Resolved (from Patch Report)'] = best.apply(_classify_resolution, axis=1)
+
+    # ── Cascade resolution: version-based bulk resolve ────────────────────────
+    # If a device has product P at installed version V, and V >= fixed_version(CVE-X, P)
+    # for the same product, mark CVE-X as Resolved regardless of whether that specific
+    # CVE row had a matched patch entry.
+    #
+    # Example: Edge 147 resolves CVE-5290 → Edge 147 also satisfies the fixed version
+    # for CVE-5288 and CVE-5289 (same Edge threshold) → cascade to Resolved.
+    #
+    # Constraint: install date must still post-date the CVE's First detected.
+    # This does NOT cross products (Edge resolving doesn't fix a Chrome CVE).
+    best = _apply_cascade_resolution(best)
 
     best = best.drop(columns=[c for c in best.columns if c.startswith('_')], errors='ignore')
 
@@ -1035,3 +1177,102 @@ def compute_patch_diagnostics(patch_full_df: pd.DataFrame) -> dict:
         'version_drift_df':   version_drift_df,
         'mismatch_summary_df': mismatch_summary_df,
     }
+
+
+# ==============================================================================
+# PATCH FAILURE REPORT
+# ==============================================================================
+
+_FAIL_CATEGORY_MAP = {
+    'reboot_pending':          'Reboot required before patch can install',
+    'catalog_miss':            'Patch not found in WUA catalog — may be superseded',
+    'network_timeout':         'Network timeout during patch download',
+    'cert_failure':            'Certificate verification failed — PME cache may need clearing',
+    'checksum_failure':        'Patch file checksum error — corrupted download',
+    'feature_update_conflict': 'Feature Update in progress — retry after update completes',
+    'third_party_unknown':     'Third-party patch application not recognised by RMM',
+    'agent_timeout':           'RMM agent timed out during install',
+    'install_error':           'Installer returned error code',
+    'unknown':                 'Unknown failure',
+}
+
+def _classify_failure_reason(reason: str) -> str:
+    r = str(reason).lower()
+    if 'reboot is required'         in r: return 'reboot_pending'
+    if 'not found in wua catalog'   in r: return 'catalog_miss'
+    if 'certificate verification'   in r: return 'cert_failure'
+    if 'checksum'                   in r: return 'checksum_failure'
+    if 'feature update'             in r: return 'feature_update_conflict'
+    if 'unknown application'        in r: return 'third_party_unknown'
+    if 'timeout'                    in r: return 'network_timeout'
+    if "couldn't download"          in r: return 'network_timeout'
+    if 'incomplete download'        in r: return 'network_timeout'
+    if 'timed out'                  in r: return 'agent_timeout'
+    if 'operation was canceled'     in r: return 'agent_timeout'
+    if 'value does not fall'        in r: return 'install_error'
+    if 'installation error'         in r: return 'install_error'
+    if 'fatal error'                in r: return 'install_error'
+    if 'process exited'             in r: return 'install_error'
+    return 'unknown'
+
+
+def load_patch_failure_report(file_path: str) -> pd.DataFrame:
+    """
+    Load and classify a patch failure report CSV.
+
+    Returns a DataFrame with columns:
+        Device, Site, Patch, Failure Status, Failure Reason,
+        _device_norm, _failure_cat, _failure_desc, _kbs
+    """
+    df = load_data(file_path)
+
+    rename = {}
+    for col in df.columns:
+        cl = col.lower().strip()
+        if cl == 'device':         rename[col] = 'Device'
+        elif cl == 'site':         rename[col] = 'Site'
+        elif cl == 'client':       rename[col] = 'Client'
+        elif cl == 'patch':        rename[col] = 'Patch'
+        elif 'failure status' in cl: rename[col] = 'Failure Status'
+        elif 'failure reason' in cl: rename[col] = 'Failure Reason'
+        elif 'time' in cl:         rename[col] = 'Time'
+    df = df.rename(columns=rename)
+
+    df['_device_norm']   = df['Device'].apply(normalize_device_name)
+    df['_failure_cat']   = df['Failure Reason'].apply(_classify_failure_reason)
+    df['_failure_desc']  = df['_failure_cat'].map(_FAIL_CATEGORY_MAP)
+    df['_kbs']           = df['Patch'].astype(str).apply(_extract_kbs)
+
+    log.info("Patch failure report: %d rows, %d devices, %d distinct KBs",
+             len(df), df['_device_norm'].nunique(),
+             len({kb for kbs in df['_kbs'] for kb in kbs}))
+    return df
+
+
+def build_patch_failure_lookup(failure_df: pd.DataFrame) -> dict:
+    """
+    Build a dict keyed by normalised device name → failure summary dict.
+
+    {
+      'DEVICE-01': {
+          'failure_count': 40,
+          'unique_kbs': 6,
+          'top_category': 'catalog_miss',
+          'top_description': 'Patch not found in WUA catalog ...',
+          'categories': {'catalog_miss': 30, 'network_timeout': 10},
+      },
+      ...
+    }
+    """
+    result = {}
+    for device, grp in failure_df.groupby('_device_norm'):
+        cats    = grp['_failure_cat'].value_counts().to_dict()
+        top_cat = grp['_failure_cat'].value_counts().index[0]
+        result[device] = {
+            'failure_count':    len(grp),
+            'unique_kbs':       len({kb for kbs in grp['_kbs'] for kb in kbs}),
+            'top_category':     top_cat,
+            'top_description':  _FAIL_CATEGORY_MAP.get(top_cat, top_cat),
+            'categories':       cats,
+        }
+    return result

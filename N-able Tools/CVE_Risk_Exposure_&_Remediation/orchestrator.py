@@ -23,6 +23,7 @@ from data_pipeline import (
     load_vulnerability_data, load_rmm_data, merge_data,
     process_patch_match, load_previous_report, compute_trends,
     normalize_device_name, extract_cve_id, clean_sheet_name,
+    load_patch_failure_report, build_patch_failure_lookup,
 )
 from diagnostics import compute_patch_diagnostics, classify_root_cause
 import snapshot as snap_store
@@ -31,9 +32,30 @@ from excel_builder import (
     build_overview_sheet, build_all_detections_sheet,
     build_product_sheets, build_stale_excluded_sheet,
     build_raw_data_sheet, build_patch_sheets, build_diagnostics_sheets,
+    build_patch_failure_sheet,
 )
 
 log = logging.getLogger(__name__)
+
+
+def _try_sync_baselines() -> None:
+    """
+    Silently attempt to refresh _baseline values in config.json from vendor APIs.
+    Logs results but never raises — a sync failure must not block the dashboard run.
+    """
+    try:
+        from version_sync import sync_baselines
+        updated = sync_baselines()
+        if updated:
+            # Reload FIXED_VERSION_RULES so this run uses the fresh baselines
+            import importlib, config as _cfg_mod
+            importlib.reload(_cfg_mod)
+            log.info("Baselines refreshed: %s",
+                     ', '.join(f'{k}={v}' for k, v in updated.items()))
+        else:
+            log.debug("Baseline sync: no updates (network unavailable or all current)")
+    except Exception as exc:
+        log.debug("Baseline sync skipped: %s", exc)
 
 
 # ==============================================================================
@@ -43,17 +65,19 @@ log = logging.getLogger(__name__)
 @dataclass
 class DashboardRequest:
     """All inputs needed to produce one dashboard workbook."""
-    vuln_path:        str
-    output_path:      str
-    rmm_path:         Optional[str]  = None
-    skip_rmm:         bool           = False
-    patch_path:       Optional[str]  = None
-    include_patch:    bool           = False
-    prev_report_path: Optional[str]  = None
-    include_trend:    bool           = False
-    threshold:        float          = 9.0
-    cutoff_date:      Optional[str]  = None   # ISO date string; None = show all
-    show_all_dates:   bool           = False
+    vuln_path:            str
+    output_path:          str
+    rmm_path:             Optional[str]  = None
+    skip_rmm:             bool           = False
+    patch_path:           Optional[str]  = None
+    include_patch:        bool           = False
+    failure_report_path:  Optional[str]  = None
+    include_failure_report: bool         = False
+    prev_report_path:     Optional[str]  = None
+    include_trend:        bool           = False
+    threshold:            float          = 9.0
+    cutoff_date:          Optional[str]  = None
+    show_all_dates:       bool           = False
 
 
 @dataclass
@@ -82,6 +106,9 @@ def run(request: DashboardRequest) -> DashboardResult:
 
     try:
         log.info("Dashboard run started — output: %s", request.output_path)
+
+        # Refresh version baselines from vendor APIs (silent if offline)
+        _try_sync_baselines()
 
         # ── Load & merge ──────────────────────────────────────────────────────
         log.info("Loading vulnerability data: %s", request.vuln_path)
@@ -274,6 +301,7 @@ def run(request: DashboardRequest) -> DashboardResult:
                 trend_metrics=trend_data['metrics'] if trend_data else None,
                 health_score=diagnostics.get('health_score'),
                 evidence_summary=diagnostics.get('evidence_summary'),
+                recommended_actions=diagnostics.get('recommended_actions'),
             )
 
             if trend_data:
@@ -299,6 +327,40 @@ def run(request: DashboardRequest) -> DashboardResult:
                 build_patch_sheets(writer, patch_data[0], patch_data[1], patch_data[2])
                 if any(not diagnostics[k].empty for k in diagnostics):
                     build_diagnostics_sheets(writer, diagnostics)
+
+            # ── Optional: patch failure report ────────────────────────────────
+            if request.include_failure_report and request.failure_report_path:
+                try:
+                    log.info("Loading patch failure report: %s", request.failure_report_path)
+                    failure_df     = load_patch_failure_report(request.failure_report_path)
+                    failure_lookup = build_patch_failure_lookup(failure_df)
+                    fail_devices   = set(failure_lookup.keys())
+
+                    # Only include active (inventoried) devices
+                    inventory_devices = (
+                        set(df_rmm['Device_Join'].unique()) if df_rmm is not None else None
+                    )
+
+                    cve_overlap    = triage_df[
+                        triage_df['Name'].apply(normalize_device_name).isin(fail_devices)
+                    ].copy()
+                    build_patch_failure_sheet(writer, failure_df, failure_lookup,
+                                              cve_overlap, inventory_devices=inventory_devices)
+                    # Surface in warnings
+                    for dev, info in sorted(failure_lookup.items(),
+                                            key=lambda x: -x[1]['failure_count'])[:3]:
+                        warnings.append(
+                            f"Patch delivery failing on {dev}: "
+                            f"{info['failure_count']} failures — {info['top_description']}"
+                        )
+                    if not cve_overlap.empty:
+                        warnings.append(
+                            f"{cve_overlap['Vulnerability Name'].nunique()} CVE type(s) on "
+                            f"{cve_overlap['Name'].nunique()} device(s) where patches are "
+                            f"actively failing — see 'Patch Failures' sheet"
+                        )
+                except Exception as exc:
+                    log.warning("Could not process patch failure report: %s", exc)
 
         log.info("Workbook written successfully")
 

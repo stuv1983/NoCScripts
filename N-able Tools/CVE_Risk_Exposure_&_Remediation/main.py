@@ -133,17 +133,19 @@ def process_reports():
 
     cutoff_date = None if show_all_dates_var.get() else date_var.get()
     request = DashboardRequest(
-        vuln_path        = vuln_path,
-        output_path      = output_path,
-        rmm_path         = rmm_path or None,
-        skip_rmm         = skip_rmm,
-        patch_path       = patch_path or None,
-        include_patch    = include_patch,
-        prev_report_path = prev_report_path or None,
-        include_trend    = include_trend,
-        threshold        = float(score_var.get()),
-        cutoff_date      = cutoff_date,
-        show_all_dates   = show_all_dates_var.get(),
+        vuln_path              = vuln_path,
+        output_path            = output_path,
+        rmm_path               = rmm_path or None,
+        skip_rmm               = skip_rmm,
+        patch_path             = patch_path or None,
+        include_patch          = include_patch,
+        failure_report_path    = failure_var.get() or None,
+        include_failure_report = include_failure_var.get(),
+        prev_report_path       = prev_report_path or None,
+        include_trend          = include_trend,
+        threshold              = float(score_var.get()),
+        cutoff_date            = cutoff_date,
+        show_all_dates         = show_all_dates_var.get(),
     )
 
     log.info("Starting dashboard generation: %s", output_path)
@@ -232,6 +234,26 @@ patch_browse_btn.pack(side=tk.LEFT, padx=4)
 include_patch_var = tk.BooleanVar()
 tk.Checkbutton(root, text="Include Patch Report matching",
                variable=include_patch_var, command=toggle_patch_state).pack(anchor="w", padx=14)
+
+# ── Patch Failure Report (optional) ───────────────────────────────────────────
+tk.Label(root, text="Patch Failure Report  (optional, CSV)",
+         font=("Arial", 9, "bold")).pack(anchor="w", padx=14, pady=(6, 0))
+failure_var = tk.StringVar()
+failure_frame = tk.Frame(root)
+failure_frame.pack(fill="x", padx=14)
+failure_entry = tk.Entry(failure_frame, textvariable=failure_var, width=44, state="disabled")
+failure_entry.pack(side=tk.LEFT)
+failure_browse_btn = tk.Button(failure_frame, text="Browse",
+                               command=lambda: select_file(failure_var, [("CSV Files","*.csv")]),
+                               state="disabled")
+failure_browse_btn.pack(side=tk.LEFT, padx=4)
+include_failure_var = tk.BooleanVar()
+tk.Checkbutton(root, text="Include Patch Failure analysis",
+               variable=include_failure_var,
+               command=lambda: [
+                   failure_entry.config(state=tk.NORMAL if include_failure_var.get() else tk.DISABLED),
+                   failure_browse_btn.config(state=tk.NORMAL if include_failure_var.get() else tk.DISABLED),
+               ]).pack(anchor="w", padx=14)
 
 tk.Label(root, text="Previous Dashboard  (optional, for M-o-M trends)",
          font=("Arial", 9, "bold")).pack(anchor="w", padx=14, pady=(10, 0))
