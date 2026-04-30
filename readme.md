@@ -4,50 +4,134 @@
 > Run at your own risk. Test thoroughly in a lab environment first. The author is not responsible for any damage, data loss, or unexpected outcomes.
 
 ## Overview
-A collection of **PowerShell and Python scripts** for **NOC / MSP** environments to automate endpoint health checks, patching, vulnerability auditing, and software lifecycle management.  
-All scripts are **RMM-friendly** (clear console output + exit codes) and safe for scheduled automation when properly tested.
+
+A collection of PowerShell and Python scripts for NOC / MSP environments to automate endpoint health checks, patching, vulnerability auditing, browser governance, software lifecycle management, and operational reporting.
+
+The repository is designed around MSP/RMM use cases:
+
+- Clear console output suitable for RMM capture
+- Exit codes that can drive monitoring, alerting, Intune detection, or remediation workflows
+- Conservative behaviour where user interruption should be avoided
+- Audit-first patterns before enforcement
+- Reporting tools for vulnerability, patch, and inventory reconciliation
 
 ---
 
-## 📁 Repository Structure
+## Repository Structure
 
-```
+```text
+NoCScripts/
 ├── N-able Tools/
 │   ├── CVEChecks/
 │   │   └── CVE-2026-20804.ps1
+│   ├── CVE_Risk_Exposure_&_Remediation/
+│   │   ├── config.json
+│   │   ├── config.py
+│   │   ├── data_pipeline.py
+│   │   ├── diagnostics.py
+│   │   ├── excel_builder.py
+│   │   ├── main.py
+│   │   ├── orchestrator.py
+│   │   ├── requirements.txt
+│   │   ├── requirements-dev.txt
+│   │   ├── run_dashboard.py
+│   │   ├── snapshot.py
+│   │   └── version_sync.py
 │   ├── RMMcheck/
 │   │   └── RMMcheck.py
-│   └── N-able_CVE_Dashboard.py
+│   ├── N-able_CVE_Dashboard.py
+│   ├── N-able_PatchReport_Dashboard.py
+│   └── cve_risk_exposure_remediation_dashboard.py
 │
-├── intune/
-│   ├── chrome/
-│   │   ├── Audit-Chrome.ps1
-│   │   ├── Detect-Chrome-Audit.ps1
-│   │   ├── Detect-Chrome.ps1
-│   │   ├── Install-Chrome.ps1
-│   │   └── Uninstall-Audit.ps1
-│   ├── firefox/
-│   │   ├── Audit-Firefox.ps1
-│   │   ├── Detect-Firefox-Audit.ps1
-│   │   ├── Detect-Firefox.ps1
-│   │   ├── Install-Firefox.ps1
-│   │   └── Uninstall-Audit.ps1
-│   ├── office/
-│   │   ├── Detect-OfficeUpdate.ps1
-│   │   └── Force-OfficeUpdate.ps1
-│   ├── teamviewer/
-│   │   ├── Detect-TeamViewer.ps1
-│   │   └── Remove-TeamViewer.ps1
-│   └── vlc/
-│       ├── Detect-VLC.ps1
-│       └── Install-VLC.ps1
+├── RMM/
+│   ├── AVCheck/
+│   │   ├── AVCheck.ps1
+│   │   └── ACCheck(beta).ps1
+│   ├── AutoWindows/
+│   │   └── AutoWindowsUpdate.ps1
+│   ├── Browser-Audit/
+│   │   └── Browser-Audit.ps1
+│   ├── CheckTVInstall/
+│   │   └── checkTVInstall.ps1
+│   ├── DiskCleanUp/
+│   │   └── DiskCleanup.ps1
+│   ├── HDDCheck/
+│   │   └── HDDUsageCheck.ps1
+│   ├── Office Version and Update Channel Audit/
+│   │   └── OfficeVersionandUpdateChannelAudit.ps1
+│   ├── PaperCut Follow Me/
+│   │   └── PaperCutFollowMe.ps1
+│   ├── PrinterCheck/
+│   │   └── printerCheck.ps1
+│   ├── SecurityCheck/
+│   │   └── SecurityCheck.ps1
+│   ├── UpdateFirefoxAndOffice/
+│   │   ├── adobeCheckReport.ps1
+│   │   ├── chromeCheckUpdate.ps1
+│   │   ├── firefoxCheckUpdate.ps1
+│   │   ├── main.ps1
+│   │   ├── officeCheckUpdate.ps1
+│   │   └── UpdateFirefox.ps1
+│   └── UpdateMS365C2R/
+│       └── UpdateMS365C2R.ps1
 │
-├── AVCheck.ps1
-├── SecurityCheck.ps1
-├── AutoWindowsUpdate.ps1
-├── Update-Chrome.ps1
-├── HDDUsageCheck.ps1
-└── AutoDiskCleanup.ps1
+├── handyPSScripts/
+│   └── CalanderPermissions.ps1
+│
+└── intune/
+    ├── chrome/
+    │   ├── Audit-Chrome.ps1
+    │   ├── Detect-Chrome-Audit.ps1
+    │   ├── Detect-Chrome.ps1
+    │   ├── Install-Chrome.ps1
+    │   └── Uninstall-Audit.ps1
+    ├── firefox/
+    │   ├── Audit-Firefox.ps1
+    │   ├── Detect-Firefox-Audit.ps1
+    │   ├── Detect-Firefox.ps1
+    │   └── Install-Firefox.ps1
+    ├── office/
+    │   ├── Detect-OfficeUpdate.ps1
+    │   └── Force-OfficeUpdate.ps1
+    ├── teamviewer/
+    │   ├── Detect-TeamViewer.ps1
+    │   └── Remove-TeamViewer.ps1
+    └── vlc/
+        ├── Detect-VLC.ps1
+        └── Install-VLC.ps1
+```
+
+---
+
+# Quick Start
+
+## PowerShell Scripts
+
+Most scripts can be run directly in PowerShell or through an RMM remote/background task.
+
+```powershell
+Set-ExecutionPolicy Bypass -Scope Process -Force
+.\ScriptName.ps1
+```
+
+For RMM usage, prefer running as **SYSTEM** where the script is designed for device-level checks, and test output/exit codes before deploying broadly.
+
+## Python Tools
+
+Create a virtual environment where possible:
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+For the modular CVE dashboard:
+
+```bash
+cd "N-able Tools/CVE_Risk_Exposure_&_Remediation"
+pip install -r requirements.txt
+python main.py
 ```
 
 ---
@@ -57,23 +141,29 @@ All scripts are **RMM-friendly** (clear console output + exit codes) and safe fo
 ## CVE-2026-20804.ps1
 
 ### Overview
-Audits Windows devices for protection against **CVE-2026-20804** using a UBR-first (Update Build Revision) model.  
-Registry-only OS detection — no WMI/CIM dependency for build information.
+
+Audits Windows devices for protection against **CVE-2026-20804** using a UBR-first model.
+
+The script uses registry-based OS/build detection and treats Update Build Revision (UBR) as the authoritative compliance indicator rather than relying on KB presence.
 
 ### Design Goals
-- UBR is the authoritative compliance indicator (KB presence is not used — cumulative updates are frequently superseded and may not appear in QFE listings even when patched)
-- Independent, optional enforcement of Windows 10 ESU Year 1
-- Reboot detection is informational only and noise-filtered
-- RMM/MSP friendly output and exit codes
+
+- UBR-first compliance model
+- No WMI/CIM dependency for OS build detection
+- Optional Windows 10 ESU Year 1 enforcement
+- Reboot state reported as informational
+- RMM/MSP-friendly output and exit codes
 
 ### Configuration
-| Variable | Default | Description |
-|---|---|---|
-| `$FailIfWin10MissingESU` | `$false` | `$true` = fail Win10 devices if ESU Year 1 is not active |
 
-### January 2026 Baseline (UBR Gates)
-| Build | OS | Min UBR |
-|---|---|---|
+| Variable | Default | Description |
+|---|---:|---|
+| `$FailIfWin10MissingESU` | `$false` | Set to `$true` to fail Windows 10 devices if ESU Year 1 is not active |
+
+### January 2026 Baseline Gates
+
+| Build | OS | Minimum UBR |
+|---:|---|---:|
 | 26100 | Windows 11 24H2 | 7623 |
 | 26200 | Windows 11 25H2 | 7623 |
 | 22631 | Windows 11 23H2 | 6491 |
@@ -82,310 +172,277 @@ Registry-only OS detection — no WMI/CIM dependency for build information.
 | 20348 | Windows Server 2022 | 4648 |
 
 ### Exit Codes
+
 | Code | Meaning |
+|---:|---|
+| `0` | Protected / not in scope / informational script condition |
+| `1` | Vulnerable, below baseline, or ESU missing when policy is enforced |
+
+---
+
+## CVE Risk Exposure & Remediation Dashboard
+
+Path:
+
+```text
+N-able Tools/CVE_Risk_Exposure_&_Remediation/
+```
+
+### Overview
+
+A modular Python CVE analysis pipeline for N-able/MSP vulnerability reporting.
+
+It correlates vulnerability exports, RMM device inventory, patch reports, and previous dashboard outputs to produce an actionable Excel workbook.
+
+This tool is intended to answer:
+
+> Are devices actually remediated, or is the patch/vulnerability tooling giving conflicting evidence?
+
+### Production Dependencies
+
+Install from the included requirements file:
+
+```bash
+pip install -r requirements.txt
+```
+
+Production dependencies include:
+
+- `pandas`
+- `xlsxwriter`
+- `openpyxl`
+- `tkcalendar`
+
+### Architecture
+
+| File | Purpose |
 |---|---|
-| `0` | Protected / Not in scope / Script error (informational) |
-| `1` | Vulnerable (below baseline) or ESU missing (if policy enforced) |
+| `main.py` | Tkinter GUI entrypoint |
+| `run_dashboard.py` | CLI/headless entrypoint |
+| `orchestrator.py` | Coordinates the pipeline |
+| `data_pipeline.py` | Loads, normalises, merges, filters, and matches report data |
+| `diagnostics.py` | Root-cause and patch evidence classification |
+| `excel_builder.py` | Excel workbook/sheet rendering |
+| `snapshot.py` | Local JSON snapshot history for trend tracking |
+| `version_sync.py` | Syncs product baselines from vendor APIs |
+| `config.json` | Product mapping, fixed-version rules, remediation rules |
+
+### Main Capabilities
+
+- Vulnerability/RMM inventory merge
+- Optional patch report matching
+- Optional patch failure report integration
+- Month-over-month trend comparison
+- Stale device exclusion
+- CVSS threshold filtering
+- Product-level triage tabs
+- Patch diagnostics and evidence notes
+- Health score and recommended actions
+- Snapshot storage for historical tracking
+- CLI mode for scheduled or headless execution
+
+### Patch Evidence Classification
+
+The dashboard separates findings into operationally useful categories:
+
+| Category | Meaning |
+|---|---|
+| Patch required | Installed version is below the fixed baseline |
+| Patched but still detected | Patch evidence exists, but the scanner still reports the CVE |
+| Device missing from patch report | Device is not present in the patch report scope |
+| Product not tracked | Device exists in the patch report, but the affected product is not tracked |
+| Installed but version unknown | Patch status exists, but version evidence is insufficient |
+| No patch baseline defined | The tool lacks a fixed baseline for that product/CVE |
+
+### CLI Usage
+
+Minimal run, skipping RMM merge:
+
+```bash
+python run_dashboard.py ^
+  --input reports/april_cve.xlsx ^
+  --output output/April_Dashboard.xlsx ^
+  --skip-rmm
+```
+
+With RMM inventory and patch matching:
+
+```bash
+python run_dashboard.py ^
+  --input reports/april_cve.xlsx ^
+  --rmm reports/device_inventory.xlsx ^
+  --patch reports/patch_report.csv ^
+  --output output/April_Dashboard.xlsx ^
+  --threshold 9.0 ^
+  --since 2026-04-01
+```
+
+With previous dashboard comparison:
+
+```bash
+python run_dashboard.py ^
+  --input reports/april_cve.xlsx ^
+  --rmm reports/device_inventory.xlsx ^
+  --output output/April_Dashboard.xlsx ^
+  --previous output/March_Dashboard.xlsx
+```
+
+### Output Sheets
+
+| Sheet | Purpose |
+|---|---|
+| Trend Summary | Month-over-month high-level movement |
+| New This Month | New CVE types compared to previous report |
+| Resolved | CVEs no longer detected |
+| Persisting CVEs | CVEs still present from the previous report |
+| Monthly Detections | Executive overview and risk summary |
+| All Detections | Full filtered detection set |
+| Product tabs | Per-product triage sheets |
+| Patch Match Overview | Patch evidence roll-up |
+| Patch Match Full Data | Detailed patch matching output |
+| Patch Report (Full) | Raw patch report evidence |
+| Diagnostics | Patch evidence/root-cause diagnostics |
+| Stale Excluded Devices | Devices excluded by last-response cutoff |
+| Raw Data | Unmodified merged dataset |
 
 ---
 
 ## N-able_CVE_Dashboard.py
 
 ### Overview
-A Python GUI utility that merges **N-able Vulnerability reports** with **RMM Device Inventory exports** to generate a fully formatted, actionable **Excel Executive Risk Dashboard**.
+
+Legacy/single-file Python GUI utility that merges N-able vulnerability reports with RMM Device Inventory exports to generate a formatted Excel Executive Risk Dashboard.
+
+This remains useful for simpler reporting workflows, but the modular dashboard folder is the preferred path for expanded patch matching and diagnostics.
 
 ### Requirements
-```
+
+```bash
 pip install pandas xlsxwriter tkcalendar openpyxl
 ```
 
 ### Features
-- **Executive risk metrics** — KEV CVE counts, exploitability summaries, server impact percentage
-- **Per-product triage sheets** — one tab per affected product with sortable CVE/device data
-- **Stale device exclusion** — filters devices below a configurable last-seen cutoff, with a dedicated exclusion sheet
-- **Hyperlinked CVEs** — links to CVE.org and NVD per finding
-- **Resolution tracking** — checkbox (☐/☑) dropdowns per row with live-counting Overview formulas
-- **RMM device type detection** — classifies Server vs Workstation from OS field
-- **Background threading** — heavy processing runs off the UI thread to prevent freezing
 
-### GUI Inputs
-1. **Vulnerability Report** — N-able vulnerability export (CSV or XLSX)
-2. **Device Inventory / RMM Report** — N-able device list (CSV or XLSX) — optional (can be skipped)
-3. **Score Threshold** — minimum CVSS score to include in per-product triage tabs (default: 9.0)
-4. **RMM Check-in Cutoff Date** — excludes stale devices from triage tabs (can be disabled to show all)
+- Executive risk metrics
+- KEV and known-exploit summaries
+- Server impact percentage
+- Per-product triage tabs
+- Stale device exclusion
+- Hyperlinked CVE.org and NVD references
+- Checkbox-style resolution tracking
+- Background processing to keep the GUI responsive
 
-### Output Sheets
-| Sheet | Contents |
+### Inputs
+
+| Input | Purpose |
 |---|---|
-| Overview | Executive metrics, severity breakdown, top 10 products, resolution status, unsynced devices |
-| All Detections | Full merged dataset, all scores, sortable/filterable |
-| [Product name] | Per-product triage tabs for findings above the score threshold |
-| Stale Excluded Devices | Devices filtered out by the cutoff date |
-| Raw Data | Unmodified merged dataset for reference |
+| Vulnerability Report | N-able vulnerability export, CSV or XLSX |
+| Device Inventory / RMM Report | N-able device list, CSV or XLSX |
+| Score Threshold | Minimum CVSS score for triage tabs |
+| RMM Check-in Cutoff Date | Optional stale device filter |
+| Output Path | Destination Excel workbook |
+
+---
+
+## N-able_PatchReport_Dashboard.py
+
+### Overview
+
+Python-based dashboard tooling for N-able patch report analysis.
+
+Use this when the focus is patch-report visibility and actionability rather than CVE-to-patch correlation.
+
+### Typical Use Cases
+
+- Summarise N-able patch status exports
+- Identify failed, missing, pending, or installed patch states
+- Prepare patch reporting for internal review
+- Support monthly patch evidence workflows
 
 ---
 
 ## RMMcheck.py
 
 ### Overview
-A Python GUI tool that compares an **Intune/Entra device export** against an **N-able RMM export** to identify corporate devices present in Intune but **missing from RMM** — useful for licence auditing and gap detection.
+
+Python GUI tool that compares an Intune/Entra device export against an N-able RMM export to identify corporate Windows devices that appear to be missing from RMM.
 
 ### Requirements
-```
+
+```bash
 pip install pandas
 ```
 
 ### Device Classification
-A device is treated as **corporate** if:
-- `joinType` contains `JOINED` (and not `REGISTERED`), **or**
-- `Ownership == CORPORATE`
+
+A device is treated as corporate if:
+
+- `joinType` contains `JOINED` and not `REGISTERED`, or
+- `Ownership` is `CORPORATE`
 
 ### Matching Logic
-1. RMM lookup sets are built from **serial number** and **normalised device name**
-2. Serial number matches take precedence; devices without serials fall back to name matching
-3. Name normalisation strips `LAPTOP-`/`DESKTOP-` prefixes and non-alphanumeric characters
 
-### Filtering Applied to Intune Devices
-- Last sign-in must be **2025-01-01 or later**
-- `operatingSystem` must contain `WINDOWS`
-- De-duplicated by device name (latest record kept)
+- Builds RMM lookup sets from serial number and normalised device name
+- Serial number matches take precedence
+- Devices without serials fall back to device-name matching
+- Device-name normalisation strips common prefixes and non-alphanumeric characters
 
 ### Output
-- If missing devices found: CSV with device ID, name, primary user, OS, last check-in, serial, ownership, and join type
-- If none found: plain text `_nodata.txt` confirmation file
 
----
-
-# Intune Scripts
-
-All Intune scripts follow a **two-phase deployment pattern**:
-
-| Phase | Purpose | Intune Assignment |
-|---|---|---|
-| **Phase 1 – Audit** | Zero-footprint compliance reporting only. No changes made. | Required (all users) |
-| **Phase 2 – Enforcement** | Full detection + remediation. Applies fixes. | Available / targeted rollout |
-
-The Detect scripts control whether Intune considers the app compliant. The Install/Remediation scripts run only when detection returns non-compliant.
-
----
-
-## Chrome
-
-### Phase 1 — Audit (Reporting Only)
-
-**`Detect-Chrome-Audit.ps1`** — Detection  
-Reports compliance state without triggering any remediation. Checks for:
-- 32-bit Chrome in `Program Files (x86)` (non-compliant)
-- Unmanaged per-user AppData installs (non-compliant)
-- Missing or disabled Google Update services (non-compliant)
-- Chrome simply not installed → compliant (no install performed)
-
-**`Audit-Chrome.ps1`** — Install (No-Op)  
-Placeholder satisfying Intune's mandatory Install command. Performs no actions.
-
-**`Uninstall-Audit.ps1`** — Uninstall (No-Op)  
-Placeholder satisfying Intune's mandatory Uninstall command. Performs no actions.
-
----
-
-### Phase 2 — Enforcement
-
-**`Detect-Chrome.ps1`** — Detection  
-Full compliance check. Non-compliant if any of the following are true:
-- 32-bit installation present
-- Unmanaged per-user AppData install found
-- Installed version below `$MinimumVersion` floor
-- Google Update services missing or disabled
-- Google Update scheduled tasks missing
-
-**`Install-Chrome.ps1`** — Remediation  
-Surgical remediation targeting only what is broken:
-
-| Condition Detected | Action Taken |
+| Result | Output |
 |---|---|
-| 32-bit architecture | Purge + MSI install |
-| AppData shadow install | Purge (binary only, user data preserved) |
-| Missing 64-bit system install | MSI install |
-| Missing scheduled update tasks | MSI install (rebuilds update engine) |
-| Version below floor | Synchronous MSI in-place upgrade |
-| Disabled update service | Silent `Set-Service` repair (no MSI needed) |
-
-Additional behaviours:
-- **Patient Process Gate** — waits up to 45 minutes for Chrome to close before making destructive changes; exits `1618` on timeout so Intune retries later
-- **Desktop sanitisation** — removes per-user Chrome shortcuts and `.exe` stubs from desktops
-- **Shortcut rewiring** — updates Start Menu, taskbar pins, and Public Desktop shortcuts to the 64-bit path
-
-Exit Codes: `0` = success, `1618` = deferred (Chrome running), any MSI code on failure.
+| Missing devices found | CSV with device ID, name, user, OS, check-in, serial, ownership, and join type |
+| No missing devices | `_nodata.txt` confirmation file |
 
 ---
 
-## Firefox
-
-### Phase 1 — Audit (Reporting Only)
-
-**`Detect-Firefox-Audit.ps1`** — Detection  
-Reports compliance state without triggering remediation. Checks for:
-- 32-bit Firefox in `Program Files (x86)` (non-compliant)
-- Unmanaged per-user AppData installs (non-compliant)
-- Missing or disabled Mozilla Maintenance Service (non-compliant)
-- Firefox not installed → compliant
-
-**`Audit-Firefox.ps1`** — Install (No-Op)  
-Placeholder. No actions performed.
-
-**`Uninstall-Audit.ps1`** — Uninstall (No-Op)  
-Placeholder. No actions performed.
-
----
-
-### Phase 2 — Enforcement
-
-**`Detect-Firefox.ps1`** — Detection  
-Full compliance check. Non-compliant if:
-- 32-bit Firefox directory exists
-- Per-user rogue install found in `AppData\Local\Mozilla Firefox` or `AppData\Local\Programs\Mozilla Firefox`
-- Installed version below `$MinimumVersion` floor (currently `148.0`)
-- Version string cannot be parsed
-
-> **Note:** Constants (`$MinimumVersion`, `$Firefox64Exe`, `$Firefox86Dir`, `$RoguePaths`) are intentionally duplicated between Detect and Install scripts — Intune evaluates them in separate processes and cannot share state.
-
-**`Install-Firefox.ps1`** — Remediation  
-Full enterprise deployment with profile preservation. Key stages:
-
-| Stage | Description |
-|---|---|
-| Process Gate | Waits up to 45 minutes for Firefox to close; exits `1` on timeout |
-| x86 Uninstall | Uses registered `UninstallString` (MSI GUID or helper.exe) for clean removal |
-| HKCU Cleanup | Loads each user's NTUSER.DAT hive to remove per-user AppData registrations and disable per-user Firefox scheduled tasks |
-| Rogue folder removal | Removes `AppData\Local` and `AppData\Local\Programs` Firefox installs |
-| Shortcut cleanup | Removes all Firefox shortcuts pre-install (MSI recreates them at the correct path) |
-| Profile snapshot | Captures each user's active profile name and path *before* the MSI runs |
-| MSI install | `ALLUSERS=1 /qn /norestart` — upgrades in-place |
-| Enterprise policies | Writes registry policies (no first-run page, no telemetry, silent auto-updates, disables Default Browser Agent) |
-| Profile restore | Restores `profiles.ini`, `installs.ini`, and `compatibility.ini` for each user post-install; writes `user.js` to suppress onboarding on next launch |
-| installs.ini re-assertion | Re-writes `installs.ini` as the final step to override any MSI post-install activity |
-| Validation | Two-tier: critical failures exit `1`; per-user profile check failures are logged as warnings |
-
-Both known Firefox install path CRC hashes are written to `installs.ini`/`profiles.ini`:
-- `308046B0AF4A39CB` — `C:\Program Files\Mozilla Firefox\firefox.exe`
-- `E7CF176E110C211B` — `C:\Program Files (x86)\Mozilla Firefox\firefox.exe`
-
-Exit Codes: `0` = success, `1` = failure or timeout, `3010` = success with reboot pending.
-
----
-
-## Office (Click-to-Run)
-
-**`Detect-OfficeUpdate.ps1`** — Detection  
-Reads `VersionToReport` from the Click-to-Run registry configuration key.  
-- Office not installed → compliant (exit 0)
-- Version at or above `$TargetVersion` → compliant (exit 0)
-- Version below `$TargetVersion` → non-compliant (exit 1)
-
-Update `$TargetVersion` to set the minimum acceptable build.
-
-**`Force-OfficeUpdate.ps1`** — Remediation  
-Triggers the native `OfficeC2RClient.exe` updater asynchronously with:
-- `displaylevel=false` — hides all update UI from the user
-- `forceappshutdown=false` — does **not** kill open Office apps; update stages in the background and applies when apps close
-
-> Intune may temporarily report the device as failed while the background update downloads and installs. Detection will return compliant on the next Intune sync cycle after the update completes.
-
----
-
-## TeamViewer
-
-Designed for **eradication** deployments — removes TeamViewer from managed endpoints via Intune uninstall assignment.
-
-> ⚠️ **Inverted exit code logic:** In an uninstall assignment, exit 0 means "app is present — run the removal script." Exit 1 means "nothing found — machine is clean."
-
-**`Detect-TeamViewer.ps1`** — Detection  
-Scans three vectors:
-1. **HKLM registry** — Uninstall keys matching `^TeamViewer\b` (avoids `TeamViewerMeeting` false positives)
-2. **Services** — Any running service matching `*TeamViewer*`
-3. **Per-user AppData** — `AppData\Local\TeamViewer`, `AppData\Roaming\TeamViewer`, and `AppData\Local\Programs\TeamViewer` across all real user profiles (identified by `NTUSER.DAT`)
-
-Configuration toggle `$AllowOnServers` — when `$false` (default), skips detection on Servers and Domain Controllers.
-
-**`Remove-TeamViewer.ps1`** — Removal  
-Full eradication across 9 stages:
-
-| Stage | Action |
-|---|---|
-| 1 | Server guardrail (skips non-workstations unless overridden) |
-| 2 | Optional active-session wait loop (up to 45 min); exits `1618` on timeout |
-| 3 | Stop all TeamViewer services; kill processes with taskkill fallback |
-| 4 | Execute official uninstallers from registry (MSI GUID or EXE silent switch) |
-| 5 | Remove TeamViewer scheduled tasks |
-| 6 | Delete system and per-user filesystem remnants |
-| 7 | Remove HKLM and all loaded user hive registry keys |
-| 8 | Delete any orphaned services via `sc.exe delete` |
-| 9 | Post-uninstall verification across all vectors; exits `1` if any footprint remains |
-
-Exit Codes: `0` = eradicated, `1` = failure/footprint remains, `1618` = active session (retry), `3010` = success with reboot pending.  
-Transcript logged to `C:\ProgramData\Microsoft\IntuneManagementExtension\Logs\TeamViewer-Removal.log`.
-
----
-
-## VLC
-
-Update-only deployment — devices without VLC are considered compliant (no install performed).
-
-**`Detect-VLC.ps1`** — Detection  
-1. Checks for 64-bit then 32-bit VLC installation
-2. If not installed → compliant (exit 0)
-3. Queries VideoLAN's live status endpoint for the latest version
-4. If local version ≥ online version → compliant (exit 0); otherwise → non-compliant (exit 1)
-5. If the status endpoint is unreachable → compliant (exit 0, skip to avoid noise)
-
-**`Install-VLC.ps1`** — Update  
-Downloads and installs the latest VLC silently using VideoLAN's `last/` stable endpoint.
-- Skips if VLC is running (avoids disrupting the user; detection remains non-compliant until a later sync)
-- Skips if already at or above `$TargetVersion`
-- Download via BITS with `Invoke-WebRequest` fallback
-- Validates download size before executing installer
-- Cleans up the installer on success
-
-Exit Codes: `0` = success or no action required, `1` = failure.
-
----
-
-# N-able NOC Scripts
+# RMM Scripts
 
 ## SecurityCheck.ps1
 
-Performs a full endpoint security posture audit in a single pass.
+Path:
 
-### What It Checks
+```text
+RMM/SecurityCheck/SecurityCheck.ps1
+```
+
+### Overview
+
+Full endpoint security posture audit in a single pass.
+
+### Checks
+
 | Check | Description |
 |---|---|
-| Antivirus | Detects Defender / third-party AV; checks service state + signatures |
-| MDE | Verifies Defender for Endpoint onboarding (Sense service) |
-| Firewall | Confirms Windows Firewall state across all profiles |
-| Windows Update | Reports date and age of last installed update |
-| Pending Reboot | Detects pending reboot state |
-| Uptime | Reports current device uptime |
-| VBS / HVCI | Validates Virtualization-Based Security and HVCI state |
+| Antivirus | Detects Defender/third-party AV and checks service/signature state |
+| Defender for Endpoint | Verifies onboarding via Sense service |
+| Firewall | Checks Windows Firewall state across profiles |
+| Windows Update | Reports last installed update and age |
+| Pending Reboot | Detects pending reboot indicators |
+| Uptime | Reports current uptime |
+| VBS / HVCI | Checks virtualisation-based security and memory integrity |
 | LAPS | Checks Local Administrator Password Solution status |
-| PS Script Logging | Reports PowerShell script block logging state |
+| PowerShell Logging | Reports script block logging state |
 
-### Parameters
+### Common Parameters
+
 | Parameter | Purpose |
 |---|---|
-| `-RequireFirewallOn` | Fail if Windows Firewall is off |
+| `-RequireFirewallOn` | Fail if firewall is off |
 | `-RequireRealTime` | Fail if no real-time AV is enabled |
-| `-RequireMDE` | Fail if MDE is not onboarded |
+| `-RequireMDE` | Fail if Defender for Endpoint is not onboarded |
 | `-RequireVBS` | Fail if VBS/HVCI is not enabled |
 | `-RequireLAPS` | Fail if LAPS is not configured |
-| `-RequireScriptLogging` | Fail if PS script logging is not enabled |
+| `-RequireScriptLogging` | Fail if PowerShell script logging is not enabled |
 | `-Strict` | Elevate warnings to failures |
-| `-Full` | Detailed multi-line output for ticket notes |
-| `-AsJson` | Structured JSON output for ingestion |
+| `-Full` | Detailed output for ticket notes |
+| `-AsJson` | Structured JSON output |
 
 ### Exit Codes
+
 | Code | Meaning |
-|---|---|
-| `0` | Secure |
+|---:|---|
+| `0` | Secure/OK |
 | `1` | Warning |
 | `2` | Critical |
 | `4` | Script error |
@@ -394,131 +451,534 @@ Performs a full endpoint security posture audit in a single pass.
 
 ## AVCheck.ps1
 
-Dedicated antivirus posture check. Narrower than SecurityCheck.ps1 — ideal for high-frequency AV-only monitoring or replacing unreliable built-in RMM AV checks.
+Path:
 
-### What It Checks
+```text
+RMM/AVCheck/AVCheck.ps1
+```
+
+### Overview
+
+Dedicated antivirus posture check. Useful for high-frequency AV monitoring or replacing noisy RMM AV checks.
+
+### Checks
+
 | Area | Description |
 |---|---|
-| Installed AV | Enumerates AV products via Windows Security Center (WSC) |
-| Active / Real-Time AV | Confirms which AV engine has real-time protection enabled |
-| Defender Health | Service state, real-time protection, engine & platform versions |
-| Signature Currency | Flags stale Defender signatures (configurable threshold) |
-| MDE (Sense) | Detects Defender for Endpoint onboarding via Sense service |
-| AV Conflicts | Detects multiple real-time AV engines enabled simultaneously |
+| Installed AV | Enumerates AV products via Windows Security Center |
+| Real-time AV | Confirms active real-time protection |
+| Defender Health | Checks Defender service, engine, platform, and protection state |
+| Signature Currency | Flags stale Defender signatures |
+| Defender for Endpoint | Checks Sense/MDE state |
+| AV Conflicts | Detects multiple real-time engines |
 
-### Parameters
+### Common Parameters
+
 | Parameter | Purpose |
 |---|---|
 | `-RequireRealTime` | Fail if no real-time AV is enabled |
 | `-RequireMDE` | Fail if MDE is not onboarded |
-| `-SigFreshHours` | Max allowed Defender signature age (default: 48h) |
-| `-Full` | Detailed multi-line output |
-| `-AsJson` | Structured JSON output |
-| `-DebugMode` | Extra diagnostics for troubleshooting |
+| `-SigFreshHours` | Maximum Defender signature age |
+| `-Full` | Detailed output |
+| `-AsJson` | JSON output |
+| `-DebugMode` | Extra diagnostics |
 
-### Exit Codes
-| Code | Meaning |
-|---|---|
-| `0` | OK / Secure |
-| `1` | Warning |
-| `2` | Critical |
-| `4` | Script error |
+---
+
+## Browser-Audit.ps1
+
+Path:
+
+```text
+RMM/Browser-Audit/Browser-Audit.ps1
+```
+
+### Overview
+
+RMM browser governance audit covering Chrome, Edge, and Firefox footprints.
+
+Use this to detect browser drift, unmanaged installs, architecture sprawl, and broken updater states across endpoints.
+
+### What It Helps Find
+
+- Per-user browser installs under user profiles
+- System-level browser installs
+- 32-bit vs 64-bit browser footprints
+- Chrome update service/task health
+- Edge update health
+- Firefox maintenance service/task health
+- Installed and running browser version context
+- Devices requiring migration to managed/system-level installs
+
+### Typical Use
+
+Run via RMM Remote Background to gather evidence before enforcing Intune/RMM browser remediation.
 
 ---
 
 ## AutoWindowsUpdate.ps1
 
-Lightweight script for checking and installing Windows Updates. Designed for RMM scheduled patch windows.
+Path:
 
-> Does **not** upgrade Windows 10 to Windows 11.
+```text
+RMM/AutoWindows/AutoWindowsUpdate.ps1
+```
+
+### Overview
+
+Lightweight Windows Update script for RMM scheduled patch windows.
+
+> This script does not upgrade Windows 10 to Windows 11.
 
 ### Parameters
+
 | Parameter | Purpose |
 |---|---|
 | `-CheckOnly` | List pending updates without installing |
-| `-Install` | Install all available updates |
-| `-Reboot` | Automatically restart if updates require it |
+| `-Install` | Install available updates |
+| `-Reboot` | Restart automatically if required |
 
-Automatically installs `PSWindowsUpdate` module if missing.
-
----
-
-## Update-Chrome.ps1 (N-able / RMM)
-
-Updates Google Chrome via Winget. Handles the common "Pending Relaunch" scenario where Chrome has staged an update but the user hasn't closed the browser.
-
-### Logic
-1. Is `chrome.exe` running?
-   - **No** → run `winget upgrade Google.Chrome`
-   - **Yes** → compare registry staged version against running version
-2. If registry version > running version → report "Pending Relaunch", skip update
-3. If no reboot pending → check Winget for new version; if available, report and skip (preserves active session)
-
-### Example Output
-```
-[!] PENDING REBOOT DETECTED
-    Running Version:  120.0.6099.109
-    Staged Version:   120.0.6099.130
-    Action: Skipped. Chrome needs a relaunch to apply the staged update.
-```
+Automatically installs the `PSWindowsUpdate` module if missing.
 
 ---
 
 ## HDDUsageCheck.ps1
 
-Audits system disk usage for MSP environments — drive-level statistics, per-user profile space, and large folder/file detection.
+Path:
 
-### What It Reports
+```text
+RMM/HDDCheck/HDDUsageCheck.ps1
+```
+
+### Overview
+
+Audits disk usage for MSP environments.
+
+### Reports
+
 | Category | Description |
 |---|---|
-| Drive capacity | Total, used, and free space per fixed drive |
-| Per-user profile size | Recursive space usage per `C:\Users` profile |
-| Large folders | Subfolders ≥ 5 GB within each profile |
-| Large files | All files ≥ 5 GB including OST files |
+| Drive capacity | Total, used, and free space |
+| User profile size | Recursive usage per `C:\Users` profile |
+| Large folders | Profile subfolders over configured threshold |
+| Large files | Large files including OST files |
 
-### Configuration
-| Variable | Default | Description |
-|---|---|---|
-| `$LowSpaceThreshold` | 10% | Free space % below which to flag a warning |
-| `$LargeThresholdGB` | 5 | Size in GB to report as large |
-| `$UserRoot` | `C:\Users` | Root path for user profiles |
+### Common Configuration
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `$LowSpaceThreshold` | `10%` | Warn below this free-space percentage |
+| `$LargeThresholdGB` | `5` | Report folders/files over this size |
+| `$UserRoot` | `C:\Users` | User profile root |
 
 ---
 
-## AutoDiskCleanup.ps1
+## DiskCleanup.ps1
 
-Production-ready silent disk cleanup automation for MSP/RMM environments. Runs `cleanmgr.exe` via a temporary hidden SYSTEM scheduled task with before/after disk space reporting.
+Path:
+
+```text
+RMM/DiskCleanUp/DiskCleanup.ps1
+```
+
+### Overview
+
+Silent disk cleanup automation for MSP/RMM environments.
+
+Runs `cleanmgr.exe` via a temporary hidden SYSTEM scheduled task and reports before/after disk usage.
 
 ### Features
-- Fully hidden execution (no user-visible UI)
-- Test / dry-run mode
+
+- Hidden execution
+- Dry-run/test mode
 - Configurable cleanup categories
-- Before / after / delta space reporting
-- Automatic removal of the temporary scheduled task
-- Mutex prevents concurrent execution
-- No on-disk logs (stdout only — captured by RMM)
+- Before/after/delta reporting
+- Temporary scheduled task cleanup
+- Mutex to prevent concurrent execution
+- No persistent on-disk logs by default
 
 ### Usage
+
 ```powershell
 # Live run
 .\DiskCleanup.ps1
 
-# Dry-run
+# Dry run
 .\DiskCleanup.ps1 -Mode test
 ```
 
-### Cleanup Categories
-Temporary Files, Temporary Setup Files, Recycle Bin, Windows Error Reporting Files, System error memory dump files, System error minidump files, Update Cleanup, Device Driver Packages, Old ChkDsk Files, Setup Log Files, Thumbnail Cache.  
-Missing categories on a given OS are silently skipped.
+---
+
+## UpdateMS365C2R.ps1
+
+Path:
+
+```text
+RMM/UpdateMS365C2R/UpdateMS365C2R.ps1
+```
+
+### Overview
+
+Triggers Microsoft 365 Apps Click-to-Run update processing from RMM.
+
+Useful where Office updates need to be nudged without forcibly closing Office applications.
+
+### Operational Notes
+
+- Uses the native Office Click-to-Run update engine
+- Suitable for background remediation
+- Avoids user disruption where configured not to force app shutdown
+- Complements Microsoft 365 Apps Cloud Update / Intune policy workflows
 
 ---
 
-## Author
-Developed and maintained by **Stu Villanti** for NOC/MSP automation and patch lifecycle management.
+## OfficeVersionandUpdateChannelAudit.ps1
 
-## Versioning
-```bash
-git add .
-git commit -m "your message"
-git push
+Path:
+
+```text
+RMM/Office Version and Update Channel Audit/OfficeVersionandUpdateChannelAudit.ps1
 ```
+
+### Overview
+
+Audits Microsoft Office Click-to-Run version and update channel.
+
+Useful for identifying devices on the wrong channel, devices lagging behind target builds, or devices not aligned with tenant update policy.
+
+---
+
+## UpdateFirefoxAndOffice Scripts
+
+Path:
+
+```text
+RMM/UpdateFirefoxAndOffice/
+```
+
+### Scripts
+
+| Script | Purpose |
+|---|---|
+| `main.ps1` | Combined/update orchestration script |
+| `UpdateFirefox.ps1` | Firefox update workflow |
+| `chromeCheckUpdate.ps1` | Chrome update check/report workflow |
+| `firefoxCheckUpdate.ps1` | Firefox update check/report workflow |
+| `officeCheckUpdate.ps1` | Office update check/report workflow |
+| `adobeCheckReport.ps1` | Adobe update/check reporting workflow |
+
+### Typical Use
+
+Use these scripts where RMM needs individual browser/application update status or a targeted update action without deploying a full Intune Win32 package.
+
+---
+
+## PrinterCheck.ps1
+
+Path:
+
+```text
+RMM/PrinterCheck/printerCheck.ps1
+```
+
+### Overview
+
+Printer and network print troubleshooting helper.
+
+Useful for RMM-side checks where printer reachability, configuration, or network path evidence needs to be captured for ticket notes.
+
+---
+
+## PaperCutFollowMe.ps1
+
+Path:
+
+```text
+RMM/PaperCut Follow Me/PaperCutFollowMe.ps1
+```
+
+### Overview
+
+PaperCut Follow Me print support script.
+
+Use for PaperCut/Follow Me print deployment or support workflows where print queue setup or validation is required.
+
+---
+
+## checkTVInstall.ps1
+
+Path:
+
+```text
+RMM/CheckTVInstall/checkTVInstall.ps1
+```
+
+### Overview
+
+Checks for TeamViewer installation/footprints from RMM.
+
+Useful as a lightweight audit before or after TeamViewer eradication workflows.
+
+---
+
+# Intune Scripts
+
+These scripts follow an audit-first pattern where possible.
+
+| Phase | Purpose | Assignment Style |
+|---|---|---|
+| Phase 1 – Audit | Report state only, no changes | Broad/required audit |
+| Phase 2 – Enforcement | Detection plus remediation | Targeted rollout |
+
+The detection script decides compliance. Remediation/install scripts run only when detection returns non-compliant.
+
+---
+
+## Intune Chrome
+
+Path:
+
+```text
+intune/chrome/
+```
+
+### Audit Phase
+
+| Script | Purpose |
+|---|---|
+| `Detect-Chrome-Audit.ps1` | Reports compliance without remediation |
+| `Audit-Chrome.ps1` | No-op install placeholder |
+| `Uninstall-Audit.ps1` | No-op uninstall placeholder |
+
+Audit checks include:
+
+- 32-bit Chrome in `Program Files (x86)`
+- Per-user AppData Chrome installs
+- Missing/disabled Google Update services
+- Missing update tasks
+- Chrome absent = compliant/no action
+
+### Enforcement Phase
+
+| Script | Purpose |
+|---|---|
+| `Detect-Chrome.ps1` | Full compliance detection |
+| `Install-Chrome.ps1` | Remediation / enterprise MSI enforcement |
+
+Non-compliance examples:
+
+- 32-bit Chrome present
+- Per-user unmanaged Chrome found
+- Installed version below minimum floor
+- Google Update services disabled/missing
+- Google Update scheduled tasks missing
+
+Remediation behaviour:
+
+- Removes unmanaged binary footprints while preserving user data where designed
+- Installs or repairs 64-bit system-level Chrome
+- Rebuilds update engine where required
+- Waits for Chrome to close before destructive actions
+- Uses retry-friendly exit behaviour for active sessions
+
+---
+
+## Intune Firefox
+
+Path:
+
+```text
+intune/firefox/
+```
+
+### Audit Phase
+
+| Script | Purpose |
+|---|---|
+| `Detect-Firefox-Audit.ps1` | Reports compliance without remediation |
+| `Audit-Firefox.ps1` | No-op install placeholder |
+
+Audit checks include:
+
+- 32-bit Firefox
+- Per-user rogue Firefox installs
+- Missing/disabled Mozilla Maintenance Service
+- Firefox absent = compliant/no action
+
+### Enforcement Phase
+
+| Script | Purpose |
+|---|---|
+| `Detect-Firefox.ps1` | Full compliance detection |
+| `Install-Firefox.ps1` | Enterprise remediation with profile preservation |
+
+Remediation behaviour:
+
+- Process gate before destructive work
+- x86 uninstall where required
+- HKCU/user-hive cleanup
+- Rogue folder removal
+- Shortcut cleanup
+- MSI install using system-level deployment
+- Enterprise policy configuration
+- Profile restore and onboarding suppression
+
+---
+
+## Intune Office
+
+Path:
+
+```text
+intune/office/
+```
+
+### Scripts
+
+| Script | Purpose |
+|---|---|
+| `Detect-OfficeUpdate.ps1` | Detects whether Office C2R is at or above a target version |
+| `Force-OfficeUpdate.ps1` | Triggers native Office C2R updater |
+
+### Behaviour
+
+- Office missing = compliant/no action
+- Office below target = non-compliant
+- Update runs silently through `OfficeC2RClient.exe`
+- Avoids force-closing Office apps where configured
+
+---
+
+## Intune TeamViewer
+
+Path:
+
+```text
+intune/teamviewer/
+```
+
+### Overview
+
+TeamViewer detection and eradication workflow for managed endpoints.
+
+### Scripts
+
+| Script | Purpose |
+|---|---|
+| `Detect-TeamViewer.ps1` | Detects TeamViewer footprints |
+| `Remove-TeamViewer.ps1` | Removes TeamViewer across services, registry, tasks, files, and user profiles |
+
+### Notes
+
+- Designed for uninstall/eradication assignments
+- Includes guardrails for servers unless overridden
+- Scans HKLM uninstall keys, services, and per-user AppData
+- Removes scheduled tasks and orphaned services
+- Performs post-removal verification
+
+---
+
+## Intune VLC
+
+Path:
+
+```text
+intune/vlc/
+```
+
+### Overview
+
+Update-only VLC deployment.
+
+Devices without VLC are treated as compliant.
+
+### Scripts
+
+| Script | Purpose |
+|---|---|
+| `Detect-VLC.ps1` | Detects installed VLC and compares to online latest version |
+| `Install-VLC.ps1` | Downloads and installs latest VLC silently |
+
+### Behaviour
+
+- Checks 64-bit then 32-bit VLC
+- Does not install VLC where it is absent
+- Skips update if VLC is running to avoid user disruption
+- Validates download before execution
+
+---
+
+# Handy PowerShell Scripts
+
+## CalanderPermissions.ps1
+
+Path:
+
+```text
+handyPSScripts/CalanderPermissions.ps1
+```
+
+### Overview
+
+Exchange Online / mailbox calendar permission helper script.
+
+Useful for reviewing or applying calendar folder permissions as part of help desk or Microsoft 365 administration workflows.
+
+> Note: File name currently appears as `CalanderPermissions.ps1` in the repo.
+
+---
+
+# Operational Guidance
+
+## Testing
+
+Before running across production:
+
+1. Test on a lab machine.
+2. Confirm expected stdout/stderr output.
+3. Confirm exit code behaviour.
+4. Confirm whether the script should run as user or SYSTEM.
+5. Confirm whether the script is audit-only or remediation-capable.
+6. For Intune scripts, validate detection logic independently before assigning remediation broadly.
+
+## RMM Deployment Tips
+
+- Prefer Remote Background execution where no UI is required.
+- Avoid destructive remediation on SCADA/OT or other change-controlled endpoints without approval.
+- Capture output into ticket notes for auditability.
+- Use JSON output where available for ingestion or dashboarding.
+- For user-facing apps, prefer non-disruptive update behaviour unless there is an approved maintenance window.
+
+## Git Workflow
+
+```bash
+git status
+git add .
+git commit -m "type: short description"
+git pull --rebase origin main
+git push origin main
+```
+
+If the branch has diverged:
+
+```bash
+git fetch origin
+git log --oneline --graph --decorate --all -n 10
+git pull --rebase origin main
+git push origin main
+```
+
+If local uncommitted changes block a rebase:
+
+```bash
+git stash push -u -m "temp before rebase"
+git pull --rebase origin main
+git stash pop
+git push origin main
+```
+
+---
+
+# Author
+
+Developed and maintained by **Stu Villanti** for NOC/MSP automation, vulnerability reporting, patch lifecycle management, and endpoint governance.
