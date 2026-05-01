@@ -33,6 +33,7 @@ from excel_builder import (
     build_product_sheets, build_stale_excluded_sheet,
     build_raw_data_sheet, build_patch_sheets, build_diagnostics_sheets,
     build_patch_failure_sheet, build_not_in_patch_scope_sheet,
+    build_products_not_tracked_sheet, build_patch_resolved_sheet,
 )
 
 log = logging.getLogger(__name__)
@@ -189,7 +190,10 @@ def run(request: DashboardRequest) -> DashboardResult:
             log.info("Loading previous report for trend: %s", request.prev_report_path)
             prev_df          = load_previous_report(request.prev_report_path)
             prev_report_name = Path(request.prev_report_path).name
-            trend_data       = compute_trends(merged_df, prev_df, request.threshold)
+            inventory_set    = (set(df_rmm['Device_Join'].unique())
+                                if df_rmm is not None else None)
+            trend_data       = compute_trends(merged_df, prev_df, request.threshold,
+                                              inventory_devices=inventory_set)
             m = trend_data['metrics']
             log.info(
                 "Trend: %d new CVEs, %d resolved, %d persisting (common-product scope)",
@@ -240,8 +244,11 @@ def run(request: DashboardRequest) -> DashboardResult:
                 warnings.append(w)
 
             # Full diagnostics (lag, drift, root cause table)
-            product_rules = FIXED_VERSION_RULES  # reuse section of config for remediation hints
-            diagnostics = compute_patch_diagnostics(patch_data[1], product_rules)
+            product_rules = FIXED_VERSION_RULES
+            diagnostics = compute_patch_diagnostics(
+                patch_data[1], product_rules,
+                resolved_pairs=patch_resolved_pairs,
+            )
 
             rc_df = diagnostics.get('root_cause_df', pd.DataFrame())
             if not rc_df.empty:
@@ -328,6 +335,7 @@ def run(request: DashboardRequest) -> DashboardResult:
 
             if patch_data:
                 build_patch_sheets(writer, patch_data[0], patch_data[1], patch_data[2])
+                build_patch_resolved_sheet(writer, patch_data[1])
                 if any(not diagnostics[k].empty for k in diagnostics
                        if isinstance(diagnostics[k], pd.DataFrame)):
                     build_diagnostics_sheets(writer, diagnostics)
@@ -345,6 +353,9 @@ def run(request: DashboardRequest) -> DashboardResult:
                     patch_devices=patch_report_devices,
                     failure_devices=failure_report_devices,
                 )
+
+                # Products in CVE data, device in patch report, but product not tracked
+                build_products_not_tracked_sheet(writer, patch_data[1])
 
             # ── Optional: patch failure report ────────────────────────────────
             if request.include_failure_report and request.failure_report_path:

@@ -797,6 +797,180 @@ def build_diagnostics_sheets(writer, diagnostics: dict) -> None:
             ws.set_row(0, 50)
 
 
+def build_patch_resolved_sheet(writer, patch_full_df: 'pd.DataFrame') -> None:
+    """
+    CVEs confirmed resolved via the patch report — patch installed, version
+    compliant, install date post-dates first detection.
+
+    Available on every run where a patch report is loaded. Does not require
+    a previous dashboard (unlike the trend-based Resolved sheet).
+    """
+    import pandas as pd
+
+    resolved = patch_full_df[
+        patch_full_df['Resolved (from Patch Report)'] == 'Resolved'
+    ].copy()
+
+    if resolved.empty:
+        return
+
+    wb       = writer.book
+    grn      = wb.add_format({'bg_color': '#E2EFDA'})
+    hdr      = wb.add_format({'bold': True, 'bg_color': '#375623',
+                               'font_color': 'white', 'border': 1})
+    note_fmt = wb.add_format({'italic': True, 'font_color': '#595959'})
+
+    # Compute lag days
+    if 'Patch Install Date' in resolved.columns and 'First detected' in resolved.columns:
+        idt = pd.to_datetime(resolved['Patch Install Date'], errors='coerce')
+        fdt = pd.to_datetime(resolved['First detected'],    errors='coerce')
+        resolved['Lag (days)'] = (idt - fdt).dt.days
+    else:
+        resolved['Lag (days)'] = ''
+
+    cols = [c for c in [
+        'Name', 'Vulnerability Name', 'Affected Products',
+        'Vulnerability Score', 'Matched Patch Version',
+        'Patch Install Date', 'First detected', 'Lag (days)',
+    ] if c in resolved.columns]
+
+    out = (resolved[cols]
+           .drop_duplicates(subset=['Name', 'Vulnerability Name'])
+           .sort_values(['Affected Products', 'Vulnerability Score'],
+                        ascending=[True, False])
+           .reset_index(drop=True))
+
+    out.to_excel(writer, sheet_name='Resolved (Patch Confirmed)', index=False)
+    ws = writer.sheets['Resolved (Patch Confirmed)']
+    ws.autofilter(0, 0, len(out), len(out.columns) - 1)
+    ws.set_row(0, None, hdr)
+
+    ws.set_column('A:A', 28)   # Device
+    ws.set_column('B:B', 22)   # CVE
+    ws.set_column('C:C', 32)   # Product
+    ws.set_column('D:D', 10)   # Score
+    ws.set_column('E:E', 22)   # Version
+    ws.set_column('F:G', 20)   # Dates
+    ws.set_column('H:H', 12)   # Lag
+
+    for i in range(1, len(out) + 1):
+        ws.set_row(i, None, grn)
+
+    # Summary note
+    note_row = len(out) + 2
+    unique_cves     = out['Vulnerability Name'].nunique()
+    unique_devices  = out['Name'].nunique()
+    ws.write(note_row, 0,
+             f'{unique_cves} CVE type(s) confirmed patched across {unique_devices} device(s) '
+             f'via patch report. Install date confirmed after first detection date.',
+             note_fmt)
+    ws.merge_range(note_row, 0, note_row, len(out.columns) - 1,
+                   f'{unique_cves} CVE type(s) confirmed patched across {unique_devices} '
+                   f'device(s) via patch report. Install date confirmed after first detection date.',
+                   note_fmt)
+
+    log.debug("Resolved (Patch Confirmed) sheet: %d rows, %d CVEs, %d devices",
+              len(out), unique_cves, unique_devices)
+
+
+def build_products_not_tracked_sheet(writer,
+                                      patch_full_df: 'pd.DataFrame') -> None:
+    """
+    Products detected by N-able with unresolved CVEs where the device IS in the
+    patch report but this specific product is not being patched/tracked on it.
+
+    This means the product needs to be added to the RMM patch policy for those
+    devices — not a config.json issue, a patch scope issue.
+
+    Also flags products not in config.json product_map at all (no canonical key),
+    with a suggested entry to add.
+    """
+    import pandas as pd, re
+    from data_pipeline import get_base_product, _detect_product, _norm_text
+
+    wb       = writer.book
+    red      = wb.add_format({'bg_color': '#FCE4D6'})
+    amb      = wb.add_format({'bg_color': '#FFF2CC'})
+    hdr      = wb.add_format({'bold': True, 'bg_color': '#1F4E79',
+                               'font_color': 'white', 'border': 1})
+    code_fmt = wb.add_format({'font_name': 'Courier New', 'font_size': 9,
+                               'bg_color': '#F2F2F2'})
+    note_fmt = wb.add_format({'italic': True, 'font_color': '#595959',
+                               'text_wrap': True})
+
+    unmanaged = patch_full_df[
+        patch_full_df['Patch Match Result'] == 'Device in patch report - product not found'
+    ].copy()
+
+    if unmanaged.empty:
+        return
+
+    unmanaged['_bp'] = unmanaged['Affected Products'].apply(get_base_product)
+    unmanaged['_pk'] = unmanaged['Affected Products'].apply(
+        lambda v: _detect_product(_norm_text(str(v))))
+
+    # Aggregate per base product
+    agg = (unmanaged.groupby(['_bp', '_pk'])
+           .agg(
+               devices       = ('Name',               'nunique'),
+               cves          = ('Vulnerability Name', 'nunique'),
+               sample_names  = ('Name', lambda x: ', '.join(sorted(x.unique())[:3])
+                                         + (' ...' if x.nunique() > 3 else '')),
+           )
+           .reset_index()
+           .sort_values('devices', ascending=False)
+           .reset_index(drop=True))
+
+    # Build suggested config.json entries
+    def _suggest_entry(bp, pk):
+        bp_clean = re.sub(r'\s+\d[\d.]+\s*$', '', str(bp).lower().strip())
+        key      = pk if pk else bp_clean.replace(' ', '_')
+        return f'["{bp_clean}", "{key}"]'
+
+    agg['In product_map'] = agg['_pk'].apply(lambda v: '✓' if v else '✗')
+    agg['Suggested config.json entry'] = agg.apply(
+        lambda r: _suggest_entry(r['_bp'], r['_pk']), axis=1)
+
+    out = agg.rename(columns={
+        '_bp':          'Product (as detected by N-able)',
+        '_pk':          'Internal Key',
+        'devices':      'Devices Affected',
+        'cves':         'CVE Count',
+        'sample_names': 'Sample Devices',
+    })[['Product (as detected by N-able)', 'Devices Affected', 'CVE Count',
+        'Sample Devices', 'In product_map', 'Suggested config.json entry']]
+
+    out.to_excel(writer, sheet_name='Products Not in Patch Scope', index=False)
+    ws = writer.sheets['Products Not in Patch Scope']
+    ws.autofilter(0, 0, len(out), len(out.columns) - 1)
+    ws.set_row(0, None, hdr)
+
+    ws.set_column('A:A', 40)   # Product name
+    ws.set_column('B:B', 16)   # Devices
+    ws.set_column('C:C', 11)   # CVEs
+    ws.set_column('D:D', 45)   # Sample devices
+    ws.set_column('E:E', 14)   # In product_map
+    ws.set_column('F:F', 45)   # Suggested entry
+
+    for i, row in enumerate(out.itertuples(), start=1):
+        n = row._2  # Devices Affected
+        ws.set_row(i, None, red if n >= 10 else amb)
+        # Code-style formatting for the suggested entry column
+        ws.write(i, 5, row._6, code_fmt)
+
+    note_row = len(out) + 2
+    ws.merge_range(note_row, 0, note_row, 5,
+                   'These products are detected by N-able on devices that ARE in the patch report, '
+                   'but this specific product is not included in the RMM patch policy for those devices. '
+                   'To fix: add the product to your RMM patch policy scope. '
+                   'If the product is also missing from config.json (✗ in "In product_map"), '
+                   'add the suggested entry to config.json product_map as well.',
+                   note_fmt)
+    ws.set_row(note_row, 50)
+
+    log.debug("Products Not in Patch Scope sheet: %d products", len(out))
+
+
 def build_not_in_patch_scope_sheet(writer,
                                     triage_df: 'pd.DataFrame',
                                     patch_devices: set,

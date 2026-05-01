@@ -860,9 +860,14 @@ def load_previous_report(file_path):
     return df
 
 
-def compute_trends(current_df, previous_df, threshold):
+def compute_trends(current_df, previous_df, threshold,
+                   inventory_devices: set = None):
     """
     Compare current and previous reports at or above the score threshold.
+
+    inventory_devices: normalised device names from the current Device Inventory.
+    If supplied, devices absent from the inventory are excluded from BOTH
+    current and previous data — decommissioned devices must not affect trends.
 
     Snapshot metrics come from the FULL filtered datasets (no product-scope
     restriction) so "Previous Report" always reflects the actual previous run.
@@ -872,18 +877,11 @@ def compute_trends(current_df, previous_df, threshold):
 
     Processing order (important — each step feeds correctly into the next):
       1. Score threshold + deduplication
-      2. Snapshot metrics captured from full data
-      3. Common-product scope applied to both datasets
-      4. Checkbox-resolved pairs removed from cur only
-      5. Set arithmetic for CVE/device movement
-
-    Returns
-    -------
-    dict with keys:
-        metrics       – headline numbers dict
-        new_df        – CVEs in current but NOT in previous  (deduplicated)
-        resolved_df   – CVEs in previous but NOT in current  (deduplicated)
-        persisting_df – CVEs in BOTH reports (deduplicated)
+      2. Inventory filter — drop decommissioned devices from both datasets
+      3. Snapshot metrics captured from full data
+      4. Common-product scope applied to both datasets
+      5. Checkbox-resolved pairs removed from cur only
+      6. Set arithmetic for CVE/device movement
     """
     cur  = current_df.copy()
     cur['_Name_Key'] = cur['Name'].apply(normalize_device_name)
@@ -900,7 +898,24 @@ def compute_trends(current_df, previous_df, threshold):
     prev_t = prev_t.sort_values('Vulnerability Score', ascending=False)\
                    .drop_duplicates(subset=['_Name_Key', '_CVE_Key'], keep='first')
 
-    # ── Step 2: Snapshot metrics — captured from FULL data before any scope filter
+    # ── Step 2: Inventory filter — remove decommissioned devices from both ────
+    # Devices not in the current inventory are decommissioned. Their CVEs must
+    # not appear in Resolved, Persisting, or trend counts — they were removed
+    # from service, not patched. Applied to both datasets so movement math is
+    # consistent: a CVE disappearing because the device was decommissioned is
+    # NOT a resolution.
+    if inventory_devices:
+        prev_before = len(prev_t)
+        prev_t = prev_t[prev_t['_Name_Key'].isin(inventory_devices)]
+        cur_t  = cur_t[cur_t['_Name_Key'].isin(inventory_devices)]
+        dropped = prev_before - len(prev_t)
+        if dropped:
+            log.info(
+                "Trend: excluded %d previous-period row(s) for decommissioned "
+                "device(s) not in current Device Inventory", dropped
+            )
+
+    # ── Step 3: Snapshot metrics — captured from FULL data before any scope filter
     # "Previous Report had X CVEs" means ALL CVEs in that report, not just the
     # subset that overlaps with this month's product coverage.
     def _kev_count(df):

@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging, re
 from typing import Optional
 import pandas as pd
-from data_pipeline import extract_cve_id, get_base_product
+from data_pipeline import extract_cve_id, get_base_product, normalize_device_name
 
 log = logging.getLogger(__name__)
 
@@ -169,9 +169,15 @@ def get_recommendations(cause: str, product: str,
 
 # ── Main entry point ──────────────────────────────────────────────────────────
 def compute_patch_diagnostics(patch_full_df: pd.DataFrame,
-                               product_rules: Optional[dict] = None) -> dict:
+                               product_rules: Optional[dict] = None,
+                               resolved_pairs: Optional[set] = None) -> dict:
     """
     Classify patch evidence for each unresolved device-CVE pair.
+
+    resolved_pairs: set of (normalised_device, cve_id) tuples already resolved
+    by any method — pipeline-confirmed OR manually marked ☑ in product sheets.
+    These pairs are excluded from Patch Evidence Notes so a manual resolution
+    is not contradicted by a classification.
 
     Returns:
         patch_lag_df      resolved pairs with days-to-fix
@@ -194,6 +200,15 @@ def compute_patch_diagnostics(patch_full_df: pd.DataFrame,
     for _, row in df[df["_cause"].notna()].iterrows():
         cause = row["_cause"]
         prod  = str(row.get("Affected Products", ""))
+
+        # Skip pairs already resolved by any method — prevents manual ☑ being
+        # contradicted by a classification in Patch Evidence Notes
+        if resolved_pairs:
+            nk = normalize_device_name(str(row.get("Name", "")))
+            ck = extract_cve_id(str(row.get("Vulnerability Name", "")))
+            if (nk, ck) in resolved_pairs:
+                continue
+
         steps = get_recommendations(cause, prod, product_rules)
         rows.append({
             "Device":               row.get("Name", ""),
