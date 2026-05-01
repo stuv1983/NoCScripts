@@ -145,7 +145,12 @@ def run(request: DashboardRequest) -> DashboardResult:
             )
 
         if merged_df.empty:
-            msg = "No vulnerability records found after applying date filter."
+            msg = (
+                f"No vulnerability records found after applying date filter "
+                f"(>= {request.cutoff_date}).\n\n"
+                f"The detection dates in your CVE export may be older than this cutoff.\n"
+                f"Try an earlier date, or tick 'Show All Dates' to include everything."
+            )
             log.warning(msg)
             return DashboardResult(success=False, message=msg)
 
