@@ -41,7 +41,8 @@ log = logging.getLogger(__name__)
 
 def _try_sync_baselines() -> None:
     """
-    Silently attempt to refresh _baseline values in config.json from vendor APIs.
+    Refresh _baseline values in config.json from vendor APIs.
+    Only called when request.sync_baselines is True (opt-in).
     Updates FIXED_VERSION_RULES in-place so this run uses the fresh baselines.
     Never raises — a sync failure must not block the dashboard run.
     """
@@ -50,10 +51,9 @@ def _try_sync_baselines() -> None:
         updated = sync_baselines()
         if updated:
             import json as _json
-            _fresh = _json.load(open(
-                __file__.replace('orchestrator.py', 'config.json'),
-                encoding='utf-8'
-            )).get('fixed_version_rules', {})
+            cfg_path = __file__.replace('orchestrator.py', 'config.json')
+            with open(cfg_path, encoding='utf-8') as _fh:
+                _fresh = _json.load(_fh).get('fixed_version_rules', {})
             FIXED_VERSION_RULES.clear()
             FIXED_VERSION_RULES.update(_fresh)
             log.info("Baselines refreshed: %s",
@@ -134,10 +134,9 @@ def run(request: DashboardRequest) -> DashboardResult:
                 # Update FIXED_VERSION_RULES in-place so this run uses the
                 # freshly added version data — no module reload needed
                 import json as _json
-                _fresh = _json.load(open(
-                    __file__.replace('orchestrator.py', 'config.json'),
-                    encoding='utf-8'
-                )).get('fixed_version_rules', {})
+                cfg_path = __file__.replace('orchestrator.py', 'config.json')
+                with open(cfg_path, encoding='utf-8') as _fh:
+                    _fresh = _json.load(_fh).get('fixed_version_rules', {})
                 FIXED_VERSION_RULES.clear()
                 FIXED_VERSION_RULES.update(_fresh)
                 log.info("CVE lookup: %d CVE(s) enriched and version rules updated", enriched)

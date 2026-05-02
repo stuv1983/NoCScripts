@@ -14,6 +14,11 @@ Run manually:
     python cve_lookup.py CVE-2026-5288 CVE-2026-5289
     python cve_lookup.py --auto           # fetch all CVEs in config.json rules
     python cve_lookup.py --dry-run CVE-2026-5288
+    python cve_lookup.py --test-nvd-api
+
+NVD API key support:
+    Preferred: set environment variable NVD_API_KEY
+    Optional:  config.json -> { "api": { "nvd_api_key": "..." } }
 
 Or from code:
     from cve_lookup import lookup_fixed_version, enrich_config
@@ -38,6 +43,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import time
 import urllib.request
@@ -53,30 +59,114 @@ _RETRY   = 2
 _DELAY   = 0.5   # seconds between API calls — be a polite client
 
 
+def _mask_key(value: str) -> str:
+    """Return a safe display form for secrets, e.g. ****ABCD."""
+    value = str(value or '').strip()
+    if not value:
+        return ''
+    return '****' + value[-4:] if len(value) > 4 else '****'
+
+
+def _load_config(config_path: Optional[str] = None) -> dict:
+    """Best-effort config.json loader used only for optional API settings."""
+    try:
+        if config_path is None:
+            config_path = Path(__file__).parent / 'config.json'
+        config_path = Path(config_path)
+        if not config_path.exists():
+            return {}
+        with open(config_path, 'r', encoding='utf-8') as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        log.debug("cve_lookup: could not read config for API settings: %s", exc)
+        return {}
+
+
+def _get_nvd_api_key(config_path: Optional[str] = None) -> tuple[str, str]:
+    """
+    Return (api_key, source).
+
+    Priority:
+      1. NVD_API_KEY environment variable
+      2. config.json -> api.nvd_api_key
+
+    The key is optional. Blank means unauthenticated NVD requests.
+    """
+    env_key = os.getenv('NVD_API_KEY', '').strip()
+    if env_key:
+        return env_key, 'environment variable NVD_API_KEY'
+
+    cfg_key = str(_load_config(config_path).get('api', {}).get('nvd_api_key', '')).strip()
+    if cfg_key:
+        return cfg_key, 'config.json api.nvd_api_key'
+
+    return '', 'none'
+
+
+def _nvd_headers(config_path: Optional[str] = None, log_status: bool = False) -> dict[str, str]:
+    """Return the extra headers for NVD requests, including apiKey when configured."""
+    key, source = _get_nvd_api_key(config_path)
+    if key:
+        if log_status:
+            log.info("cve_lookup: NVD API key detected from %s (%s)", source, _mask_key(key))
+        return {'apiKey': key}
+
+    if log_status:
+        log.warning(
+            "cve_lookup: no NVD API key configured; using unauthenticated NVD requests "
+            "which may hit HTTP 403/429 rate limits"
+        )
+    return {}
+
+
+def test_nvd_api_access(config_path: Optional[str] = None, cve_id: str = 'CVE-2024-21413') -> bool:
+    """
+    Perform a direct NVD API test and log clear pass/fail feedback.
+
+    This is intentionally independent of CVE.org fallback logic so it confirms
+    NVD access specifically. It returns True only when NVD returns at least one
+    vulnerability record.
+    """
+    cve_id = cve_id.strip().upper()
+    headers = _nvd_headers(config_path, log_status=True)
+    url = f'https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={cve_id}'
+    log.info("cve_lookup: testing NVD API access with %s", cve_id)
+    data = _get(url, extra_headers=headers)
+    count = len(data.get('vulnerabilities', [])) if isinstance(data, dict) else 0
+    if count:
+        log.info("cve_lookup: NVD API access OK — received %d vulnerability record(s) for %s", count, cve_id)
+        return True
+    log.error("cve_lookup: NVD API access test failed — no vulnerability records returned for %s", cve_id)
+    return False
+
+
 # ==============================================================================
 # API FETCHERS
 # ==============================================================================
 
-def _get(url: str) -> Optional[dict]:
+def _get(url: str, extra_headers: Optional[dict[str, str]] = None) -> Optional[dict]:
     """HTTP GET with retries. Returns parsed JSON or None on failure."""
+    headers = {'User-Agent': _UA, 'Accept': 'application/json'}
+    if extra_headers:
+        headers.update(extra_headers)
+
     for attempt in range(_RETRY):
         try:
-            req = urllib.request.Request(
-                url,
-                headers={'User-Agent': _UA, 'Accept': 'application/json'},
-            )
+            req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=_TIMEOUT) as r:
                 return json.loads(r.read())
         except urllib.error.HTTPError as e:
             if e.code == 404:
+                log.debug("HTTP 404 from %s — CVE not found", url[:80])
                 return None          # CVE not found — not a retry candidate
-            if e.code == 429:
-                log.warning("Rate limited by %s — waiting 5s", url[:60])
+            if e.code in (403, 429):
+                log.warning("Rate limited or blocked by %s — HTTP %d; waiting 5s", url[:80], e.code)
                 time.sleep(5)
             else:
-                log.debug("HTTP %d from %s (attempt %d)", e.code, url[:60], attempt + 1)
+                log.debug("HTTP %d from %s (attempt %d)", e.code, url[:80], attempt + 1)
         except Exception as e:
-            log.debug("Fetch failed %s: %s (attempt %d)", url[:60], e, attempt + 1)
+            log.debug("Fetch failed %s: %s (attempt %d)", url[:80], e, attempt + 1)
         time.sleep(_DELAY)
     return None
 
@@ -197,8 +287,175 @@ def _is_valid_version(v: str) -> bool:
 
 
 # ==============================================================================
-# AUTO PRODUCT-MAP DERIVATION
+# EDGE CHROMIUM CVE RESOLVER
 # ==============================================================================
+#
+# Problem: Chromium CVEs (e.g. CVE-2026-5288/5289/5290) are filed against
+# Google Chrome by the CNA.  CVE.org and NVD return a Chrome fixed version
+# only.  Microsoft Edge is a Chromium derivative on a different version train,
+# so the Chrome fixed version is wrong for Edge.
+#
+# Solution: when a CVE maps to 'chrome', also attempt to resolve an Edge-
+# specific fixed version from Microsoft's own Edge update API.  The two
+# results are stored separately — chrome and edge are independent canonical
+# keys and never share a fixed version.
+#
+# Source: edgeupdates.microsoft.com/api/products
+# This is the same source used by version_sync.py for baseline tracking.
+# It exposes the per-release security CVE list via the "CVEs" field on each
+# release, making it the authoritative Microsoft source for Edge/CVE mapping.
+#
+# Fallback: if the API doesn't list the CVE (Microsoft sometimes omits CVE
+# details for Chromium-inherited fixes), we use the Chromium milestone to
+# find the corresponding Edge release.  Edge Stable incorporates a Chromium
+# milestone on a ~1-week delay; the milestone can be extracted from the
+# Chrome fixed version's major number.
+
+_EDGE_PRODUCTS_URL = 'https://edgeupdates.microsoft.com/api/products'
+_EDGE_CHROMIUM_MILESTONE_URL = (
+    'https://edgeupdates.microsoft.com/api/products?view=enterprise'
+)
+_EDGE_CACHE: Optional[list] = None   # module-level cache, one fetch per session
+
+
+def _get_edge_releases() -> list:
+    """Fetch and cache the Edge products/releases list."""
+    global _EDGE_CACHE
+    if _EDGE_CACHE is not None:
+        return _EDGE_CACHE
+    try:
+        data = _get(_EDGE_PRODUCTS_URL)
+        if isinstance(data, list):
+            _EDGE_CACHE = data
+            return _EDGE_CACHE
+    except Exception as e:
+        log.debug("cve_lookup: Edge releases fetch failed — %s", e)
+    _EDGE_CACHE = []
+    return _EDGE_CACHE
+
+
+def _edge_fixed_version_for_cve(cve_id: str) -> Optional[str]:
+    """
+    Return the earliest Edge Stable version that lists cve_id in its
+    security release notes, or None if not found.
+
+    Microsoft's Edge release API includes a 'CVEs' list per release for
+    CVEs that Microsoft explicitly credits in their release notes.  This
+    covers most Chromium-inherited CVEs but not all — Microsoft sometimes
+    omits CVE IDs when they describe a release only as "incorporates
+    Chromium security updates".
+    """
+    releases = _get_edge_releases()
+    if not releases:
+        return None
+
+    cve_upper = cve_id.strip().upper()
+
+    # Find the Stable channel product
+    stable = next((p for p in releases if str(p.get('Product', '')).lower() == 'stable'), None)
+    if not stable:
+        return None
+
+    # Walk releases sorted oldest-first; return first one that mentions the CVE
+    sorted_releases = sorted(
+        stable.get('Releases', []),
+        key=lambda r: [int(x) for x in str(r.get('ProductVersion', '0')).split('.')
+                       if x.isdigit()],
+    )
+
+    for rel in sorted_releases:
+        rel_cves = [str(c).strip().upper() for c in rel.get('CVEs', [])]
+        if cve_upper in rel_cves:
+            ver = str(rel.get('ProductVersion', '')).strip()
+            if _is_valid_version(ver):
+                log.debug("cve_lookup: Edge release notes: %s fixed in Edge %s", cve_id, ver)
+                return ver
+
+    return None
+
+
+def _edge_fixed_version_for_chromium_milestone(chrome_fixed: str) -> Optional[str]:
+    """
+    Given a Chrome fixed version string (e.g. '146.0.7680.178'), extract the
+    Chromium major milestone (146) and return the earliest Edge Stable release
+    that is built on that milestone or later.
+
+    Used as a fallback when the Edge release notes don't explicitly list the
+    CVE — Edge incorporates each Chromium security update within ~1 week.
+    """
+    releases = _get_edge_releases()
+    if not releases or not chrome_fixed:
+        return None
+
+    try:
+        chrome_major = int(chrome_fixed.split('.')[0])
+    except (ValueError, IndexError):
+        return None
+
+    stable = next((p for p in releases if str(p.get('Product', '')).lower() == 'stable'), None)
+    if not stable:
+        return None
+
+    candidates = []
+    for rel in stable.get('Releases', []):
+        ver = str(rel.get('ProductVersion', '')).strip()
+        if not _is_valid_version(ver):
+            continue
+        try:
+            edge_major = int(ver.split('.')[0])
+        except (ValueError, IndexError):
+            continue
+        if edge_major >= chrome_major:
+            candidates.append(ver)
+
+    if not candidates:
+        return None
+
+    # Return the lowest qualifying version (earliest safe Edge release)
+    candidates.sort(key=lambda v: [int(x) for x in v.split('.') if x.isdigit()])
+    result = candidates[0]
+    log.debug(
+        "cve_lookup: Edge milestone fallback: Chrome major %d → Edge %s",
+        chrome_major, result,
+    )
+    return result
+
+
+def _resolve_edge_version(cve_id: str, chrome_fixed: Optional[str]) -> Optional[str]:
+    """
+    Resolve the Edge-specific fixed version for a Chromium CVE.
+
+    Strategy (in order):
+      1. Direct CVE lookup in Edge release notes (authoritative)
+      2. Chromium milestone mapping from chrome_fixed version (fallback)
+
+    Returns None if no Edge version can be determined.
+    """
+    # Step 1: direct CVE lookup
+    ver = _edge_fixed_version_for_cve(cve_id)
+    if ver:
+        log.info("cve_lookup: %s → edge=%s (from Edge release notes)", cve_id, ver)
+        return ver
+
+    # Step 2: milestone mapping
+    if chrome_fixed:
+        ver = _edge_fixed_version_for_chromium_milestone(chrome_fixed)
+        if ver:
+            log.info(
+                "cve_lookup: %s → edge=%s (milestone fallback from chrome=%s)",
+                cve_id, ver, chrome_fixed,
+            )
+            return ver
+
+    log.debug("cve_lookup: %s — could not resolve Edge version", cve_id)
+    return None
+
+
+# Canonical keys that represent Chromium-based products where a separate
+# Edge resolution should be attempted when Chrome is matched.
+_CHROMIUM_PRODUCTS: frozenset[str] = frozenset({'chrome'})
+
+
 
 # Noise words to strip when building a canonical slug from a MITRE product name.
 # Keeps the slug short and stable across minor wording variations.
@@ -354,6 +611,7 @@ def lookup_fixed_version(
     product_map: list[tuple[str, str]],
     cfg: Optional[dict] = None,
     auto_add_products: bool = False,
+    config_path: Optional[str] = None,
 ) -> dict[str, str]:
     """
     Fetch the fixed version(s) for a CVE from public APIs.
@@ -387,11 +645,17 @@ def lookup_fixed_version(
     # Source 2: NVD (fallback)
     if not results:
         time.sleep(_DELAY)
-        data = _get(f'https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={cve_id}')
+        data = _get(
+            f'https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={cve_id}',
+            extra_headers=_nvd_headers(config_path),
+        )
         if data:
             results = _parse_nvd(data)
             if results:
-                log.debug("cve_lookup: %s → NVD returned %d CPE entries", cve_id, len(results))
+                log.info("cve_lookup: %s → NVD returned %d CPE entries", cve_id, len(results))
+            else:
+                vulns = len(data.get('vulnerabilities', [])) if isinstance(data, dict) else 0
+                log.info("cve_lookup: NVD request succeeded for %s but no fixed-version CPE ranges were found (%d record(s))", cve_id, vulns)
 
     # Source 3: OSV.dev (fallback)
     if not results:
@@ -455,6 +719,22 @@ def lookup_fixed_version(
     elif not (auto_add_products and unmatched):
         # Only warn if we didn't handle the unmatched entries ourselves
         log.warning("cve_lookup: %s — data found but no product_map matches", cve_id)
+
+    # ── Edge Chromium supplement ───────────────────────────────────────────────
+    # When a CVE matched 'chrome' (upstream CNA records only list Google Chrome),
+    # also attempt to resolve the Microsoft Edge fixed version separately.
+    # Chrome and Edge are on different version trains — the Chrome version must
+    # never be stored under the 'edge' canonical key.
+    # Only run if 'edge' is in the configured product_map (checked via product_map
+    # having an entry that maps to 'edge') and 'edge' not already matched.
+    if _CHROMIUM_PRODUCTS & set(matched.keys()):
+        edge_in_pm = any(v == 'edge' for _, v in product_map)
+        if edge_in_pm and 'edge' not in matched:
+            chrome_fixed = matched.get('chrome')
+            edge_ver = _resolve_edge_version(cve_id, chrome_fixed)
+            if edge_ver:
+                matched['edge'] = edge_ver
+                log.info("cve_lookup: %s → supplemented edge=%s", cve_id, edge_ver)
 
     return matched
 
@@ -531,6 +811,7 @@ def enrich_config(cve_ids: Optional[list[str]] = None,
             product_map,
             cfg=cfg if auto_add_products else None,
             auto_add_products=auto_add_products,
+            config_path=str(config_path),
         )
 
         # Rebuild product_map from cfg in case auto-add mutated it
@@ -673,7 +954,15 @@ if __name__ == '__main__':
                         '(default: auto-add is enabled)')
     p.add_argument('--config',    default=None, metavar='PATH',
                    help='Path to config.json')
+    p.add_argument('--test-nvd-api', action='store_true',
+                   help='Test direct NVD API access and print clear pass/fail feedback')
+    p.add_argument('--test-cve', default='CVE-2024-21413', metavar='CVE-ID',
+                   help='CVE ID to use with --test-nvd-api (default: CVE-2024-21413)')
     args = p.parse_args()
+
+    if args.test_nvd_api:
+        ok = test_nvd_api_access(config_path=args.config, cve_id=args.test_cve)
+        sys.exit(0 if ok else 2)
 
     cve_ids = None if args.auto else (args.cves or None)
 

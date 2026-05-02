@@ -1,5 +1,8 @@
 {
   "_comment": "N-able CVE Dashboard \u2014 product configuration. Add rows to 'product_map' to match software N-able detects against your patch report. Keys are lowercased substrings matched against the patch report product name; values are the internal canonical name. Entries are matched top-to-bottom \u2014 put more-specific strings before less-specific ones. 'fixed_version_rules' maps canonical_name \u2192 {CVE-ID: minimum_fixed_version}.",
+  "api": {
+    "nvd_api_key": "9C2E062C-C745-F111-836A-129478FCB64D"
+  },
   "product_map": [
     [
       "microsoft sql server management studio",
@@ -26,6 +29,22 @@
       "chrome"
     ],
     [
+      "google chromium",
+      "chrome"
+    ],
+    [
+      "chromium v8",
+      "chrome"
+    ],
+    [
+      "google v8",
+      "chrome"
+    ],
+    [
+      "chromium",
+      "chrome"
+    ],
+    [
       "haxx curl",
       "curl"
     ],
@@ -42,8 +61,116 @@
       "sinema_remote_connect_client"
     ],
     [
+      "apple macos tahoe",
+      "macos"
+    ],
+    [
+      "macos tahoe",
+      "macos"
+    ],
+    [
       "apple macos",
       "macos"
+    ],
+    [
+      "macos",
+      "macos"
+    ],
+    [
+      "apple safari",
+      "safari"
+    ],
+    [
+      "safari",
+      "safari"
+    ],
+    [
+      "apple ios and ipados",
+      "ios_ipados"
+    ],
+    [
+      "ios and ipados",
+      "ios_ipados"
+    ],
+    [
+      "apple ios ipados",
+      "ios_ipados"
+    ],
+    [
+      "ios ipados",
+      "ios_ipados"
+    ],
+    [
+      "apple ios",
+      "ios_ipados"
+    ],
+    [
+      "apple ipados",
+      "ipados"
+    ],
+    [
+      "ipados",
+      "ipados"
+    ],
+    [
+      "apple iphone os",
+      "iphone_os"
+    ],
+    [
+      "apple iphone_os",
+      "iphone_os"
+    ],
+    [
+      "iphone os",
+      "iphone_os"
+    ],
+    [
+      "iphone_os",
+      "iphone_os"
+    ],
+    [
+      "apple tvos",
+      "tvos"
+    ],
+    [
+      "apple tv os",
+      "tvos"
+    ],
+    [
+      "tvos",
+      "tvos"
+    ],
+    [
+      "apple visionos",
+      "visionos"
+    ],
+    [
+      "visionos",
+      "visionos"
+    ],
+    [
+      "apple watchos",
+      "watchos"
+    ],
+    [
+      "watchos",
+      "watchos"
+    ],
+    [
+      "webkitgtk",
+      "webkitgtk"
+    ],
+    [
+      "webkit2gtk",
+      "webkitgtk"
+    ],
+    [
+      "wpewebkit",
+      "wpewebkit"
+    ],
+    [
+      "wpe webkit",
+      "wpewebkit"
     ],
     [
       "siemens sinec_ins",
@@ -52,26 +179,6 @@
     [
       "splunk universal_forwarder",
       "universal_forwarder"
-    ],
-    [
-      "apple safari",
-      "safari"
-    ],
-    [
-      "apple ios ipados",
-      "ios_ipados"
-    ],
-    [
-      "apple ipados",
-      "ipados"
-    ],
-    [
-      "apple visionos",
-      "visionos"
-    ],
-    [
-      "apple watchos",
-      "watchos"
     ],
     [
       "microsoft asp.net core",
@@ -112,10 +219,6 @@
     [
       "zlib",
       "zlib"
-    ],
-    [
-      "apple iphone_os",
-      "iphone_os"
     ],
     [
       "stormshield_network_security",
@@ -194,9 +297,9 @@
     "_comment": "Per-CVE minimum fixed versions + optional rolling baseline. Add '_baseline': 'version' to enforce a minimum version even without a specific CVE rule. Update baselines monthly as vendors release new versions.",
     "chrome": {
       "_baseline": "148.0.7778.97",
-      "CVE-2026-5289": "136.0.7103.116",
-      "CVE-2026-5290": "136.0.7103.116",
-      "CVE-2026-5288": "136.0.7103.116",
+      "CVE-2026-5289": "146.0.7680.178",
+      "CVE-2026-5290": "146.0.7680.178",
+      "CVE-2026-5288": "146.0.7680.178",
       "CVE-2025-4052": "136.0.7103.59",
       "CVE-2025-10585": "140.0.7339.185",
       "CVE-2026-5858": "147.0.7727.55",
@@ -214,9 +317,9 @@
     },
     "edge": {
       "_baseline": "147.0.3912.87",
-      "CVE-2026-5289": "136.0.3240.64",
-      "CVE-2026-5290": "136.0.3240.64",
-      "CVE-2026-5288": "136.0.3240.64"
+      "CVE-2026-5289": "146.0.3856.97",
+      "CVE-2026-5290": "146.0.3856.97",
+      "CVE-2026-5288": "146.0.3856.97"
     },
     "vlc": {
       "_baseline": "3.0.21"
@@ -260,7 +363,8 @@
       "CVE-2025-24201": "18.3.1"
     },
     "ios_ipados": {
-      "CVE-2025-24201": "15.8.4"
+      "CVE-2025-24201": "15.8.4",
+      "CVE-2025-43342": "18.7"
     },
     "ipados": {
       "CVE-2025-24201": "17.7.6",
@@ -318,7 +422,10 @@
     },
     "teamviewer": {
       "CVE-2018-16550": "13.2.9356"
-    }
+    },
+    "tvos": {},
+    "webkitgtk": {},
+    "wpewebkit": {}
   },
   "remediation_rules": {
     "_comment": "Product-specific remediation steps. Keys match canonical product names from product_map.",
