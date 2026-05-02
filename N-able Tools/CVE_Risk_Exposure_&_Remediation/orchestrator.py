@@ -84,6 +84,8 @@ class DashboardRequest:
     threshold:            float          = 9.0
     cutoff_date:          Optional[str]  = None
     show_all_dates:       bool           = False
+    sync_baselines:       bool           = False
+    exclude_missing_rmm:  bool           = True
 
 
 @dataclass
@@ -113,8 +115,9 @@ def run(request: DashboardRequest) -> DashboardResult:
     try:
         log.info("Dashboard run started — output: %s", request.output_path)
 
-        # Refresh version baselines from vendor APIs (silent if offline)
-        _try_sync_baselines()
+        # Refresh version baselines from vendor APIs (only when explicitly requested)
+        if request.sync_baselines:
+            _try_sync_baselines()
 
         # ── Load & merge ──────────────────────────────────────────────────────
         log.info("Loading vulnerability data: %s", request.vuln_path)
@@ -147,7 +150,8 @@ def run(request: DashboardRequest) -> DashboardResult:
             df_rmm = load_rmm_data(request.rmm_path)
             log.info("  %d devices loaded", len(df_rmm))
 
-        merged_df = merge_data(df_vuln, df_rmm, request.skip_rmm)
+        merged_df = merge_data(df_vuln, df_rmm, request.skip_rmm,
+                               exclude_missing_rmm=request.exclude_missing_rmm)
         log.info("Merged dataset: %d rows", len(merged_df))
 
         raw_df         = merged_df.copy()
@@ -315,7 +319,22 @@ def run(request: DashboardRequest) -> DashboardResult:
                 log.warning("Could not compute re-detected count: %s", exc)
 
         # Initialise failure_df before workbook write block so all branches can reference it
-        failure_df = None
+        failure_df     = None
+        failure_lookup = {}
+        failure_devices: set = set()
+
+        # ── Load failure report early (before workbook block) ─────────────────
+        # Must happen before build_not_in_patch_scope_sheet so failure_devices
+        # is populated when determining which devices are truly out of scope.
+        if request.include_failure_report and request.failure_report_path:
+            try:
+                log.info("Loading patch failure report: %s", request.failure_report_path)
+                failure_df     = load_patch_failure_report(request.failure_report_path)
+                failure_lookup = build_patch_failure_lookup(failure_df)
+                failure_devices = set(failure_lookup.keys())
+            except Exception as exc:
+                log.warning("Could not process patch failure report: %s", exc)
+                warnings.append(f"Could not process patch failure report: {exc}")
 
         # ── Write workbook ────────────────────────────────────────────────────
         log.info("Writing workbook: %s", request.output_path)
@@ -339,7 +358,6 @@ def run(request: DashboardRequest) -> DashboardResult:
                 redetected_count=redetected_count,
                 sheet_name=overview_sheet_name,
                 trend_metrics=trend_data['metrics'] if trend_data else None,
-                health_score=diagnostics.get('health_score'),
                 evidence_summary=diagnostics.get('evidence_summary'),
                 recommended_actions=diagnostics.get('recommended_actions'),
                 has_prev_report=trend_data is not None,
@@ -375,52 +393,39 @@ def run(request: DashboardRequest) -> DashboardResult:
                 patch_report_devices = set(
                     patch_data[1]['Name'].apply(normalize_device_name).unique()
                 ) if patch_data else set()
-                failure_report_devices = set(
-                    failure_df['_device_norm'].unique()
-                ) if failure_df is not None else set()
 
                 build_not_in_patch_scope_sheet(
                     writer, triage_df,
                     patch_devices=patch_report_devices,
-                    failure_devices=failure_report_devices,
+                    failure_devices=failure_devices,
                 )
 
                 # Products in CVE data, device in patch report, but product not tracked
                 build_products_not_tracked_sheet(writer, patch_data[1])
 
-            # ── Optional: patch failure report ────────────────────────────────
-            if request.include_failure_report and request.failure_report_path:
-                try:
-                    log.info("Loading patch failure report: %s", request.failure_report_path)
-                    failure_df     = load_patch_failure_report(request.failure_report_path)
-                    failure_lookup = build_patch_failure_lookup(failure_df)
-                    fail_devices   = set(failure_lookup.keys())
-
-                    # Only include active (inventoried) devices
-                    inventory_devices = (
-                        set(df_rmm['Device_Join'].unique()) if df_rmm is not None else None
+            # ── Write patch failure sheets (data already loaded above) ─────────
+            if failure_df is not None and failure_lookup:
+                inventory_devices = (
+                    set(df_rmm['Device_Join'].unique()) if df_rmm is not None else None
+                )
+                cve_overlap = triage_df[
+                    triage_df['Name'].apply(normalize_device_name).isin(failure_devices)
+                ].copy()
+                build_patch_failure_sheet(writer, failure_df, failure_lookup,
+                                          cve_overlap, inventory_devices=inventory_devices)
+                # Surface in warnings
+                for dev, info in sorted(failure_lookup.items(),
+                                        key=lambda x: -x[1]['failure_count'])[:3]:
+                    warnings.append(
+                        f"Patch delivery failing on {dev}: "
+                        f"{info['failure_count']} failures — {info['top_description']}"
                     )
-
-                    cve_overlap    = triage_df[
-                        triage_df['Name'].apply(normalize_device_name).isin(fail_devices)
-                    ].copy()
-                    build_patch_failure_sheet(writer, failure_df, failure_lookup,
-                                              cve_overlap, inventory_devices=inventory_devices)
-                    # Surface in warnings
-                    for dev, info in sorted(failure_lookup.items(),
-                                            key=lambda x: -x[1]['failure_count'])[:3]:
-                        warnings.append(
-                            f"Patch delivery failing on {dev}: "
-                            f"{info['failure_count']} failures — {info['top_description']}"
-                        )
-                    if not cve_overlap.empty:
-                        warnings.append(
-                            f"{cve_overlap['Vulnerability Name'].nunique()} CVE type(s) on "
-                            f"{cve_overlap['Name'].nunique()} device(s) where patches are "
-                            f"actively failing — see 'Patch Failures' sheet"
-                        )
-                except Exception as exc:
-                    log.warning("Could not process patch failure report: %s", exc)
+                if not cve_overlap.empty:
+                    warnings.append(
+                        f"{cve_overlap['Vulnerability Name'].nunique()} CVE type(s) on "
+                        f"{cve_overlap['Name'].nunique()} device(s) where patches are "
+                        f"actively failing — see 'Patch Failures' sheet"
+                    )
 
         log.info("Workbook written successfully")
 

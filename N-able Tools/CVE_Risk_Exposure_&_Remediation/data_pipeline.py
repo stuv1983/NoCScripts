@@ -459,7 +459,7 @@ def load_rmm_data(file_path):
 
     return df.drop_duplicates(subset=['Device_Join'], keep='first')
 
-def merge_data(df_vuln, df_rmm, skip_rmm):
+def merge_data(df_vuln, df_rmm, skip_rmm, exclude_missing_rmm=True):
     # Some N-able CVE exports already include Last Response and Device Type inline.
     # Detect this upfront so we don't create _x/_y collision columns during the merge.
     vuln_has_lr = 'Last Response' in df_vuln.columns
@@ -473,12 +473,18 @@ def merge_data(df_vuln, df_rmm, skip_rmm):
 
         if len(rmm_pull) > 1:
             before = len(df_vuln)
-            # INNER join: devices absent from the inventory are decommissioned.
-            # Their CVEs are excluded entirely — no "Not Found in RMM" tracking.
+            # exclude_missing_rmm=True (default):
+            #   INNER join — devices absent from the inventory are decommissioned.
+            #   Their CVEs are excluded entirely.
+            # exclude_missing_rmm=False:
+            #   LEFT join — all CVE rows are kept.  Devices not in the inventory
+            #   get Last Response = 'Not Found in RMM' so they remain visible
+            #   for evidence/scope-gap reporting.
+            join_how = 'inner' if exclude_missing_rmm else 'left'
             merged = pd.merge(df_vuln, df_rmm[rmm_pull],
-                              left_on='Name_Join', right_on='Device_Join', how='inner')
+                              left_on='Name_Join', right_on='Device_Join', how=join_how)
             dropped = before - len(merged)
-            if dropped:
+            if dropped and exclude_missing_rmm:
                 decom_names = (
                     set(df_vuln['Name_Join'].unique())
                     - set(df_rmm['Device_Join'].unique())
@@ -490,6 +496,19 @@ def merge_data(df_vuln, df_rmm, skip_rmm):
                     ', '.join(sorted(decom_names)[:5]),
                     ' ...' if len(decom_names) > 5 else '',
                 )
+            elif not exclude_missing_rmm:
+                # Tag unmatched devices so downstream code can identify them
+                missing_mask = merged['Device_Join'].isna()
+                if missing_mask.any():
+                    if not vuln_has_lr:
+                        merged.loc[missing_mask, 'Last Response'] = 'Not Found in RMM'
+                    if not vuln_has_dt:
+                        merged.loc[missing_mask, 'Device Type'] = 'Unknown'
+                    log.info(
+                        "%d CVE rows for devices not in Device Inventory kept "
+                        "(exclude_missing_rmm=False)",
+                        missing_mask.sum(),
+                    )
             if not vuln_has_dt:
                 merged['Device Type'] = merged['Device Type'].fillna('Unknown')
         else:

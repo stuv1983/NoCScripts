@@ -62,6 +62,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help='Skip RMM merge (CVE export already includes device info)')
     p.add_argument('--patch',     default=None,   metavar='FILE',
                    help='Patch report for patch-match analysis (CSV or XLSX)')
+    p.add_argument('--failure-report', default=None, metavar='FILE',
+                   help='Patch failure report CSV for failed patch delivery analysis')
     p.add_argument('--previous',  default=None,   metavar='FILE',
                    help='Previous dashboard (.xlsx) for month-over-month trends')
     p.add_argument('--threshold', default=9.0,    type=float, metavar='SCORE',
@@ -70,6 +72,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help='Only include detections on or after this date')
     p.add_argument('--all-dates', action='store_true',
                    help='Include all detection dates (overrides --since)')
+    p.add_argument('--sync-baselines', action='store_true',
+                   help='Refresh rolling product baselines from vendor APIs before generating')
+    p.add_argument('--include-all-rmm', action='store_true',
+                   help='Keep CVEs for devices not in RMM inventory (default: exclude them)')
     p.add_argument('--verbose',   action='store_true',
                    help='Enable DEBUG-level logging')
     return p
@@ -92,23 +98,30 @@ def main() -> int:
     if args.patch and not Path(args.patch).exists():
         log.error("Patch file not found: %s", args.patch)
         return 1
+    if args.failure_report and not Path(args.failure_report).exists():
+        log.error("Patch failure report not found: %s", args.failure_report)
+        return 1
     if args.previous and not Path(args.previous).exists():
         log.error("Previous report not found: %s", args.previous)
         return 1
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
 
     request = DashboardRequest(
-        vuln_path        = args.input,
-        output_path      = args.output,
-        rmm_path         = args.rmm,
-        skip_rmm         = args.skip_rmm,
-        patch_path       = args.patch,
-        include_patch    = bool(args.patch),
-        prev_report_path = args.previous,
-        include_trend    = bool(args.previous),
-        threshold        = args.threshold,
-        cutoff_date      = None if args.all_dates else args.since,
-        show_all_dates   = args.all_dates,
+        vuln_path              = args.input,
+        output_path            = args.output,
+        rmm_path               = args.rmm,
+        skip_rmm               = args.skip_rmm,
+        patch_path             = args.patch,
+        include_patch          = bool(args.patch),
+        failure_report_path    = args.failure_report,
+        include_failure_report = bool(args.failure_report),
+        prev_report_path       = args.previous,
+        include_trend          = bool(args.previous),
+        threshold              = args.threshold,
+        cutoff_date            = None if args.all_dates else args.since,
+        show_all_dates         = args.all_dates,
+        sync_baselines         = args.sync_baselines,
+        exclude_missing_rmm    = not args.include_all_rmm,
     )
 
     log.info("Starting headless dashboard generation")

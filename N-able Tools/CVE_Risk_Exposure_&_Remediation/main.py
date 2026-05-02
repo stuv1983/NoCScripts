@@ -145,6 +145,7 @@ def process_reports():
         threshold              = float(score_var.get()),
         cutoff_date            = cutoff_date,
         show_all_dates         = show_all_dates_var.get(),
+        sync_baselines         = sync_baselines_var.get(),
     )
 
     log.info("Starting dashboard generation: %s", output_path)
@@ -211,7 +212,7 @@ tk.Entry(score_frame, textvariable=score_var, width=6).pack(side=tk.LEFT, padx=6
 
 date_frame = tk.Frame(root)
 date_frame.pack(anchor="w", padx=14, pady=(6, 0))
-tk.Label(date_frame, text="Filter: detections since", font=("Arial", 9, "bold")).pack(side=tk.LEFT)
+tk.Label(date_frame, text="Exclude stale devices last seen before", font=("Arial", 9, "bold")).pack(side=tk.LEFT)
 date_var = tk.StringVar()
 from datetime import date, timedelta
 _default_since = (date.today() - timedelta(days=90)).strftime('%Y-%m-%d')
@@ -274,6 +275,10 @@ prev_report_browse_btn.pack(side=tk.LEFT, padx=4)
 include_trend_var = tk.BooleanVar()
 tk.Checkbutton(root, text="Include month-over-month trend analysis",
                variable=include_trend_var, command=toggle_trend_state).pack(anchor="w", padx=14)
+
+sync_baselines_var = tk.BooleanVar()
+tk.Checkbutton(root, text="Refresh product baselines before run",
+               variable=sync_baselines_var).pack(anchor="w", padx=14, pady=(6, 0))
 
 generate_btn = tk.Button(
     root,

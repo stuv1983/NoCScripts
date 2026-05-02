@@ -265,7 +265,6 @@ def build_overview_sheet(workbook, merged_df, filtered_df, triage_df, threshold,
                           product_to_sheet, header_fmt, link_fmt, customer_name='',
                           patch_confirmed_count=0, redetected_count=0,
                           sheet_name='Detections', trend_metrics=None,
-                          health_score: Optional[dict] = None,
                           evidence_summary: Optional[dict] = None,
                           recommended_actions: Optional[list] = None,
                           has_prev_report: bool = False):
@@ -388,18 +387,20 @@ def build_overview_sheet(workbook, merged_df, filtered_df, triage_df, threshold,
     ws.write(r0+3, 4, 'Avg CVEs / Device'); ws.write(r0+3, 5, avg_per_dev)
     ws.write(r0+4, 4, 'Servers Impacted');  ws.write(r0+4, 5, f'{srv_aff} ({srv_pct})')
 
-    # ── Patch Reliability Score ───────────────────────────────────────────────
-    if health_score and health_score.get('score') is not None:
-        hs   = health_score['score']
-        grad = health_score['grade']
-        interp = health_score['interpretation']
-        hs_colour = ('#375623' if hs >= 75 else '#7F6000' if hs >= 60 else '#9C0006')
-        hs_fmt  = workbook.add_format({'bold': True, 'font_size': 18, 'font_color': hs_colour})
-        hs_note = workbook.add_format({'italic': True, 'font_color': '#595959', 'font_size': 9})
-        ws.write(r0,   7, 'Patch Reliability Score', header_fmt)
-        ws.write(r0+1, 7, f'{hs} / 100  ({grad})', hs_fmt)
-        ws.write(r0+2, 7, interp, hs_note)
-        ws.set_column('H:H', 42)
+    # ── Patch Evidence Summary (plain counts — client-safe) ─────────────────
+    # The synthetic Patch Reliability Score (0-100) uses internally-defined
+    # weighted penalties that are not standards-based.  For client-facing
+    # reports, plain counts are clearer and more defensible.
+    if evidence_summary:
+        summ_fmt  = workbook.add_format({'bold': True, 'font_size': 10})
+        summ_note = workbook.add_format({'italic': True, 'font_color': '#595959', 'font_size': 9})
+        ws.write(r0,   7, 'Patch Evidence Summary', header_fmt)
+        sr = r0 + 1
+        for label, count in sorted(evidence_summary.items(), key=lambda x: -x[1]):
+            ws.write(sr, 7, f'{count}  {label}', summ_fmt)
+            sr += 1
+        ws.write(sr, 7, 'See Patch Evidence Notes sheet for per-device detail', summ_note)
+        ws.set_column('H:H', 48)
 
     # ── CVE Movement Context (only shown when trend data available) ────────────
     # Answers the question "is this CVE count jump real risk or noise?"
