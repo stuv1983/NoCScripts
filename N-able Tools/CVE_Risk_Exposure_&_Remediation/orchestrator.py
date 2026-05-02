@@ -342,6 +342,7 @@ def run(request: DashboardRequest) -> DashboardResult:
                 health_score=diagnostics.get('health_score'),
                 evidence_summary=diagnostics.get('evidence_summary'),
                 recommended_actions=diagnostics.get('recommended_actions'),
+                has_prev_report=trend_data is not None,
             )
 
             if trend_data:

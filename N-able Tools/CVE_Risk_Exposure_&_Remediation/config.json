@@ -26,6 +26,118 @@
       "chrome"
     ],
     [
+      "haxx curl",
+      "curl"
+    ],
+    [
+      "oracle mysql_server",
+      "mysql_server"
+    ],
+    [
+      "haxx libcurl",
+      "libcurl"
+    ],
+    [
+      "siemens sinema_remote_connect_client",
+      "sinema_remote_connect_client"
+    ],
+    [
+      "apple macos",
+      "macos"
+    ],
+    [
+      "siemens sinec_ins",
+      "sinec_ins"
+    ],
+    [
+      "splunk universal_forwarder",
+      "universal_forwarder"
+    ],
+    [
+      "apple safari",
+      "safari"
+    ],
+    [
+      "apple ios ipados",
+      "ios_ipados"
+    ],
+    [
+      "apple ipados",
+      "ipados"
+    ],
+    [
+      "apple visionos",
+      "visionos"
+    ],
+    [
+      "apple watchos",
+      "watchos"
+    ],
+    [
+      "microsoft asp.net core",
+      "dotnet"
+    ],
+    [
+      "microsoft visual studio",
+      "visualstudio"
+    ],
+    [
+      "fasterxml jackson-databind",
+      "jackson_databind"
+    ],
+    [
+      "oracle financial_services_analytical_applications_infrastructure",
+      "financial_services_analytical_ap"
+    ],
+    [
+      "oracle global_lifecycle_management_opatch",
+      "global_lifecycle_management_opat"
+    ],
+    [
+      "oracle goldengate_stream_analytics",
+      "goldengate_stream_analytics"
+    ],
+    [
+      "oracle mysql",
+      "mysql"
+    ],
+    [
+      "oracle primavera_unifier",
+      "primavera_unifier"
+    ],
+    [
+      "curl",
+      "curl"
+    ],
+    [
+      "zlib",
+      "zlib"
+    ],
+    [
+      "apple iphone_os",
+      "iphone_os"
+    ],
+    [
+      "stormshield_network_security",
+      "stormshield_network_security"
+    ],
+    [
+      "microsoft .net",
+      "dotnet"
+    ],
+    [
+      "microsoft nuget",
+      "nuget"
+    ],
+    [
+      "microsoft powershell",
+      "powershell"
+    ],
+    [
+      "teamviewer",
+      "teamviewer"
+    ],
+    [
       "windows 11",
       "windows"
     ],
@@ -111,7 +223,102 @@
     },
     "ssms": {},
     "office": {},
-    "office365": {}
+    "office365": {},
+    "curl": {
+      "CVE-2019-5482": "7.65.3",
+      "CVE-2019-5481": "7.65.3",
+      "CVE-2022-32221": "7.86.0",
+      "CVE-2023-38545": "8.4.0"
+    },
+    "mysql_server": {
+      "CVE-2019-5482": "5.7.28",
+      "CVE-2019-3822": "5.7.26",
+      "CVE-2019-5481": "5.7.28",
+      "CVE-2021-22945": "5.7.35"
+    },
+    "libcurl": {
+      "CVE-2019-3822": "7.64.0",
+      "CVE-2021-22945": "7.78.0"
+    },
+    "sinema_remote_connect_client": {
+      "CVE-2019-3822": "2.0"
+    },
+    "macos": {
+      "CVE-2021-22945": "12.3",
+      "CVE-2025-24201": "15.3.2",
+      "CVE-2022-32221": "12.6.3",
+      "CVE-2022-37434": "11.7.1"
+    },
+    "sinec_ins": {
+      "CVE-2021-22945": "1.0.1.1"
+    },
+    "universal_forwarder": {
+      "CVE-2021-22945": "8.2.12",
+      "CVE-2022-32221": "8.2.12"
+    },
+    "safari": {
+      "CVE-2025-24201": "18.3.1"
+    },
+    "ios_ipados": {
+      "CVE-2025-24201": "15.8.4"
+    },
+    "ipados": {
+      "CVE-2025-24201": "17.7.6",
+      "CVE-2022-37434": "15.7.1"
+    },
+    "visionos": {
+      "CVE-2025-24201": "2.3.2"
+    },
+    "watchos": {
+      "CVE-2025-24201": "11.4",
+      "CVE-2022-37434": "9.1"
+    },
+    "dotnet": {
+      "CVE-2025-55315": "2.3.6",
+      "CVE-2023-36049": "8.0.0",
+      "CVE-2024-0057": "3.0.50727.8976"
+    },
+    "visualstudio": {
+      "CVE-2025-55315": "17.10.20",
+      "CVE-2023-36049": "17.2.22",
+      "CVE-2024-0057": "16.11.34"
+    },
+    "jackson_databind": {
+      "CVE-2019-14540": "2.6.7.3"
+    },
+    "financial_services_analytical_ap": {
+      "CVE-2019-14540": "8.0.8"
+    },
+    "global_lifecycle_management_opat": {
+      "CVE-2019-14540": "11.2.0.3.23"
+    },
+    "goldengate_stream_analytics": {
+      "CVE-2019-14540": "19.1.0.0.1"
+    },
+    "mysql": {
+      "CVE-2019-14540": "5.7.30"
+    },
+    "primavera_unifier": {
+      "CVE-2019-14540": "17.12"
+    },
+    "zlib": {
+      "CVE-2022-37434": "1.2.12"
+    },
+    "iphone_os": {
+      "CVE-2022-37434": "15.7.1"
+    },
+    "stormshield_network_security": {
+      "CVE-2022-37434": "3.7.34"
+    },
+    "nuget": {
+      "CVE-2024-0057": "5.11.6.0"
+    },
+    "powershell": {
+      "CVE-2024-0057": "7.2.18"
+    },
+    "teamviewer": {
+      "CVE-2018-16550": "13.2.9356"
+    }
   },
   "remediation_rules": {
     "_comment": "Product-specific remediation steps. Keys match canonical product names from product_map.",

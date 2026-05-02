@@ -251,20 +251,55 @@ def compute_patch_diagnostics(patch_full_df: pd.DataFrame,
                     if lag_rows else _e)
 
     # ── Version drift ─────────────────────────────────────────────────────────
+    # Groups by base product AND architecture (x64/x86) so a fleet with mixed
+    # 32-bit and 64-bit Chrome/Firefox installs shows separate drift rows for
+    # each variant rather than merging them into one misleading bucket.
+    _ARCH_RE = re.compile(r'\((x64|x86|32[\-\s]?bit|64[\-\s]?bit)\)', re.IGNORECASE)
+
+    def _arch_suffix(text: str) -> str:
+        """Return ' (x64)' / ' (x86)' / '' from a patch name or product string."""
+        m = _ARCH_RE.search(str(text))
+        if not m:
+            return ''
+        a = m.group(1).lower()
+        return ' (x86)' if ('x86' in a or '32' in a) else ' (x64)'
+
+    def _drift_key(row) -> str:
+        """
+        Stable grouping key for version drift: base product + arch suffix.
+
+        Arch is preferred from 'Matched Patch' (e.g. 'Chrome (x64) 147.0…')
+        because N-able's CVE export often omits it from 'Affected Products'
+        (e.g. 'Google Chrome' with no arch tag).  Falls back to 'Affected
+        Products' arch when the patch name is absent or has no arch tag.
+        """
+        bp   = get_base_product(str(row.get("Affected Products", "")))
+        arch = _arch_suffix(str(row.get("Matched Patch", "")))
+        if not arch:
+            arch = _arch_suffix(str(row.get("Affected Products", "")))
+        return bp + arch
+
     drift_rows = []
     no_version_data_products = []
     if "Matched Patch Version" in df.columns:
-        df["_bp"] = df["Affected Products"].apply(get_base_product)
-        for prod, grp in df.groupby("_bp"):
+        df["_bp"]       = df["Affected Products"].apply(get_base_product)
+        df["_drift_key"] = df.apply(_drift_key, axis=1)
+
+        for dk, grp in df.groupby("_drift_key"):
             vers = (grp["Matched Patch Version"].dropna().astype(str).str.strip()
                     .loc[lambda s: s.str.len() > 0].unique().tolist())
             if len(set(vers)) < 2:
                 if len(vers) == 0:
-                    # Product detected but patch tool returns no version data
-                    no_version_data_products.append(prod)
+                    # Only log the base product name (no arch suffix) for the
+                    # "no version data" note — avoids duplicating e.g.
+                    # "Google Chrome (x64)" and "Google Chrome (x86)" separately
+                    # when both have no data.
+                    bp = str(grp["_bp"].iloc[0]) if not grp.empty else str(dk)
+                    if bp not in no_version_data_products:
+                        no_version_data_products.append(bp)
                 continue
             drift_rows.append({
-                "Product":           prod,
+                "Product":           dk,           # e.g. "Google Chrome (x64)"
                 "Distinct Versions": len(set(vers)),
                 "Versions Seen":     ", ".join(sorted(set(vers))),
                 "Device Count":      grp["Name"].nunique(),

@@ -197,11 +197,164 @@ def _is_valid_version(v: str) -> bool:
 
 
 # ==============================================================================
+# AUTO PRODUCT-MAP DERIVATION
+# ==============================================================================
+
+# Noise words to strip when building a canonical slug from a MITRE product name.
+# Keeps the slug short and stable across minor wording variations.
+_NOISE_WORDS = re.compile(
+    r'\b(version|v|update|security|runtime|framework|sdk|client|server|'
+    r'x64|x86|32.bit|64.bit|for|and|the|rtm|lts|esr|release|channel)\b',
+    re.IGNORECASE,
+)
+_VER_STRIP  = re.compile(r'\b\d+(?:\.\d+)+\b')           # strip dotted versions e.g. 6.0.25
+_YEAR_STRIP = re.compile(r'\b(?:19|20)\d{2}\b')           # strip 4-digit years e.g. 2022
+_ARCH_STRIP = re.compile(r'\(x64\)|\(x86\)|\(64.bit\)|\(32.bit\)', re.IGNORECASE)
+_SLUG_CHARS = re.compile(r'[^a-z0-9]+')            # keep only alphanum for slug
+
+# Products whose MITRE name differs significantly from how N-able names them.
+# Checked before the generic derivation logic — add more as you find them.
+_KNOWN_CANONICAL: list[tuple[str, str]] = [
+    # (lowercase substring in "vendor product", canonical_key)
+    ('microsoft .net',      'dotnet'),
+    (r'\.net framework',    'dotnet'),
+    (r'\.net core',         'dotnet'),
+    (r'\.net runtime',      'dotnet'),
+    ('haxx curl',           'curl'),
+    (' curl',               'curl'),
+    ('madler zlib',         'zlib'),
+    (' zlib',               'zlib'),
+    ('microsoft visual studio', 'visualstudio'),
+    ('winzip',              'winzip'),
+    ('7-zip',               '7zip'),
+    ('notepad++',           'notepadpp'),
+    ('adobe acrobat',       'acrobat'),
+    ('adobe reader',        'acrobat'),
+]
+
+
+def _derive_canonical(vendor: str, product: str) -> str:
+    """
+    Derive a stable canonical key for a MITRE vendor/product pair.
+
+    Priority:
+      1. _KNOWN_CANONICAL lookup — handles products whose MITRE naming
+         diverges from N-able's naming (e.g. "haxx curl" → "curl").
+      2. Generic slug derived from the product name (vendor-prefixed only
+         when needed to avoid collisions, e.g. "microsoft_edge" vs "edge").
+
+    Returns a lowercase alphanum+underscore string ≤ 32 chars.
+    """
+    combined = f'{vendor} {product}'.lower().strip()
+    for fragment, canonical in _KNOWN_CANONICAL:
+        if re.search(fragment, combined):
+            return canonical
+
+    # Generic path: clean the product name into a stable slug
+    p = product.lower()
+    p = _VER_STRIP.sub('', p)         # drop version numbers
+    p = _NOISE_WORDS.sub(' ', p)      # drop noise words
+    p = _SLUG_CHARS.sub('_', p)       # slug
+    p = p.strip('_')
+    # If slug is very short or empty, prefix vendor
+    if len(p) < 3:
+        v = _SLUG_CHARS.sub('_', vendor.lower()).strip('_')
+        p = f'{v}_{p}'.strip('_')
+    return p[:32] or 'unknown'
+
+
+def _derive_search_key(vendor: str, product: str) -> str:
+    """
+    Derive the product_map search key — a lowercase substring that will be
+    found inside both:
+      - the CVE export's "Affected products" column  (e.g. "Microsoft .NET Runtime 6.0 (x64)")
+      - the patch report's "Patch" column            (e.g. "2026-04 .NET 8.0.26 Security Update…")
+
+    Strip version numbers, architecture tags, and noise words so the key stays
+    stable across releases and is broad enough to match N-able's various naming
+    conventions.  Prefer shorter keys that match more product name variants.
+    """
+    p = _ARCH_STRIP.sub(' ', product)     # remove (x64) / (x86) etc.
+    p = _VER_STRIP.sub('', p)             # remove 6.0, 8.0.26, …
+    p = _YEAR_STRIP.sub('', p)            # remove 2022, 2019, …
+    p = _NOISE_WORDS.sub(' ', p)          # remove runtime, framework, version, …
+    p = re.sub(r'\s+', ' ', p).strip()
+
+    combined = f'{vendor} {p}'.lower().strip()
+    combined = re.sub(r'\s+', ' ', combined)
+
+    # If the vendor name is embedded in the product string already, use
+    # product-only key to avoid ugly "microsoft microsoft edge" patterns
+    v_low = vendor.lower().strip()
+    p_low = p.lower().strip()
+    if v_low and v_low in p_low:
+        return p_low
+
+    return combined
+
+
+def _auto_update_product_map(
+    vendor: str,
+    product: str,
+    fixed_version: str,
+    cve_id: str,
+    cfg: dict,
+) -> Optional[str]:
+    """
+    Derive a (search_key, canonical) pair from MITRE data and, if the search_key
+    is not already in product_map, insert it and create a fixed_version_rules
+    entry.  Updates cfg in-place.  Returns the canonical key on success, None
+    if nothing was added (key already present or derivation failed).
+
+    Entries are inserted BEFORE the first generic "windows" entry so more-
+    specific strings are matched first, as required by the top-to-bottom
+    product_map matching logic in data_pipeline.py.
+    """
+    canonical  = _derive_canonical(vendor, product)
+    search_key = _derive_search_key(vendor, product)
+
+    if not canonical or not search_key:
+        return None
+
+    pm = cfg.get('product_map', [])
+
+    # Already present — nothing to add
+    existing_keys = {str(k).lower() for k, _ in pm}
+    if search_key in existing_keys:
+        return None
+
+    # Find insertion point: before the first "windows" or generic catch-all entry
+    insert_at = len(pm)
+    for i, (k, _) in enumerate(pm):
+        if str(k).lower() in ('windows', 'windows 10', 'windows 11'):
+            insert_at = i
+            break
+
+    pm.insert(insert_at, [search_key, canonical])
+    cfg['product_map'] = pm
+
+    # Ensure fixed_version_rules has an entry for this canonical
+    fvr = cfg.setdefault('fixed_version_rules', {})
+    if canonical not in fvr:
+        fvr[canonical] = {}
+
+    log.info(
+        "cve_lookup: auto-added product_map [%r → %r] from %s (%s %s → fixed %s)",
+        search_key, canonical, cve_id, vendor, product, fixed_version,
+    )
+    return canonical
+
+
+# ==============================================================================
 # MAIN LOOKUP
 # ==============================================================================
 
-def lookup_fixed_version(cve_id: str,
-                         product_map: list[tuple[str, str]]) -> dict[str, str]:
+def lookup_fixed_version(
+    cve_id: str,
+    product_map: list[tuple[str, str]],
+    cfg: Optional[dict] = None,
+    auto_add_products: bool = False,
+) -> dict[str, str]:
     """
     Fetch the fixed version(s) for a CVE from public APIs.
 
@@ -209,6 +362,15 @@ def lookup_fixed_version(cve_id: str,
     e.g. { 'chrome': '136.0.7103.116', 'edge': '136.0.3240.64' }
 
     Returns empty dict if CVE not found or no version data available.
+
+    auto_add_products
+        When True and cfg is provided, any vendor/product in the CVE data
+        that has no product_map match is automatically added to cfg's
+        product_map and fixed_version_rules (cfg is mutated in place).
+        The caller is responsible for persisting cfg to disk.
+        Entries are derived via _derive_canonical / _derive_search_key and
+        inserted before the generic "windows" catch-all so specificity order
+        is preserved.
     """
     cve_id = cve_id.strip().upper()
     log.info("cve_lookup: fetching %s", cve_id)
@@ -244,26 +406,54 @@ def lookup_fixed_version(cve_id: str,
         log.warning("cve_lookup: no version data found for %s", cve_id)
         return {}
 
-    # Match each result against product_map
-    matched: dict[str, str] = {}
+    # Match each result against product_map — collect unmatched for auto-add
+    matched:   dict[str, str]  = {}
+    unmatched: list[dict]      = []
+
     for r in results:
         fv = r.get('fixed_version', '').strip()
         if not _is_valid_version(fv):
             continue
         pk = _match_product(r.get('vendor', ''), r.get('product', ''), product_map)
         if not pk:
+            unmatched.append(r)
             log.debug("cve_lookup: no product_map match for %s %s",
                       r.get('vendor'), r.get('product'))
             continue
-        # If we get multiple results for the same product, keep the lowest fixed version
-        # (most conservative — ensures devices are on at least the minimum safe release)
+        # Keep the lowest fixed version per product (most conservative)
         if pk not in matched or _version_lt(fv, matched[pk]):
             matched[pk] = fv
+
+    # Auto-add: derive and register new product_map entries from unmatched results
+    if auto_add_products and cfg is not None and unmatched:
+        live_pm = [(str(k).lower(), str(v).lower())
+                   for k, v in cfg.get('product_map', [])]
+        for r in unmatched:
+            vendor  = r.get('vendor', '')
+            product = r.get('product', '')
+            fv      = r.get('fixed_version', '')
+
+            # Skip if another result already matched this vendor/product
+            if _match_product(vendor, product, live_pm):
+                continue
+
+            canonical = _auto_update_product_map(vendor, product, fv, cve_id, cfg)
+            if canonical:
+                # Rebuild live_pm from the now-updated cfg so subsequent
+                # results in this loop benefit from the new entry
+                live_pm = [(str(k).lower(), str(v).lower())
+                           for k, v in cfg.get('product_map', [])]
+                # Add this result to matched using the new canonical
+                if not _is_valid_version(fv):
+                    continue
+                if canonical not in matched or _version_lt(fv, matched[canonical]):
+                    matched[canonical] = fv
 
     if matched:
         log.info("cve_lookup: %s → %s",
                  cve_id, ', '.join(f'{k}={v}' for k, v in matched.items()))
-    else:
+    elif not (auto_add_products and unmatched):
+        # Only warn if we didn't handle the unmatched entries ourselves
         log.warning("cve_lookup: %s — data found but no product_map matches", cve_id)
 
     return matched
@@ -286,15 +476,21 @@ def _version_lt(a: str, b: str) -> bool:
 def enrich_config(cve_ids: Optional[list[str]] = None,
                   config_path: Optional[str] = None,
                   dry_run: bool = False,
-                  overwrite: bool = False) -> dict[str, dict[str, str]]:
+                  overwrite: bool = False,
+                  auto_add_products: bool = True) -> dict[str, dict[str, str]]:
     """
     Look up fixed versions for a list of CVEs and write them into config.json.
 
-    cve_ids:     list of CVE IDs to look up. If None, reads all CVE IDs already
-                 present in config.json fixed_version_rules (auto mode).
-    config_path: path to config.json. Defaults to same directory as this file.
-    dry_run:     if True, print what would be written without modifying config.
-    overwrite:   if True, replace existing entries. Default: skip if already set.
+    cve_ids:           list of CVE IDs to look up. If None, reads all CVE IDs already
+                       present in config.json fixed_version_rules (auto mode).
+    config_path:       path to config.json. Defaults to same directory as this file.
+    dry_run:           if True, print what would be written without modifying config.
+    overwrite:         if True, replace existing entries. Default: skip if already set.
+    auto_add_products: if True (default), automatically add product_map entries and
+                       fixed_version_rules keys for products found in CVE data that
+                       have no existing product_map match.  Each new entry is derived
+                       from the MITRE vendor/product string and logged at INFO level
+                       so you can review and rename the canonical key if needed.
 
     Returns dict of { cve_id: { product: fixed_version } } for all found results.
     """
@@ -321,14 +517,35 @@ def enrich_config(cve_ids: Optional[list[str]] = None,
                         cve_ids.append(k.upper())
 
     results: dict[str, dict[str, str]] = {}
+    config_dirty = False   # track whether product_map was modified
 
     for cve_id in cve_ids:
         cve_id = cve_id.strip().upper()
-        matched = lookup_fixed_version(cve_id, product_map)
+
+        # Pass the live cfg so lookup_fixed_version can mutate product_map
+        # in place when auto_add_products is True.  After a successful auto-add
+        # the updated product_map is in cfg['product_map']; rebuild product_map
+        # tuple list so subsequent CVEs in this loop benefit from new entries.
+        matched = lookup_fixed_version(
+            cve_id,
+            product_map,
+            cfg=cfg if auto_add_products else None,
+            auto_add_products=auto_add_products,
+        )
+
+        # Rebuild product_map from cfg in case auto-add mutated it
+        new_pm = [(str(k).lower(), str(v).lower()) for k, v in cfg.get('product_map', [])]
+        if new_pm != product_map:
+            product_map  = new_pm
+            config_dirty = True
+
         if not matched:
             continue
 
         results[cve_id] = matched
+
+        # Sync fvr from cfg (auto-add may have added new canonical keys)
+        fvr = cfg.setdefault('fixed_version_rules', {})
 
         for pk, fv in matched.items():
             if pk not in fvr:
@@ -343,15 +560,19 @@ def enrich_config(cve_ids: Optional[list[str]] = None,
 
             old = fvr[pk].get(cve_id, '(not set)')
             fvr[pk][cve_id] = fv
+            cfg['fixed_version_rules'] = fvr
+            config_dirty = True
             log.info("cve_lookup: config.json %s/%s: %s → %s", pk, cve_id, old, fv)
 
         time.sleep(_DELAY)   # be polite between CVE lookups
 
-    if results and not dry_run:
-        cfg['fixed_version_rules'] = fvr
+    if config_dirty and not dry_run:
         with open(config_path, 'w', encoding='utf-8') as fh:
             json.dump(cfg, fh, indent=2)
-        log.info("cve_lookup: config.json updated with %d CVE(s)", len(results))
+        n_results = len(results)
+        n_pm      = len(cfg.get('product_map', [])) - len(
+            [(k, v) for k, v in cfg.get('product_map', [])])
+        log.info("cve_lookup: config.json updated — %d CVE(s) enriched", n_results)
     elif dry_run:
         log.info("cve_lookup: dry run — no changes written")
 
@@ -363,7 +584,8 @@ def enrich_config(cve_ids: Optional[list[str]] = None,
 # ==============================================================================
 
 def enrich_from_detections(cve_df: 'pd.DataFrame',
-                            config_path: Optional[str] = None) -> int:
+                            config_path: Optional[str] = None,
+                            auto_add_products: bool = True) -> int:
     """
     Called by the orchestrator with the loaded CVE DataFrame.
     Finds all CVE IDs in the data that don't have a fixed_version_rules entry
@@ -371,6 +593,12 @@ def enrich_from_detections(cve_df: 'pd.DataFrame',
 
     config.json is the persistent cache — each CVE is only looked up once per
     product. Once written, subsequent runs read from config.json and skip the API.
+
+    auto_add_products
+        When True (default), products found in CVE data that have no product_map
+        match are automatically added to config.json so future runs can match
+        and version-check them.  Set to False to preserve the old behaviour of
+        only enriching products already in product_map.
 
     Returns the number of CVEs enriched.
     """
@@ -387,8 +615,6 @@ def enrich_from_detections(cve_df: 'pd.DataFrame',
                         for k, v in cfg.get('product_map', [])]
 
         # Build set of CVE IDs already fully covered in config.json
-        # A CVE is "known" if it appears in at least one product's rules
-        # (the API returns all affected products in one call)
         known: set[str] = set()
         for pk_rules in fvr.values():
             if isinstance(pk_rules, dict):
@@ -405,7 +631,11 @@ def enrich_from_detections(cve_df: 'pd.DataFrame',
 
         log.info("cve_lookup: %d of %d CVE(s) without version data — looking up",
                  len(missing), len(all_cves))
-        results = enrich_config(cve_ids=missing, config_path=config_path)
+        results = enrich_config(
+            cve_ids           = missing,
+            config_path       = config_path,
+            auto_add_products = auto_add_products,
+        )
         return len(results)
 
     except Exception as e:
@@ -438,6 +668,9 @@ if __name__ == '__main__':
                    help='Show what would be written without modifying config.json')
     p.add_argument('--overwrite', action='store_true',
                    help='Replace existing fixed_version_rules entries')
+    p.add_argument('--no-auto-add', action='store_true',
+                   help='Do not auto-add products to product_map when no match is found '
+                        '(default: auto-add is enabled)')
     p.add_argument('--config',    default=None, metavar='PATH',
                    help='Path to config.json')
     args = p.parse_args()
@@ -449,10 +682,11 @@ if __name__ == '__main__':
         sys.exit(1)
 
     results = enrich_config(
-        cve_ids     = cve_ids,
-        config_path = args.config,
-        dry_run     = args.dry_run,
-        overwrite   = args.overwrite,
+        cve_ids           = cve_ids,
+        config_path       = args.config,
+        dry_run           = args.dry_run,
+        overwrite         = args.overwrite,
+        auto_add_products = not args.no_auto_add,
     )
 
     if results:

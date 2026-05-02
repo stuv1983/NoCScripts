@@ -267,7 +267,8 @@ def build_overview_sheet(workbook, merged_df, filtered_df, triage_df, threshold,
                           sheet_name='Detections', trend_metrics=None,
                           health_score: Optional[dict] = None,
                           evidence_summary: Optional[dict] = None,
-                          recommended_actions: Optional[list] = None):
+                          recommended_actions: Optional[list] = None,
+                          has_prev_report: bool = False):
     ws = workbook.add_worksheet(sheet_name)
 
     # ── Format definitions ────────────────────────────────────────────────────
@@ -511,10 +512,17 @@ def build_overview_sheet(workbook, merged_df, filtered_df, triage_df, threshold,
         ws.write(row_r + 5, 4, '  Patch via RMM', sub_grey)
         ws.write(row_r + 5, 5, patch_confirmed_count)
         ws.write(row_r + 5, 6, 'pre-filled ☑ by patch report', note_fmt_small)
-        ws.write(row_r + 6, 4, '  Manually Marked', sub_grey)
-        ws.write_formula(row_r + 6, 5, f'={f_res} - {patch_confirmed_count}')
-        ws.write(row_r + 6, 6, 'user-checked ☑', note_fmt_small)
-        extra_rows = 6
+        extra_rows = 5
+
+        if has_prev_report:
+            # Only meaningful when a previous workbook exists — users could have
+            # manually ticked ☑ boxes in that run which carry forward.
+            # On a first run every ☑ is patch-confirmed; the "Manually Marked"
+            # subtraction would always read 0 and would be misleading.
+            ws.write(row_r + 6, 4, '  Manually Marked', sub_grey)
+            ws.write_formula(row_r + 6, 5, f'={f_res} - {patch_confirmed_count}')
+            ws.write(row_r + 6, 6, 'user-checked ☑', note_fmt_small)
+            extra_rows = 6
 
     if redetected_count > 0:
         rr = row_r + extra_rows + 1
