@@ -374,15 +374,45 @@ def _edge_fixed_version_for_cve(cve_id: str) -> Optional[str]:
     return None
 
 
-def _edge_fixed_version_for_chromium_milestone(chrome_fixed: str) -> Optional[str]:
-    """
-    Given a Chrome fixed version string (e.g. '146.0.7680.178'), extract the
-    Chromium major milestone (146) and return the earliest Edge Stable release
-    that is built on that milestone or later.
+def _edge_release_date(rel: dict) -> Optional['datetime']:
+    """Parse a release date from an Edge releases API entry."""
+    import datetime as _dt
+    for key in ('PublishedTime', 'ReleaseTime', 'ReleaseDate'):
+        val = rel.get(key)
+        if val:
+            try:
+                # Handle ISO 8601 with optional Z/offset
+                s = str(val).replace('Z', '+00:00')
+                return _dt.datetime.fromisoformat(s).replace(tzinfo=None)
+            except (ValueError, TypeError):
+                pass
+    return None
 
-    Used as a fallback when the Edge release notes don't explicitly list the
-    CVE — Edge incorporates each Chromium security update within ~1 week.
+
+def _edge_fixed_version_for_chromium_milestone(
+    chrome_fixed: str,
+    cve_published: Optional[str] = None,
+) -> Optional[str]:
     """
+    Given a Chrome fixed version string (e.g. '146.0.7680.178'), return the
+    earliest Edge Stable release that:
+      (a) has the same Chromium major or later, AND
+      (b) has a release date on or after the CVE publish date (when known)
+
+    Guard (b) prevents choosing an early Edge 146 build that existed before
+    the Chromium security fix actually landed in that milestone.  An Edge
+    release on the right major but before the CVE was published cannot contain
+    the fix.
+
+    If cve_published is not available, (b) is skipped and only (a) applies —
+    this is less precise but still better than no version at all.
+
+    Returns None if no qualifying Edge release is found, rather than guessing.
+    The Fixed Version Source will be marked accordingly so the analyst can see
+    why no Edge version was stored.
+    """
+    import datetime as _dt
+
     releases = _get_edge_releases()
     if not releases or not chrome_fixed:
         return None
@@ -396,6 +426,15 @@ def _edge_fixed_version_for_chromium_milestone(chrome_fixed: str) -> Optional[st
     if not stable:
         return None
 
+    # Parse CVE publish date for guard (b)
+    pub_dt: Optional[_dt.datetime] = None
+    if cve_published:
+        try:
+            s = str(cve_published).replace('Z', '+00:00')
+            pub_dt = _dt.datetime.fromisoformat(s).replace(tzinfo=None)
+        except (ValueError, TypeError):
+            pass
+
     candidates = []
     for rel in stable.get('Releases', []):
         ver = str(rel.get('ProductVersion', '')).strip()
@@ -405,50 +444,81 @@ def _edge_fixed_version_for_chromium_milestone(chrome_fixed: str) -> Optional[st
             edge_major = int(ver.split('.')[0])
         except (ValueError, IndexError):
             continue
-        if edge_major >= chrome_major:
-            candidates.append(ver)
+
+        # Guard (a): same major or later
+        if edge_major < chrome_major:
+            continue
+
+        # Guard (b): release date must be on/after CVE publish date
+        if pub_dt is not None:
+            rel_dt = _edge_release_date(rel)
+            if rel_dt is not None and rel_dt < pub_dt:
+                continue  # this release predates the CVE — cannot contain the fix
+
+        candidates.append(ver)
 
     if not candidates:
+        log.debug(
+            "cve_lookup: Edge milestone fallback: no qualifying release for "
+            "Chrome major %d (cve_published=%s) — not guessing",
+            chrome_major, cve_published,
+        )
         return None
 
     # Return the lowest qualifying version (earliest safe Edge release)
     candidates.sort(key=lambda v: [int(x) for x in v.split('.') if x.isdigit()])
     result = candidates[0]
     log.debug(
-        "cve_lookup: Edge milestone fallback: Chrome major %d → Edge %s",
-        chrome_major, result,
+        "cve_lookup: Edge milestone fallback: Chrome major %d → Edge %s "
+        "(release date guard applied: cve_published=%s)",
+        chrome_major, result, cve_published,
     )
     return result
 
 
-def _resolve_edge_version(cve_id: str, chrome_fixed: Optional[str]) -> Optional[str]:
+def _resolve_edge_version(
+    cve_id: str,
+    chrome_fixed: Optional[str],
+    cve_published: Optional[str] = None,
+) -> tuple[Optional[str], str]:
     """
     Resolve the Edge-specific fixed version for a Chromium CVE.
 
-    Strategy (in order):
-      1. Direct CVE lookup in Edge release notes (authoritative)
-      2. Chromium milestone mapping from chrome_fixed version (fallback)
+    Returns (version_string_or_None, source_description).
 
-    Returns None if no Edge version can be determined.
+    Strategy (in order):
+      1. Edge release notes explicitly list the CVE — authoritative.
+      2. Edge release on same Chromium major with release date >= CVE publish date.
+      3. None — do not guess silently.
+
+    source_description is one of:
+      "Microsoft Edge release API - CVE listed"
+      "Microsoft Edge release API - milestone fallback"
+      "No Edge baseline defined"
     """
-    # Step 1: direct CVE lookup
+    # Step 1: direct CVE lookup in release notes
     ver = _edge_fixed_version_for_cve(cve_id)
     if ver:
-        log.info("cve_lookup: %s → edge=%s (from Edge release notes)", cve_id, ver)
-        return ver
+        log.info("cve_lookup: %s → edge=%s (Microsoft Edge release API - CVE listed)", cve_id, ver)
+        return ver, 'Microsoft Edge release API - CVE listed'
 
-    # Step 2: milestone mapping
+    # Step 2: milestone + date guard
     if chrome_fixed:
-        ver = _edge_fixed_version_for_chromium_milestone(chrome_fixed)
+        ver = _edge_fixed_version_for_chromium_milestone(chrome_fixed, cve_published)
         if ver:
             log.info(
-                "cve_lookup: %s → edge=%s (milestone fallback from chrome=%s)",
-                cve_id, ver, chrome_fixed,
+                "cve_lookup: %s → edge=%s (Microsoft Edge release API - milestone fallback "
+                "from chrome=%s, cve_published=%s)",
+                cve_id, ver, chrome_fixed, cve_published,
             )
-            return ver
+            return ver, 'Microsoft Edge release API - milestone fallback'
 
-    log.debug("cve_lookup: %s — could not resolve Edge version", cve_id)
-    return None
+    log.info(
+        "cve_lookup: %s — could not resolve Edge version with date guard "
+        "(chrome_fixed=%s, cve_published=%s) — stored as No Edge baseline defined",
+        cve_id, chrome_fixed, cve_published,
+    )
+    return None, 'No Edge baseline defined'
 
 
 # Canonical keys that represent Chromium-based products where a separate
@@ -730,11 +800,27 @@ def lookup_fixed_version(
     if _CHROMIUM_PRODUCTS & set(matched.keys()):
         edge_in_pm = any(v == 'edge' for _, v in product_map)
         if edge_in_pm and 'edge' not in matched:
-            chrome_fixed = matched.get('chrome')
-            edge_ver = _resolve_edge_version(cve_id, chrome_fixed)
+            chrome_fixed  = matched.get('chrome')
+            # Extract CVE publish date from CVE.org data for the fallback date guard
+            _cve_published: Optional[str] = None
+            if data and isinstance(data, dict):
+                try:
+                    _meta = data.get('cveMetadata', {})
+                    _cve_published = (
+                        _meta.get('datePublished')
+                        or _meta.get('dateUpdated')
+                    )
+                except Exception:
+                    pass
+            edge_ver, edge_src = _resolve_edge_version(cve_id, chrome_fixed, _cve_published)
             if edge_ver:
                 matched['edge'] = edge_ver
-                log.info("cve_lookup: %s → supplemented edge=%s", cve_id, edge_ver)
+                log.info("cve_lookup: %s → supplemented edge=%s (%s)", cve_id, edge_ver, edge_src)
+            else:
+                log.info(
+                    "cve_lookup: %s — Edge version not stored (%s)",
+                    cve_id, edge_src,
+                )
 
     return matched
 
@@ -798,6 +884,7 @@ def enrich_config(cve_ids: Optional[list[str]] = None,
 
     results: dict[str, dict[str, str]] = {}
     config_dirty = False   # track whether product_map was modified
+    before_product_map_count = len(cfg.get('product_map', []))
 
     for cve_id in cve_ids:
         cve_id = cve_id.strip().upper()
@@ -850,10 +937,12 @@ def enrich_config(cve_ids: Optional[list[str]] = None,
     if config_dirty and not dry_run:
         with open(config_path, 'w', encoding='utf-8') as fh:
             json.dump(cfg, fh, indent=2)
-        n_results = len(results)
-        n_pm      = len(cfg.get('product_map', [])) - len(
-            [(k, v) for k, v in cfg.get('product_map', [])])
-        log.info("cve_lookup: config.json updated — %d CVE(s) enriched", n_results)
+        n_results      = len(results)
+        added_products = len(cfg.get('product_map', [])) - before_product_map_count
+        log.info(
+            "cve_lookup: config.json updated — %d CVE(s) enriched, %d product mapping(s) added",
+            n_results, added_products,
+        )
     elif dry_run:
         log.info("cve_lookup: dry run — no changes written")
 

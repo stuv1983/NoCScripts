@@ -102,6 +102,95 @@ class DashboardResult:
 # MAIN ENTRY POINT
 # ==============================================================================
 
+def _config_health_check(cfg: dict) -> list[str]:
+    """
+    Pre-flight validation of config.json.  Returns a list of warning strings.
+    Non-fatal — warnings are surfaced in the workbook and logs but never block
+    the run.  Hard errors (missing config, empty product_map) are handled
+    earlier by config.py.
+
+    Checks:
+      1. No duplicate product_map keys
+      2. No fixed_version_rules product missing from product_map
+      3. All version strings are parseable
+      4. No Chrome version stored under Edge canonical key (or vice versa)
+    """
+    import re as _re
+    _VER_RE = _re.compile(r'^\d+(?:\.\d+){1,5}$')
+
+    issues: list[str] = []
+    pm     = cfg.get('product_map', [])
+    fvr    = cfg.get('fixed_version_rules', {})
+
+    # 1. Duplicate product_map keys
+    seen_keys: dict[str, int] = {}
+    for k, _ in pm:
+        kl = str(k).lower()
+        seen_keys[kl] = seen_keys.get(kl, 0) + 1
+    dupes = [k for k, n in seen_keys.items() if n > 1]
+    if dupes:
+        issues.append(
+            f"config.json: duplicate product_map key(s): {', '.join(dupes[:5])}"
+        )
+
+    # 2. fixed_version_rules product not in product_map
+    pm_values = {str(v).lower() for _, v in pm}
+    for product in fvr:
+        if product.startswith('_'):
+            continue
+        if product.lower() not in pm_values:
+            issues.append(
+                f"config.json: fixed_version_rules['{product}'] has no matching "
+                f"product_map entry — version rules will never be applied"
+            )
+
+    # 3. Unparseable version strings
+    for product, rules in fvr.items():
+        if not isinstance(rules, dict):
+            continue
+        for key, ver in rules.items():
+            if key.startswith('_'):
+                ver_str = str(ver).strip()
+                if ver_str and not _VER_RE.match(ver_str):
+                    issues.append(
+                        f"config.json: fixed_version_rules['{product}']['_baseline'] "
+                        f"= {ver_str!r} is not a parseable version"
+                    )
+            else:
+                ver_str = str(ver).strip()
+                if ver_str and not _VER_RE.match(ver_str):
+                    issues.append(
+                        f"config.json: fixed_version_rules['{product}']['{key}'] "
+                        f"= {ver_str!r} is not a parseable version"
+                    )
+
+    # 4. Chrome versions in Edge rules or vice versa
+    # Heuristic: Chrome versions have 4 dotted parts (major.0.build.patch)
+    # Edge versions also have 4 parts but different build numbers.
+    # Flag if the numeric 3rd segment (build) is identical — that would mean
+    # a Chrome version was copy-pasted into the edge rules.
+    chrome_rules = fvr.get('chrome', {})
+    edge_rules   = fvr.get('edge', {})
+    for cve_id in set(chrome_rules) & set(edge_rules):
+        if cve_id.startswith('_'):
+            continue
+        cv = str(chrome_rules[cve_id]).strip()
+        ev = str(edge_rules[cve_id]).strip()
+        if cv and ev and cv == ev:
+            issues.append(
+                f"config.json: Chrome and Edge have identical version {cv!r} "
+                f"for {cve_id} — Chrome and Edge versions must differ"
+            )
+
+    if issues:
+        for w in issues:
+            log.warning("Config health: %s", w)
+    else:
+        log.debug("Config health: OK")
+
+    return issues
+
+
 def run(request: DashboardRequest) -> DashboardResult:
     """
     Execute the full dashboard pipeline for one request.
@@ -114,6 +203,18 @@ def run(request: DashboardRequest) -> DashboardResult:
 
     try:
         log.info("Dashboard run started — output: %s", request.output_path)
+
+        # Pre-flight config health check — non-fatal, warnings surfaced in workbook
+        import json as _json
+        try:
+            with open(Path(__file__).parent / 'config.json', encoding='utf-8') as _fh:
+                _cfg_raw = _json.load(_fh)
+            config_issues = _config_health_check(_cfg_raw)
+            for issue in config_issues:
+                warnings.append(issue)
+        except Exception as _e:
+            log.warning("Config health check failed: %s", _e)
+            config_issues = []
 
         # Refresh version baselines from vendor APIs (only when explicitly requested)
         if request.sync_baselines:
@@ -255,10 +356,10 @@ def run(request: DashboardRequest) -> DashboardResult:
             p_full['_nk'] = p_full['Name'].astype(str).apply(normalize_device_name)
             p_full['_ck'] = p_full['Vulnerability Name'].astype(str).apply(extract_cve_id)
 
-            if 'Resolved (from Patch Report)' in p_full.columns:
+            if 'Patch Evidence Status' in p_full.columns:
                 patch_resolved_pairs = set(zip(
-                    p_full.loc[p_full['Resolved (from Patch Report)'] == 'Resolved', '_nk'],
-                    p_full.loc[p_full['Resolved (from Patch Report)'] == 'Resolved', '_ck'],
+                    p_full.loc[p_full['Patch Evidence Status'] == 'Patch confirmed - pending rescan', '_nk'],
+                    p_full.loc[p_full['Patch Evidence Status'] == 'Patch confirmed - pending rescan', '_ck'],
                 ))
                 log.info("Patch-confirmed resolved pairs: %d", len(patch_resolved_pairs))
 
@@ -372,7 +473,7 @@ def run(request: DashboardRequest) -> DashboardResult:
 
             if trend_data:
                 build_trend_detail_sheets(writer, wb, trend_data, link_fmt,
-                                          sheets_subset={'Resolved'})
+                                          sheets_subset={'Resolved (Patch Confirmed)'})
 
             build_all_detections_sheet(writer, merged_df, link_fmt, miss_fmt)
 

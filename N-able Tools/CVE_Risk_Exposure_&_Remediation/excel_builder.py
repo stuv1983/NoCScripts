@@ -218,7 +218,7 @@ def build_trend_detail_sheets(writer, workbook, trend, link_fmt, sheets_subset=N
     all_sheets = [
         ('New This Month',  trend['new_df'],        new_bg,
          'New CVEs not seen in the previous report — investigate and prioritise.'),
-        ('Resolved',        trend['resolved_df'],   res_bg,
+        ('Resolved (Patch Confirmed)',        trend['resolved_df'],   res_bg,
          'CVEs present last report that are no longer detected — confirmed remediated.'),
         ('Persisting CVEs', trend['persisting_df'], per_bg,
          'CVEs carried over from the previous report — still unresolved.'),
@@ -401,6 +401,28 @@ def build_overview_sheet(workbook, merged_df, filtered_df, triage_df, threshold,
             sr += 1
         ws.write(sr, 7, 'See Patch Evidence Notes sheet for per-device detail', summ_note)
         ws.set_column('H:H', 48)
+
+    # ── N-able Patch Report note — Pending ≠ Installed ───────────────────────
+    # This note addresses a common source of confusion: the "Discovered / Install
+    # Date" column in the patch report has different meanings depending on Status.
+    # Surfacing it here prevents "why isn't this resolved?" questions.
+    if evidence_summary:
+        pending_note_fmt = workbook.add_format({
+            'italic': True, 'font_color': '#7F6000', 'font_size': 8,
+            'bg_color': '#FFFFE0', 'border': 1, 'text_wrap': True,
+        })
+        pr = sr + 2
+        ws.merge_range(pr, 7, pr + 2, 9,
+            'N-able Patch Report note: '
+            'For Status = Pending, the "Discovered / Install Date" is the date the patch was '
+            'detected as available — not the date it was installed. '
+            'Pending rows are not treated as remediated. '
+            'Only Status = Installed or Reboot Required is accepted as patch evidence.',
+            pending_note_fmt,
+        )
+        ws.set_row(pr, 14)
+        ws.set_row(pr + 1, 14)
+        ws.set_row(pr + 2, 14)
 
     # ── CVE Movement Context (only shown when trend data available) ────────────
     # Answers the question "is this CVE count jump real risk or noise?"
@@ -817,7 +839,7 @@ def build_patch_resolved_sheet(writer, patch_full_df: 'pd.DataFrame') -> None:
     import pandas as pd
 
     resolved = patch_full_df[
-        patch_full_df['Resolved (from Patch Report)'] == 'Resolved'
+        patch_full_df['Patch Evidence Status'] == 'Patch confirmed - pending rescan'
     ].copy()
 
     if resolved.empty:

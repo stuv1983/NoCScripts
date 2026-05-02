@@ -72,7 +72,7 @@ _RULES = [
     # (pmr_substring, resolved_value, vcr_substring, internal_cause)
     ("Not found in patch report",                  None,        None,               "coverage_gap"),
     ("Device in patch report - product not found", None,        None,               "unmanaged_app"),
-    (None,                                         "Resolved",  None,               None),
+    (None,                                         "Patch confirmed - pending rescan",  None,               None),
     ("Matched - installed",   "Unresolved", "Version compliant",    "version_compliant"),
     ("Matched - installed",   "Unresolved", "Below fixed version",  "version_below_fixed"),
     ("Matched - installed",   "Unresolved", "no fixed baseline",    "no_fixed_baseline"),
@@ -86,7 +86,7 @@ _RULES = [
 def classify_root_cause(row) -> Optional[str]:
     """Returns internal cause code or None. No shadow_it guessing — no path data available."""
     pmr = str(row.get("Patch Match Result",          "")).strip()
-    res = str(row.get("Resolved (from Patch Report)","Unresolved")).strip()
+    res = str(row.get("Patch Evidence Status","Unresolved")).strip()
     vcr = str(row.get("Version Check Result",        "")).strip()
     for pmr_s, res_v, vcr_s, cause in _RULES:
         if ((pmr_s is None or pmr_s.lower() in pmr.lower()) and
@@ -188,7 +188,7 @@ def compute_patch_diagnostics(patch_full_df: pd.DataFrame,
     df = patch_full_df.copy()
     _e = pd.DataFrame()
     _no_h = {"score": None, "grade": None, "breakdown": {}, "interpretation": "No data"}
-    required = {"Name","Vulnerability Name","Patch Match Result","Resolved (from Patch Report)"}
+    required = {"Name","Vulnerability Name","Patch Match Result","Patch Evidence Status"}
     if not required.issubset(df.columns):
         log.warning("compute_patch_diagnostics: missing columns %s", required - set(df.columns))
         return {"patch_lag_df": _e, "version_drift_df": _e, "root_cause_df": _e, "health_score": _no_h}
@@ -215,7 +215,7 @@ def compute_patch_diagnostics(patch_full_df: pd.DataFrame,
             "Product":              prod,
             "CVE":                  extract_cve_id(str(row.get("Vulnerability Name", ""))),
             "Patch Match Result":   row.get("Patch Match Result", ""),
-            "Resolved":             row.get("Resolved (from Patch Report)", ""),
+            "Resolved":             row.get("Patch Evidence Status", ""),
             "Patch Evidence Notes": DISPLAY_MAP.get(cause, "Unresolved"),
             "Recommended Steps":    "\n".join(f"{i+1}. {s}" for i, s in enumerate(steps)),
             "_cause_internal":      cause,   # kept for health score, not written to Excel
@@ -235,7 +235,7 @@ def compute_patch_diagnostics(patch_full_df: pd.DataFrame,
     # ── Patch lag (resolved pairs) ────────────────────────────────────────────
     lag_rows = []
     if "Patch Install Date" in df.columns and "First detected" in df.columns:
-        for _, row in df[df["Resolved (from Patch Report)"] == "Resolved"].iterrows():
+        for _, row in df[df["Patch Evidence Status"] == "Patch confirmed - pending rescan"].iterrows():
             idt = pd.to_datetime(row.get("Patch Install Date"), errors="coerce")
             fdt = pd.to_datetime(row.get("First detected"),     errors="coerce")
             if pd.isna(idt) or pd.isna(fdt): continue

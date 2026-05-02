@@ -223,10 +223,16 @@ def _resolve_fixed_version(row):
     """
     Look up the minimum fixed version for a CVE+product combination.
 
-    Priority order:
-      1. 'Fixed Version' column in the CVE workbook (explicit override)
-      2. CVE-specific rule in config.json fixed_version_rules
-      3. '_baseline' rolling minimum in config.json (updated monthly)
+    Returns the HIGHEST (strictest) of:
+      1. 'Fixed Version' column in the CVE workbook (explicit override — always wins)
+      2. max(CVE-specific rule, rolling baseline) from config.json
+
+    The per-CVE rule is the version that first fixed THIS CVE.  The baseline
+    is the current minimum safe version for the product.  When the baseline
+    has moved past the per-CVE rule (common — browsers release monthly), the
+    baseline is the correct threshold: a device on an old version that happens
+    to be above the per-CVE rule is still vulnerable to later CVEs bundled in
+    the same product update.
     """
     if 'Fixed Version' in row.index:
         v = str(row.get('Fixed Version', '')).strip()
@@ -234,13 +240,30 @@ def _resolve_fixed_version(row):
     product = row.get('_pk', '')
     if not product: return '', ''
     rules = FIXED_VERSION_RULES.get(product, {})
-    # CVE-specific rule takes priority
+
+    # Find CVE-specific rule (if any)
+    cve_version = ''
+    cve_source  = ''
     for cve in _extract_cves(str(row.get('Vulnerability Name', ''))):
-        if cve in rules: return rules[cve], f'config rule ({cve})'
-    # Rolling baseline fallback
+        if cve in rules:
+            cve_version = rules[cve]
+            cve_source  = f'config rule ({cve})'
+            break
+
+    # Rolling baseline
     baseline = rules.get('_baseline', '').strip()
-    if baseline: return baseline, 'rolling baseline'
+
+    # Return whichever is higher — the stricter requirement wins
+    if cve_version and baseline:
+        if _version_gte(baseline, cve_version):
+            return baseline, 'rolling baseline (supersedes per-CVE rule)'
+        return cve_version, cve_source
+    if cve_version:
+        return cve_version, cve_source
+    if baseline:
+        return baseline, 'rolling baseline'
     return '', ''
+
 
 def _classify_version_check(row):
     status = str(row.get('Status', '')).strip()
@@ -300,7 +323,7 @@ def _classify_resolution(row):
         if not cve_dates:
             return 'Unresolved'
 
-        return 'Resolved' if install_dt >= max(cve_dates) else 'Unresolved'
+        return 'Patch confirmed - pending rescan' if install_dt >= max(cve_dates) else 'Unresolved'
 
     except Exception:
         return 'Unresolved'
@@ -643,12 +666,18 @@ def _apply_cascade_resolution(df: pd.DataFrame) -> pd.DataFrame:
         if not isinstance(rules, dict):
             continue
 
-        # Explicit per-CVE rules first
+        # Explicit per-CVE rules — use max(per_cve, baseline) so a stale
+        # per-CVE threshold doesn't falsely resolve when the baseline is stricter
+        baseline_t = product_baselines.get(pk)
         for cve_id, fixed_str in rules.items():
             if cve_id.startswith('_'):
                 continue
             fixed_t = _parse_version(fixed_str)
-            if fixed_t and ver_info['_vt'] >= fixed_t:
+            if not fixed_t:
+                continue
+            # Use the stricter of per-CVE rule and baseline
+            effective_t = max(fixed_t, baseline_t) if baseline_t else fixed_t
+            if ver_info['_vt'] >= effective_t:
                 cascade_resolve.add((device, pk, cve_id.upper()))
 
         # Baseline fallback: covers all CVEs on this product that have no explicit rule.
@@ -667,7 +696,7 @@ def _apply_cascade_resolution(df: pd.DataFrame) -> pd.DataFrame:
     #   B) Baseline sentinel + version compliant + install post-dates detection
     cascade_applied = 0
     for idx, row in df.iterrows():
-        if str(row.get('Resolved (from Patch Report)', '')).strip() != 'Unresolved':
+        if str(row.get('Patch Evidence Status', '')).strip() != 'Unresolved':
             continue
         device  = str(row['Name'])
         pk      = str(row.get('_cascade_pk', ''))
@@ -688,13 +717,13 @@ def _apply_cascade_resolution(df: pd.DataFrame) -> pd.DataFrame:
                 # resolving an active CVE when the patch report did not prove
                 # remediation happened after detection.
                 if not pd.isna(install_dt) and not pd.isna(first_dt) and install_dt >= first_dt:
-                    df.at[idx, 'Resolved (from Patch Report)'] = 'Resolved'
+                    df.at[idx, 'Patch Evidence Status'] = 'Patch confirmed - pending rescan'
                     cascade_applied += 1
                     break
             elif (device, pk, '_BASELINE_') in cascade_resolve:
                 # Baseline: also need timing check (we don't know the per-CVE threshold)
                 if not pd.isna(install_dt) and not pd.isna(first_dt) and install_dt >= first_dt:
-                    df.at[idx, 'Resolved (from Patch Report)'] = 'Resolved'
+                    df.at[idx, 'Patch Evidence Status'] = 'Patch confirmed - pending rescan'
                     cascade_applied += 1
                     break
 
@@ -786,7 +815,7 @@ def process_patch_match(patch_path, cve_df, min_score=9.0):
     # Rename _pd → Patch Install Date BEFORE calling _classify_resolution so the
     # date-comparison logic can find the column by its final name.
     best = best.rename(columns={'Patch': 'Matched Patch', '_pd': 'Patch Install Date'})
-    best['Resolved (from Patch Report)'] = best.apply(_classify_resolution, axis=1)
+    best['Patch Evidence Status'] = best.apply(_classify_resolution, axis=1)
 
     # ── Cascade resolution: version-based bulk resolve ────────────────────────
     # If a device has product P at installed version V, and V >= fixed_version(CVE-X, P)
@@ -805,7 +834,7 @@ def process_patch_match(patch_path, cve_df, min_score=9.0):
     ov_cols = ['Name', 'Device Type', 'Threat Status', 'Vulnerability Score',
                'Affected Products', 'Date Published', 'First detected', 'Last updated',
                'Last Response', 'Matched Patch', 'Patch Install Date',
-               'Patch Match Result', 'Resolved (from Patch Report)']
+               'Patch Match Result', 'Patch Evidence Status']
     overview = _make_excel_safe(best[[c for c in ov_cols if c in best.columns]])
     return overview, _make_excel_safe(best), _make_excel_safe(patch), total_rows, filtered_rows
 
@@ -1132,7 +1161,7 @@ def compute_patch_diagnostics(patch_full_df: pd.DataFrame) -> dict:
     """
     df = patch_full_df.copy()
     required = {'Name', 'Vulnerability Name', 'Patch Match Result',
-                'Resolved (from Patch Report)'}
+                'Patch Evidence Status'}
     if not required.issubset(df.columns):
         log.warning("compute_patch_diagnostics: missing columns %s — skipping",
                     required - set(df.columns))
@@ -1156,7 +1185,7 @@ def compute_patch_diagnostics(patch_full_df: pd.DataFrame) -> dict:
                 'First Detected':     first_dt.date(),
                 'Patch Install Date': install_dt.date(),
                 'Lag (days)':         lag_days,
-                'Status':             row.get('Resolved (from Patch Report)', ''),
+                'Status':             row.get('Patch Evidence Status', ''),
             })
     patch_lag_df = (pd.DataFrame(lag_rows)
                     .sort_values('Lag (days)', ascending=False)
@@ -1207,7 +1236,7 @@ def compute_patch_diagnostics(patch_full_df: pd.DataFrame) -> dict:
     for _, row in df.iterrows():
         gap = classify_patch_gap(
             row.get('Patch Match Result', ''),
-            row.get('Resolved (from Patch Report)', ''),
+            row.get('Patch Evidence Status', ''),
         )
         if gap != 'detection_mismatch':
             continue
