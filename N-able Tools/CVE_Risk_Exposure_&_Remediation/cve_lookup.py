@@ -706,9 +706,12 @@ def lookup_fixed_version(
     results: list[dict] = []
 
     # Source 1: CVE.org
-    data = _get(f'https://cveawg.mitre.org/api/cve/{cve_id}')
-    if data:
-        results = _parse_cve_org(data)
+    # Capture separately so the Edge supplement can read cveMetadata.datePublished
+    # even when NVD or OSV is used as the version-data fallback.
+    cve_org_data = _get(f'https://cveawg.mitre.org/api/cve/{cve_id}')
+    data = cve_org_data   # alias kept so existing code below is unchanged
+    if cve_org_data:
+        results = _parse_cve_org(cve_org_data)
         if results:
             log.debug("cve_lookup: %s → CVE.org returned %d affected entries", cve_id, len(results))
 
@@ -801,11 +804,13 @@ def lookup_fixed_version(
         edge_in_pm = any(v == 'edge' for _, v in product_map)
         if edge_in_pm and 'edge' not in matched:
             chrome_fixed  = matched.get('chrome')
-            # Extract CVE publish date from CVE.org data for the fallback date guard
+            # Extract CVE publish date from CVE.org data for the fallback date guard.
+            # Use cve_org_data explicitly — 'data' may have been overwritten by
+            # the NVD or OSV fallback, neither of which contains cveMetadata.
             _cve_published: Optional[str] = None
-            if data and isinstance(data, dict):
+            if cve_org_data and isinstance(cve_org_data, dict):
                 try:
-                    _meta = data.get('cveMetadata', {})
+                    _meta = cve_org_data.get('cveMetadata', {})
                     _cve_published = (
                         _meta.get('datePublished')
                         or _meta.get('dateUpdated')

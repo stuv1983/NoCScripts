@@ -767,7 +767,8 @@ def build_diagnostics_sheets(writer, diagnostics: dict) -> None:
     if not rc_df.empty:
         # Only write columns intended for stakeholder view
         _SHOW_COLS = ['Device', 'Product', 'CVE', 'Patch Match Result',
-                      'Resolved', 'Patch Evidence Notes', 'Recommended Steps']
+                      'Resolved', 'Patch Evidence Notes', 'Baseline Compliance',
+                      'Recommended Steps']
         out = rc_df[[c for c in _SHOW_COLS if c in rc_df.columns]].copy()
         out.to_excel(writer, sheet_name='Patch Evidence Notes', index=False)
         ws = writer.sheets['Patch Evidence Notes']
@@ -778,7 +779,8 @@ def build_diagnostics_sheets(writer, diagnostics: dict) -> None:
         ws.set_column('D:D', 35)   # Patch Match Result
         ws.set_column('E:E', 12)   # Resolved
         ws.set_column('F:F', 32)   # Patch Evidence Notes
-        ws.set_column('G:G', 55)   # Recommended Steps
+        ws.set_column('G:G', 22)   # Baseline Compliance
+        ws.set_column('H:H', 55)   # Recommended Steps
         for i, label in enumerate(out.get('Patch Evidence Notes', []), start=1):
             colour = _LABEL_COLOUR.get(str(label), '#FFFFFF')
             ws.set_row(i, 30, wb.add_format({'bg_color': colour, 'text_wrap': True, 'valign': 'top'}))
@@ -871,6 +873,7 @@ def build_patch_resolved_sheet(writer, patch_full_df: 'pd.DataFrame') -> None:
         'Name', 'Vulnerability Name', 'Affected Products',
         'Vulnerability Score', 'Matched Patch Version',
         'Patch Install Date', 'First detected', 'Lag (days)',
+        'Product Baseline', 'Baseline Compliance',
     ] if c in resolved.columns]
 
     out = (resolved[cols]
@@ -891,6 +894,8 @@ def build_patch_resolved_sheet(writer, patch_full_df: 'pd.DataFrame') -> None:
     ws.set_column('E:E', 22)   # Version
     ws.set_column('F:G', 20)   # Dates
     ws.set_column('H:H', 12)   # Lag
+    ws.set_column('I:I', 20)   # Product Baseline
+    ws.set_column('J:J', 22)   # Baseline Compliance
 
     for i in range(1, len(out) + 1):
         ws.set_row(i, None, grn)

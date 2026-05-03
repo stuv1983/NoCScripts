@@ -51,7 +51,7 @@ def _try_sync_baselines() -> None:
         updated = sync_baselines()
         if updated:
             import json as _json
-            cfg_path = __file__.replace('orchestrator.py', 'config.json')
+            cfg_path = str(Path(__file__).parent / 'config.json')
             with open(cfg_path, encoding='utf-8') as _fh:
                 _fresh = _json.load(_fh).get('fixed_version_rules', {})
             FIXED_VERSION_RULES.clear()
@@ -235,7 +235,7 @@ def run(request: DashboardRequest) -> DashboardResult:
                 # Update FIXED_VERSION_RULES in-place so this run uses the
                 # freshly added version data — no module reload needed
                 import json as _json
-                cfg_path = __file__.replace('orchestrator.py', 'config.json')
+                cfg_path = str(Path(__file__).parent / 'config.json')
                 with open(cfg_path, encoding='utf-8') as _fh:
                     _fresh = _json.load(_fh).get('fixed_version_rules', {})
                 FIXED_VERSION_RULES.clear()

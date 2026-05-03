@@ -138,16 +138,16 @@ def parse_last_response(val):
     epoch = pd.to_datetime('1900-01-01')
     if val in ['Not Found in RMM', 'N/A', '']: return epoch
     try: return pd.to_datetime(val)
-    except: pass
+    except Exception: pass
     if val.startswith('overdue_'):
         try: return pd.to_datetime(val.replace('overdue_', '').split(' -')[0])
-        except: pass
+        except Exception: pass
     if 'days' in val or 'hrs' in val:
         try:
             m = _DIGITS_RE.search(val)
             days = int(m.group(0)) if m else 0
             return pd.Timestamp.now() - pd.Timedelta(days=days)
-        except: pass
+        except Exception: pass
     return epoch
 
 def get_col_letter(col_idx):
@@ -637,7 +637,7 @@ def _apply_cascade_resolution(df: pd.DataFrame) -> pd.DataFrame:
          from any rows where Matched Patch Version is populated.
       2. For each CVE in FIXED_VERSION_RULES, check whether any device's known
          version for that product_key >= fixed version AND install_date >= first_detected.
-      3. If so, mark the Unresolved row as 'Resolved (cascade)'.
+      3. If so, mark the Unresolved row as 'Patch confirmed - pending rescan'.
 
     This specifically handles the case where CVE-5288, 5289, 5290 all share the
     same Edge fixed version. Once we confirm Edge is at 147.x (which resolves 5290),

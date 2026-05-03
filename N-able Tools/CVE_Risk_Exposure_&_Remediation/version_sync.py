@@ -24,7 +24,7 @@ import os
 import urllib.request
 import urllib.error
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 log = logging.getLogger(__name__)
 
@@ -95,7 +95,7 @@ def _get_vlc() -> Optional[str]:
 # MAIN SYNC FUNCTION
 # ==============================================================================
 
-_FETCHERS: dict[str, callable] = {
+_FETCHERS: dict[str, Callable] = {
     'chrome':  _get_chrome,
     'firefox': _get_firefox,
     'edge':    _get_edge,
