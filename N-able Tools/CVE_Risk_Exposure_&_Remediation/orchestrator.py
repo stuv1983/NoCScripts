@@ -33,7 +33,7 @@ from excel_builder import (
     build_overview_sheet, build_all_detections_sheet,
     build_product_sheets, build_stale_excluded_sheet,
     build_raw_data_sheet, build_patch_sheets, build_diagnostics_sheets,
-    build_patch_failure_sheet, build_not_in_patch_scope_sheet,
+    build_patch_failure_sheet,
     build_products_not_tracked_sheet, build_patch_resolved_sheet,
 )
 
@@ -438,8 +438,6 @@ def run(request: DashboardRequest) -> DashboardResult:
         failure_devices: set = set()
 
         # ── Load failure report early (before workbook block) ─────────────────
-        # Must happen before build_not_in_patch_scope_sheet so failure_devices
-        # is populated when determining which devices are truly out of scope.
         if request.include_failure_report and request.failure_report_path:
             try:
                 log.info("Loading patch failure report: %s", request.failure_report_path)
@@ -502,21 +500,6 @@ def run(request: DashboardRequest) -> DashboardResult:
                 if any(not diagnostics[k].empty for k in diagnostics
                        if isinstance(diagnostics[k], pd.DataFrame)):
                     build_diagnostics_sheets(writer, diagnostics)
-
-                # Devices in CVE data but absent from patch report entirely.
-                # Use the raw patch report (patch_data[2]) NOT the merged PMFD
-                # (patch_data[1]).  The PMFD contains every CVE-export device
-                # including those with 'Not found in patch report' — using it
-                # would incorrectly mark all devices as "present in patch report".
-                patch_report_devices = set(
-                    patch_data[2]['Device'].apply(normalize_device_name).unique()
-                ) if patch_data else set()
-
-                build_not_in_patch_scope_sheet(
-                    writer, triage_df,
-                    patch_devices=patch_report_devices,
-                    failure_devices=failure_devices,
-                )
 
                 # Products in CVE data, device in patch report, but product not tracked
                 build_products_not_tracked_sheet(writer, patch_data[1])
