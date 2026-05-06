@@ -25,10 +25,18 @@ from openpyxl.utils import get_column_letter
 
 # ── Excel helpers ─────────────────────────────────────────────────────────────
 COL = {
+    # Header / accent colours (used on header rows and summary tiles)
     "dark": "2C3E50", "navy": "1A5276", "red": "C0392B",
     "amber": "E67E22", "green": "1E8449", "gold": "7D6608",
-    "row_orange": "FDEBD0", "row_blue": "EBF5FB",
-    "row_gold": "FEF9E7", "row_gold2": "F9F3D2", "white": "FDFEFE",
+    # Data-row highlight colours — all light pastels for readable black text
+    "row_dual32":   "FFD0D0",   # light red   — dual 32+64-bit install
+    "row_only32":   "FFF0CC",   # light amber — 32-bit only install
+    "row_peruser":  "D0E8FF",   # light blue  — per-user/AppData install
+    "row_risk":     "FDEBD0",   # light orange — any risk row on browser sheets
+    "row_blue":     "EBF5FB",   # light blue  — alternating clean row
+    "row_gold":     "FEF9E7",   # light gold  — alternating row (stale sheet)
+    "row_gold2":    "F9F3D2",   # light gold2 — alternating row (stale sheet)
+    "white":        "FDFEFE",   # near-white  — alternating clean row
 }
 
 def _fill(h):
@@ -51,6 +59,25 @@ def _hdr(ws, row, ncols, fill):
 def _widths(ws, widths):
     for i, w in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
+
+def _write_legend(ws, start_row, entries):
+    """
+    Write a small colour legend below the data.
+    entries: list of (hex_colour, label_text)
+    Writes two rows: a blank spacer then one row per entry.
+    """
+    LBL_FONT = Font(name="Arial", size=8, bold=True, color="404040")
+    spacer = start_row
+    ws.row_dimensions[spacer].height = 8
+    for i, (hex_col, label) in enumerate(entries, spacer + 1):
+        swatch = ws.cell(i, 1)
+        swatch.fill = _fill(hex_col)
+        swatch.border = BORDER
+        swatch.value = ""
+        ws.row_dimensions[i].height = 16
+        lbl = ws.cell(i, 2, f"  {label}")
+        lbl.font = LBL_FONT
+        lbl.alignment = Alignment(vertical="center")
 
 
 # ── Browser parsing ───────────────────────────────────────────────────────────
@@ -81,29 +108,83 @@ def _normalise_scope(scope, path):
         return "System"
     return "Unknown"
 
+def _resolve_arch(reported_arch, path):
+    """
+    Use the install path to sanity-check the architecture reported by N-able.
+
+    N-able occasionally reports 32-bit for Chrome installs that live in
+    C:\\Program Files\\ (not Program Files (x86)).  A 32-bit Windows application
+    is redirected by the OS to Program Files (x86) at install time, so a binary
+    sitting in the non-(x86) Program Files tree cannot be 32-bit.
+
+    Rule:
+      reported 32-bit + path in Program Files (no (x86))  → override to 64-bit
+      reported 32-bit + path in Program Files (x86)        → keep 32-bit  (genuine)
+      reported 32-bit + path in AppData                    → keep 32-bit  (per-user, may be 32-bit)
+      anything else                                         → trust N-able
+    """
+    if reported_arch == "32-bit":
+        p = path.lower()
+        in_program_files     = "\\program files\\" in p or p.startswith("c:\\program files\\")
+        in_program_files_x86 = "(x86)" in p
+        if in_program_files and not in_program_files_x86:
+            return "64-bit"   # path proves it cannot be 32-bit; N-able is wrong
+    return reported_arch
+
+
 def parse_browsers(output):
     results = []
     text = str(output).replace("\r", "\n").replace(";", "\n")
     for m in _BPAT.finditer(text):
-        path = m.group(2).strip()
+        path  = m.group(2).strip()
         scope = _normalise_scope(m.group(5), path)
+        arch  = _resolve_arch(m.group(4).strip(), path)
         results.append({
             "browser": m.group(1).strip(),
-            "path": path,
+            "path":    path,
             "version": m.group(3).strip(),
-            "arch": m.group(4).strip(),
-            "scope": scope,
+            "arch":    arch,
+            "scope":   scope,
         })
     return results
 
+def _path_note(arch, path):
+    """Return a plain-English note when a 64-bit binary lives in a (x86) folder.
+    Edge always installs to Program Files (x86) regardless of bitness — without
+    this note, techs see (x86) in the path and incorrectly assume it is 32-bit."""
+    if arch == "64-bit" and "(x86)" in path:
+        return "64-bit binary in (x86) folder — expected install location for this browser"
+    return ""
+
+
 def detect_issues(browsers):
+    """
+    Returns (dual_32, only_32, per_user) — three lists of installs, each an issue on a Win11 64-bit fleet.
+
+    dual_32  : 32-bit installs where the same browser ALSO has a 64-bit install present.
+               Remediation: remove the 32-bit copy.
+    only_32  : 32-bit installs where NO 64-bit copy of that browser exists.
+               Remediation: replace with the 64-bit installer.
+    per_user : installs under AppData / marked Per-User scope.
+               Remediation: reinstall to Program Files as System scope.
+    """
     by_name = {}
     for b in browsers:
         by_name.setdefault(b["browser"], []).append(b)
-    dual = {n: e for n, e in by_name.items()
-            if {"32-bit", "64-bit"}.issubset({x["arch"] for x in e})}
+
+    dual_32, only_32 = [], []
+    for name, installs in by_name.items():
+        archs = {b["arch"] for b in installs}
+        for b in installs:
+            if b["arch"] != "32-bit":
+                continue
+            if "64-bit" in archs:
+                dual_32.append(b)   # 32-bit alongside a 64-bit copy
+            else:
+                only_32.append(b)   # no 64-bit version present at all
+
     per_user = [b for b in browsers if "AppData" in b["path"] or b["scope"] == "Per-User"]
-    return dual, per_user
+    return dual_32, only_32, per_user
 
 
 # ── Core logic ────────────────────────────────────────────────────────────────
@@ -116,7 +197,8 @@ def load_inventory(path, stale_days):
     today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     inv["days_since"] = (today - inv["last_response_dt"]).dt.days
     stale = inv["days_since"] > stale_days
-    return inv[~stale].copy(), inv[stale].copy()
+    client_name = inv["Customer name"].dropna().iloc[0] if "Customer name" in inv.columns and not inv["Customer name"].dropna().empty else ""
+    return inv[~stale].copy(), inv[stale].copy(), str(client_name).strip()
 
 def load_audit(paths):
     combined = pd.concat([pd.read_csv(p) for p in paths], ignore_index=True)
@@ -147,174 +229,195 @@ def load_audit(paths):
     return audit
 
 def build_flagged(audit, inv_active):
+    """One row per flagged install — dual_32 / only_32 / per_user, all filterable."""
     flagged = []
     idx = inv_active.set_index("Device name")
+    seen = set()  # (device, browser, path, issue_type) — prevent double-counting
     for _, row in audit.iterrows():
-        browsers = parse_browsers(str(row["Output"]))
-        dual, per_user = detect_issues(browsers)
-        issues, detail = [], []
-        if dual:
-            issues.append("Dual Install (32/64-bit)")
-            for name, ents in dual.items():
-                detail.append(name + ": " + " | ".join(f"{e['arch']} v{e['version']}" for e in ents))
-        if per_user:
-            issues.append("Per-User (AppData) Install")
-            for b in per_user:
-                detail.append(f"{b['browser']} v{b['version']} @ {b['path']}")
-        if not issues:
-            continue
-        ir = idx.loc[row["Device"]] if row["Device"] in idx.index else None
-        flagged.append({
-            "Device": row["Device"],
-            "Client": ir["Customer name"] if ir is not None and "Customer name" in ir.index else row.get("Client", ""),
-            "Site": ir["Site name"] if ir is not None and "Site name" in ir.index else row.get("Site", ""),
-            "Issue Type": " + ".join(issues), "Issue Detail": " | ".join(detail),
-            "OS":            ir["OS version"]                    if ir is not None else "N/A",
-            "Model":         ir["Model"]                         if ir is not None else "N/A",
-            "Username":      ir["Username"]                      if ir is not None else "N/A",
+        device = row["Device"]
+        ir = idx.loc[device] if device in idx.index else None
+        base = {
+            "Device":        device,
+            "Client":        ir["Customer name"]               if ir is not None and "Customer name"             in ir.index else row.get("Client", ""),
+            "Site":          ir["Site name"]                   if ir is not None and "Site name"                 in ir.index else row.get("Site", ""),
+            "OS":            ir["OS version"]                  if ir is not None else "N/A",
+            "Model":         ir["Model"]                       if ir is not None else "N/A",
+            "Username":      ir["Username"]                    if ir is not None else "N/A",
             "Last Response": str(ir["Last response (Local time)"]) if ir is not None else "N/A",
-        })
+        }
+        browsers = parse_browsers(str(row["Output"]))
+        dual_32, only_32, per_user = detect_issues(browsers)
+
+        issue_sets = [
+            ("32-bit Install (Dual — remove 32-bit copy)",    dual_32),
+            ("32-bit Install (Only — replace with 64-bit)",   only_32),
+            ("Per-User (AppData) Install",                    per_user),
+        ]
+        for issue_type, installs in issue_sets:
+            for b in installs:
+                key = (device, b["browser"], b["path"], issue_type)
+                if key in seen: continue
+                seen.add(key)
+                flagged.append({**base,
+                    "Browser":       b["browser"],
+                    "Issue Type":    issue_type,
+                    "Issue Detail":  f"v{b['version']} @ {b['path']}",
+                    "Version":       b["version"],
+                    "Architecture":  b["arch"],
+                    "Install Scope": b["scope"],
+                    "Install Path":  b["path"],
+                })
     return flagged
 
 
-def _browser_summary(installs, browser):
-    rows = [b for b in installs if b["browser"] == browser]
-    if not rows:
-        return ""
-    return " | ".join(
-        f"{b['version']} {b['arch']} {b['scope']} @ {b['path']}"
-        for b in rows
-    )
+BROWSERS_TRACKED = ["Google Chrome", "Microsoft Edge", "Mozilla Firefox"]
 
-def build_browser_matrix(audit_active, inv_active):
-    """One row per active scanned device showing Chrome/Firefox/Edge presence and risk flags."""
+def build_browser_sheet_rows(audit_active, inv_active, browser_name):
+    """One row per install of browser_name, sorted by version descending."""
     idx = inv_active.set_index("Device name")
     rows = []
-    browsers_to_track = ["Google Chrome", "Mozilla Firefox", "Microsoft Edge"]
-
-    for _, row in audit_active.iterrows():
-        device = row["Device"]
-        inv = idx.loc[device] if device in idx.index else None
-        all_installs = parse_browsers(str(row["Output"]))
-        installs = [b for b in all_installs if b["browser"] in browsers_to_track]
-
-        rec = {
-            "Device": device,
-            "Client": inv["Customer name"] if inv is not None and "Customer name" in inv.index else row.get("Client", ""),
-            "Site": inv["Site name"] if inv is not None and "Site name" in inv.index else row.get("Site", ""),
-            "OS": inv["OS version"] if inv is not None else "N/A",
-            "Username": inv["Username"] if inv is not None else "N/A",
-            "Last Response": str(inv["Last response (Local time)"]) if inv is not None else "N/A",
-        }
-        for browser in browsers_to_track:
-            browser_rows = [b for b in installs if b["browser"] == browser]
-            rec[f"Has {browser}"] = "Yes" if browser_rows else "No"
-            rec[f"{browser} Install Count"] = len(browser_rows)
-            rec[f"{browser} Details"] = _browser_summary(installs, browser)
-            rec[f"{browser} 32-bit"] = "Yes" if any(b["arch"] == "32-bit" for b in browser_rows) else "No"
-            rec[f"{browser} Per-User"] = "Yes" if any(b["scope"] == "Per-User" or "appdata" in b["path"].lower() for b in browser_rows) else "No"
-
-        rec["Any 32-bit Browser"] = "Yes" if any(b["arch"] == "32-bit" for b in all_installs) else "No"
-        rec["Any Per-User Browser"] = "Yes" if any(b["scope"] == "Per-User" or "appdata" in b["path"].lower() for b in all_installs) else "No"
-        rec["Total Browser Installs"] = len(all_installs)
-        rows.append(rec)
-
-    return rows
-
-def build_browser_installs(audit_active, inv_active):
-    """One row per detected Chrome/Firefox/Edge install for filtering down to 32-bit/per-user installs."""
-    idx = inv_active.set_index("Device name")
-    rows = []
-    browsers_to_track = {"Google Chrome", "Mozilla Firefox", "Microsoft Edge"}
-
     for _, row in audit_active.iterrows():
         device = row["Device"]
         inv = idx.loc[device] if device in idx.index else None
         for b in parse_browsers(str(row["Output"])):
-            if b["browser"] not in browsers_to_track:
+            if b["browser"] != browser_name:
                 continue
             is_per_user = b["scope"] == "Per-User" or "appdata" in b["path"].lower()
-            is_32bit = b["arch"] == "32-bit"
             rows.append({
-                "Device": device,
-                "Client": inv["Customer name"] if inv is not None and "Customer name" in inv.index else row.get("Client", ""),
-                "Site": inv["Site name"] if inv is not None and "Site name" in inv.index else row.get("Site", ""),
-                "Browser": b["browser"],
-                "Version": b["version"],
-                "Architecture": b["arch"],
-                "Install Scope": b["scope"],
-                "Install Path": b["path"],
-                "Is 32-bit": "Yes" if is_32bit else "No",
+                "Device":              device,
+                "Client":              inv["Customer name"]               if inv is not None and "Customer name"             in inv.index else row.get("Client", ""),
+                "Site":                inv["Site name"]                   if inv is not None and "Site name"                 in inv.index else row.get("Site", ""),
+                "Version":             b["version"],
+                "Architecture":        b["arch"],
+                "Install Scope":       b["scope"],
+                "Install Path":        b["path"],
+                "Is 32-bit":           "Yes" if b["arch"] == "32-bit" else "No",
                 "Is Per-User/AppData": "Yes" if is_per_user else "No",
-                "OS": inv["OS version"] if inv is not None else "N/A",
-                "Username": inv["Username"] if inv is not None else "N/A",
-                "Last Response": str(inv["Last response (Local time)"]) if inv is not None else "N/A",
+                "Note":                _path_note(b["arch"], b["path"]),
+                "OS":                  inv["OS version"]                  if inv is not None else "N/A",
+                "Username":            inv["Username"]                    if inv is not None else "N/A",
+                "Last Response":       str(inv["Last response (Local time)"]) if inv is not None else "N/A",
             })
+    # Sort: by device name first so all installs for the same device sit together
+    # (e.g. MEDTECH121 Firefox 32-bit and 64-bit are adjacent rows).
+    # Within each device: risk rows (32-bit / per-user) before clean, then version desc.
+    # Devices that have ANY risk install float to the top of the sheet so they're
+    # visible without filtering; fully clean devices follow below.
+    device_has_risk = {
+        r["Device"]
+        for r in rows
+        if r["Is 32-bit"] == "Yes" or r["Is Per-User/AppData"] == "Yes"
+    }
+    def _sort_key(r):
+        is_risk_device = r["Device"] in device_has_risk
+        is_risk_row    = r["Is 32-bit"] == "Yes" or r["Is Per-User/AppData"] == "Yes"
+        ver_parts      = [int(x) for x in r["Version"].split(".") if x.isdigit()]
+        # (risk device first, device name, risk row first within device, version desc)
+        return (0 if is_risk_device else 1, r["Device"], 0 if is_risk_row else 1, [-p for p in ver_parts])
+    rows.sort(key=_sort_key)
     return rows
 
-def browser_overview_counts(browser_matrix, browser_installs):
-    browsers = ["Google Chrome", "Mozilla Firefox", "Microsoft Edge"]
+def build_version_spread(browser_rows):
+    """Return list of {Version, Devices, 64-bit Devices, 32-bit Devices, Per-User Devices} sorted by version desc."""
+    from collections import defaultdict
+    ver_devices  = defaultdict(set)
+    ver_64       = defaultdict(set)
+    ver_32       = defaultdict(set)
+    ver_per_user = defaultdict(set)
+    for r in browser_rows:
+        v = r["Version"]
+        ver_devices[v].add(r["Device"])
+        if r["Is 32-bit"] == "No":
+            ver_64[v].add(r["Device"])
+        if r["Is 32-bit"] == "Yes":
+            ver_32[v].add(r["Device"])
+        if r["Is Per-User/AppData"] == "Yes":
+            ver_per_user[v].add(r["Device"])
+    versions = sorted(ver_devices.keys(),
+                      key=lambda v: [int(x) for x in v.split(".") if x.isdigit()],
+                      reverse=True)
+    return [{"Version": v, "Devices": len(ver_devices[v]),
+             "64-bit Devices": len(ver_64[v]),
+             "32-bit Devices": len(ver_32[v]),
+             "Per-User Devices": len(ver_per_user[v])}
+            for v in versions]
+
+def browser_overview_counts(all_browser_rows):
+    """Summary counts per browser from the combined per-browser row lists."""
     counts = []
-    for browser in browsers:
-        devices = {r["Device"] for r in browser_matrix if r[f"Has {browser}"] == "Yes"}
-        devices_32 = {r["Device"] for r in browser_installs if r["Browser"] == browser and r["Is 32-bit"] == "Yes"}
-        devices_per = {r["Device"] for r in browser_installs if r["Browser"] == browser and r["Is Per-User/AppData"] == "Yes"}
-        installs = [r for r in browser_installs if r["Browser"] == browser]
+    for browser_name, rows in all_browser_rows.items():
+        devices     = {r["Device"] for r in rows}
+        installs_64 = [r for r in rows if r["Is 32-bit"] == "No"]
+        installs_32 = [r for r in rows if r["Is 32-bit"] == "Yes"]
+        devices_per = {r["Device"] for r in rows if r["Is Per-User/AppData"] == "Yes"}
         counts.append({
-            "Browser": browser,
-            "Devices with Browser": len(devices),
-            "Total Installs Detected": len(installs),
-            "Devices with 32-bit Install": len(devices_32),
-            "Devices with Per-User/AppData Install": len(devices_per),
+            "Browser":              browser_name,
+            "Devices":              len(devices),
+            "64-bit Installs":      len(installs_64),
+            "32-bit Installs":      len(installs_32),
+            "Per-User Installs":    len(devices_per),
         })
     return counts
 
-def build_report(flagged, not_scanned, stale_inv, inv_active, audit_active, browser_matrix, browser_installs, output_path, stale_days):
+BROWSER_SHEET_CONFIG = {
+    "Google Chrome":   {"emoji": "🟢", "color": COL["green"], "row_alt": COL["row_blue"]},
+    "Microsoft Edge":  {"emoji": "🔵", "color": COL["navy"],  "row_alt": COL["row_blue"]},
+    "Mozilla Firefox": {"emoji": "🟠", "color": COL["amber"], "row_alt": COL["row_blue"]},
+}
+
+def _write_browser_sheet(wb, browser_name, rows):
+    cfg = BROWSER_SHEET_CONFIG[browser_name]
+    short = browser_name.replace("Google ", "").replace("Mozilla ", "").replace("Microsoft ", "")
+    ws = wb.create_sheet(f"{cfg['emoji']} {short}"); ws.sheet_view.showGridLines = False
+    hdrs = ["Device", "Client", "Site", "Version", "Architecture", "Install Scope",
+            "Install Path", "Is 32-bit", "Is Per-User/AppData", "Note", "OS", "Username", "Last Response"]
+    for c, h in enumerate(hdrs, 1): ws.cell(1, c, h)
+    _hdr(ws, 1, len(hdrs), _fill(cfg["color"]))
+    for r, rec in enumerate(rows, 2):
+        is_risk = rec["Is 32-bit"] == "Yes" or rec["Is Per-User/AppData"] == "Yes"
+        alt = _fill(COL["row_risk"]) if is_risk else _fill(COL["row_blue"])
+        for c, key in enumerate(hdrs, 1):
+            cell = ws.cell(r, c, rec.get(key, "")); cell.font = BODY_FONT
+            cell.border = BORDER; cell.fill = alt; cell.alignment = WRAP
+        ws.row_dimensions[r].height = 18
+    _widths(ws, [20, 14, 22, 18, 14, 16, 64, 10, 18, 44, 32, 24, 20])
+    ws.freeze_panes = "A2"; ws.auto_filter.ref = ws.dimensions
+    _write_legend(ws, len(rows) + 3, [
+        (COL["row_risk"],  "Risk row — install is 32-bit or per-user/AppData. Review and remediate."),
+        (COL["row_blue"],  "Clean row — 64-bit system install, no issues detected."),
+    ])
+
+
+def build_report(flagged, not_scanned, stale_inv, inv_active, audit_active, all_browser_rows, output_path, stale_days, client_name=""):
     wb = Workbook()
 
+    # ── Summary ───────────────────────────────────────────────────────────────
+    # Single left-aligned column layout — everything reads top to bottom:
+    #
+    #   Rows  4–9  : Fleet stat tiles           (A=label, B=value)
+    #   Row   10   : (blank)
+    #   Rows 11–14 : Browser counts table        (A–E: Browser|Devices|64-bit|32-bit|Per-User)
+    #   Row   15   : (blank)
+    #   Rows 16–19 : Issue breakdown tiles       (A=label, B=value)
+    #   Rows 21–22 : (blank / spread title row)
+    #   Rows 22+   : Version spread tables       Chrome A–E, Edge G–K, Firefox M–Q
+    #
     ws = wb.active; ws.title = "Summary"; ws.sheet_view.showGridLines = False
-    ws["A1"] = "Browser CVE Audit Report"
+    ws["A1"] = f"Browser CVE Audit Report — {client_name}" if client_name else "Browser CVE Audit Report"
     ws["A1"].font = Font(name="Arial", bold=True, size=16, color=COL["dark"])
     ws["A2"] = f"Generated {datetime.now().strftime('%d %b %Y')}  |  Devices inactive >{stale_days} days excluded"
     ws["A2"].font = Font(name="Arial", size=10, color="7F8C8D")
-    for i, (label, val, color) in enumerate([
-        ("Total Fleet (Inventory)",              len(inv_active) + len(stale_inv), COL["dark"]),
-        (f"Stale / Offline (>{stale_days} days)", len(stale_inv),                  COL["gold"]),
-        ("Active Devices (Inventory)",           len(inv_active),                  COL["navy"]),
-        ("Active Devices Scanned",               len(audit_active),                COL["green"]),
-        ("Devices with Issues",                  len(flagged),                     COL["red"]),
-        ("Active Devices NOT Scanned",           len(not_scanned),                 COL["amber"]),
-    ], 4):
-        f = _fill(color)
-        ws.cell(i, 1, label).font = Font(name="Arial", bold=True, size=10, color="FFFFFF")
-        ws.cell(i, 1).fill = f; ws.cell(i, 1).border = BORDER
-        ws.cell(i, 1).alignment = Alignment(horizontal="left", vertical="center", indent=1)
-        ws.cell(i, 2, val).font = Font(name="Arial", bold=True, size=12, color="FFFFFF")
-        ws.cell(i, 2).fill = f; ws.cell(i, 2).border = BORDER; ws.cell(i, 2).alignment = CENTER
-        ws.row_dimensions[i].height = 22
-    # Browser overview counts
-    browser_counts = browser_overview_counts(browser_matrix, browser_installs)
-    start_row = 12
-    headers = ["Browser", "Devices with Browser", "Total Installs Detected", "Devices with 32-bit Install", "Devices with Per-User/AppData Install"]
-    for c, h in enumerate(headers, 1):
-        ws.cell(start_row, c, h)
-    _hdr(ws, start_row, len(headers), _fill(COL["navy"]))
-    for r, rec in enumerate(browser_counts, start_row + 1):
-        for c, h in enumerate(headers, 1):
-            cell = ws.cell(r, c, rec[h]); cell.font = BODY_FONT
-            cell.border = BORDER; cell.alignment = CENTER if c > 1 else WRAP
-        ws.row_dimensions[r].height = 22
 
-    # Tracking totals for quick triage
-    tracking_row = start_row + len(browser_counts) + 3
-    any_32 = len({r["Device"] for r in browser_installs if r["Is 32-bit"] == "Yes"})
-    any_per = len({r["Device"] for r in browser_installs if r["Is Per-User/AppData"] == "Yes"})
-    total_installs = len(browser_installs)
+    # ── Section 1 — Fleet stat tiles (rows 4–9) ───────────────────────────────
+    STAT_ROW = 4
     for i, (label, val, color) in enumerate([
-        ("Devices with ANY 32-bit browser install", any_32, COL["amber"]),
-        ("Devices with ANY per-user/AppData install", any_per, COL["red"]),
-        ("Total Chrome/Firefox/Edge installs detected", total_installs, COL["green"]),
-    ], tracking_row):
+        ("Total Fleet (Inventory)",               len(inv_active) + len(stale_inv), COL["dark"]),
+        (f"Stale / Offline (>{stale_days} days)", len(stale_inv),                   COL["gold"]),
+        ("Active Devices (Inventory)",            len(inv_active),                   COL["navy"]),
+        ("Active Devices Scanned",                len(audit_active),                 COL["green"]),
+        ("Devices with Issues",                   len({r["Device"] for r in flagged}), COL["red"]),
+        ("Active Devices NOT Scanned",            len(not_scanned),                  COL["amber"]),
+    ], STAT_ROW):
         f = _fill(color)
         ws.cell(i, 1, label).font = Font(name="Arial", bold=True, size=10, color="FFFFFF")
         ws.cell(i, 1).fill = f; ws.cell(i, 1).border = BORDER
@@ -323,63 +426,144 @@ def build_report(flagged, not_scanned, stale_inv, inv_active, audit_active, brow
         ws.cell(i, 2).fill = f; ws.cell(i, 2).border = BORDER; ws.cell(i, 2).alignment = CENTER
         ws.row_dimensions[i].height = 22
 
-    _widths(ws, [42, 18, 22, 24, 32])
+    # ── Section 2 — Browser counts table (rows 11–14) ────────────────────────
+    # One header row + one coloured row per browser, 5 cols: Browser|Devices|64-bit|32-bit|Per-User
+    OV_ROW  = 11
+    OV_HDRS = ["Browser", "Devices", "64-bit Installs", "32-bit Installs", "Per-User Installs"]
+    for c, h in enumerate(OV_HDRS, 1):
+        cell = ws.cell(OV_ROW, c, h)
+        cell.fill = _fill(COL["dark"]); cell.font = HDR_FONT
+        cell.border = BORDER; cell.alignment = CENTER
+    ws.row_dimensions[OV_ROW].height = 22
 
+    browser_counts = browser_overview_counts(all_browser_rows)
+    for ri, rec in enumerate(browser_counts, OV_ROW + 1):
+        cfg  = BROWSER_SHEET_CONFIG[rec["Browser"]]
+        vals = [rec["Browser"], rec["Devices"], rec["64-bit Installs"],
+                rec["32-bit Installs"], rec["Per-User Installs"]]
+        for c, v in enumerate(vals, 1):
+            cell = ws.cell(ri, c, v)
+            cell.font  = Font(name="Arial", bold=True, size=10, color="FFFFFF")
+            cell.fill  = _fill(cfg["color"]); cell.border = BORDER
+            cell.alignment = Alignment(horizontal="left" if c == 1 else "center",
+                                       vertical="center", indent=1 if c == 1 else 0)
+        ws.row_dimensions[ri].height = 22
+
+    # ── Section 3 — Issue breakdown tiles (rows 16–19) ───────────────────────
+    ISSUE_ROW = 16
+    all_rows_flat = [r for rows in all_browser_rows.values() for r in rows]
+    dual_32_devs  = len({r["Device"] for r in flagged if "Dual" in r["Issue Type"]})
+    only_32_devs  = len({r["Device"] for r in flagged if "Only" in r["Issue Type"]})
+    per_user_devs = len({r["Device"] for r in flagged if r["Issue Type"] == "Per-User (AppData) Install"})
+    for i, (label, val, color) in enumerate([
+        ("Devices with dual 32+64-bit installs (remove 32-bit copy)", dual_32_devs,      COL["red"]),
+        ("Devices with 32-bit only installs (replace with 64-bit)",   only_32_devs,      COL["amber"]),
+        ("Devices with per-user/AppData installs",                    per_user_devs,      COL["navy"]),
+        ("Total Chrome/Edge/Firefox installs detected",               len(all_rows_flat), COL["green"]),
+    ], ISSUE_ROW):
+        f = _fill(color)
+        ws.cell(i, 1, label).font = Font(name="Arial", bold=True, size=10, color="FFFFFF")
+        ws.cell(i, 1).fill = f; ws.cell(i, 1).border = BORDER
+        ws.cell(i, 1).alignment = Alignment(horizontal="left", vertical="center", indent=1)
+        ws.cell(i, 2, val).font = Font(name="Arial", bold=True, size=12, color="FFFFFF")
+        ws.cell(i, 2).fill = f; ws.cell(i, 2).border = BORDER; ws.cell(i, 2).alignment = CENTER
+        ws.row_dimensions[i].height = 22
+
+    # ── Section 4 — Version spread tables (rows 22+, three browsers side by side) ──
+    # 5 cols per table: Version | Devices | 64-bit | 32-bit | Per-User
+    # 1 blank-col gap between tables.
+    # Spread starts at col A — no collision with other sections (which only use rows 4–19).
+    SPREAD_NCOLS     = 5
+    SPREAD_GAP       = 1
+    SPREAD_HDRS      = ["Version", "Devices", "64-bit", "32-bit", "Per-User"]
+    SPREAD_ROW_START = ISSUE_ROW + 4 + 1   # rows 16–19 issues + 1 blank + 1 title = row 22
+
+    for bi, (browser_name, rows) in enumerate(all_browser_rows.items()):
+        cfg   = BROWSER_SHEET_CONFIG[browser_name]
+        short = browser_name.replace("Google ", "").replace("Mozilla ", "").replace("Microsoft ", "")
+        col0  = 1 + bi * (SPREAD_NCOLS + SPREAD_GAP)   # 1, 7, 13
+
+        # Browser title row — merged across all 5 cols
+        title_row = SPREAD_ROW_START - 1
+        ws.merge_cells(start_row=title_row, start_column=col0,
+                       end_row=title_row,   end_column=col0 + SPREAD_NCOLS - 1)
+        tc = ws.cell(title_row, col0, f"{cfg['emoji']} {short} — Version Spread")
+        tc.font      = Font(name="Arial", bold=True, size=10, color="FFFFFF")
+        tc.fill      = _fill(cfg["color"]); tc.border = BORDER
+        tc.alignment = Alignment(horizontal="center", vertical="center")
+        ws.row_dimensions[title_row].height = 20
+
+        # Column headers
+        for ci, h in enumerate(SPREAD_HDRS, col0):
+            cell = ws.cell(SPREAD_ROW_START, ci, h)
+            cell.fill = _fill(COL["dark"]); cell.font = HDR_FONT
+            cell.border = BORDER; cell.alignment = CENTER
+        ws.row_dimensions[SPREAD_ROW_START].height = 20
+
+        # Data rows
+        spread = build_version_spread(rows)
+        for ri, sv in enumerate(spread, SPREAD_ROW_START + 1):
+            if sv["32-bit Devices"] > 0:
+                row_fill = _fill(COL["row_only32"])
+            elif sv["Per-User Devices"] > 0:
+                row_fill = _fill(COL["row_peruser"])
+            else:
+                row_fill = _fill(COL["row_blue"])
+            vals = [sv["Version"], sv["Devices"], sv["64-bit Devices"],
+                    sv["32-bit Devices"], sv["Per-User Devices"]]
+            for ci, v in enumerate(vals, col0):
+                cell = ws.cell(ri, ci, v); cell.font = BODY_FONT
+                cell.border = BORDER; cell.fill = row_fill; cell.alignment = CENTER
+            ws.row_dimensions[ri].height = 18
+
+        # Column widths
+        for ci, w in zip(range(col0, col0 + SPREAD_NCOLS), [18, 10, 10, 10, 11]):
+            ws.column_dimensions[get_column_letter(ci)].width = w
+        ws.column_dimensions[get_column_letter(col0 + SPREAD_NCOLS)].width = 2
+
+    # Global column widths for cols A–B and overview cols C–E
+    ws.column_dimensions["A"].width = 54
+    ws.column_dimensions["B"].width = 10
+    for ci, w in enumerate([20, 16, 16, 18], 3):   # C=Browser, D=Devices, E=64-bit, F=32-bit, G=Per-User
+        ws.column_dimensions[get_column_letter(ci)].width = w
+
+    # ── ⚠ Devices with Issues ─────────────────────────────────────────────────
     ws2 = wb.create_sheet("⚠ Devices with Issues"); ws2.sheet_view.showGridLines = False
-    hdrs = ["Device", "Client", "Site", "Issue Type", "Issue Detail", "OS", "Model", "Username", "Last Response"]
+    hdrs = ["Device", "Client", "Site", "Browser", "Issue Type", "Version",
+            "Architecture", "Install Scope", "Install Path", "OS", "Model", "Username", "Last Response"]
+    # Colour by issue type so it's visually scannable without filtering
+    _ISSUE_FILL = {
+        "32-bit Install (Dual — remove 32-bit copy)":  COL["row_dual32"],
+        "32-bit Install (Only — replace with 64-bit)": COL["row_only32"],
+        "Per-User (AppData) Install":                  COL["row_peruser"],
+    }
     for c, h in enumerate(hdrs, 1): ws2.cell(1, c, h)
-    _hdr(ws2, 1, len(hdrs), _fill(COL["red"]))
-    for r, rec in enumerate(flagged, 2):
-        alt = _fill(COL["row_orange"]) if r % 2 == 0 else _fill(COL["white"])
+    _hdr(ws2, 1, len(hdrs), _fill(COL["dark"]))
+    sorted_flagged = sorted(flagged, key=lambda x: (x["Client"], x["Site"], x["Device"], x["Browser"], x["Issue Type"]))
+    for r, rec in enumerate(sorted_flagged, 2):
+        row_fill = _fill(_ISSUE_FILL.get(rec.get("Issue Type", ""), COL["row_risk"]))
         for c, key in enumerate(hdrs, 1):
             cell = ws2.cell(r, c, rec.get(key, "")); cell.font = BODY_FONT
-            cell.border = BORDER; cell.fill = alt; cell.alignment = WRAP
-        ws2.row_dimensions[r].height = 45
-    _widths(ws2, [20, 14, 24, 26, 58, 36, 30, 26, 20]); ws2.freeze_panes = "A2"
+            cell.border = BORDER; cell.fill = row_fill; cell.alignment = WRAP
+        ws2.row_dimensions[r].height = 18
+    _widths(ws2, [22, 14, 22, 20, 38, 16, 14, 14, 58, 36, 26, 26, 20]); ws2.freeze_panes = "A2"
     ws2.auto_filter.ref = ws2.dimensions
+    _write_legend(ws2, len(sorted_flagged) + 3, [
+        (COL["row_dual32"],  "32-bit Install (Dual) — same browser has both 32-bit and 64-bit installed. Remove the 32-bit copy."),
+        (COL["row_only32"],  "32-bit Install (Only) — browser only present as 32-bit, no 64-bit version. Replace with 64-bit installer."),
+        (COL["row_peruser"], "Per-User (AppData) Install — browser installed under user profile, not system-wide. Reinstall to Program Files."),
+    ])
 
-    ws_browser = wb.create_sheet("🌐 Browser Devices"); ws_browser.sheet_view.showGridLines = False
-    br_h = [
-        "Device", "Client", "Site", "OS", "Username", "Last Response",
-        "Has Google Chrome", "Google Chrome Install Count", "Google Chrome Details", "Google Chrome 32-bit", "Google Chrome Per-User",
-        "Has Mozilla Firefox", "Mozilla Firefox Install Count", "Mozilla Firefox Details", "Mozilla Firefox 32-bit", "Mozilla Firefox Per-User",
-        "Has Microsoft Edge", "Microsoft Edge Install Count", "Microsoft Edge Details", "Microsoft Edge 32-bit", "Microsoft Edge Per-User",
-        "Any 32-bit Browser", "Any Per-User Browser", "Total Browser Installs",
-    ]
-    for c, h in enumerate(br_h, 1): ws_browser.cell(1, c, h)
-    _hdr(ws_browser, 1, len(br_h), _fill(COL["navy"]))
-    for r, rec in enumerate(browser_matrix, 2):
-        is_risk = rec["Any 32-bit Browser"] == "Yes" or rec["Any Per-User Browser"] == "Yes"
-        alt = _fill(COL["row_orange"]) if is_risk else (_fill(COL["row_blue"]) if r % 2 == 0 else _fill(COL["white"]))
-        for c, key in enumerate(br_h, 1):
-            cell = ws_browser.cell(r, c, rec.get(key, "")); cell.font = BODY_FONT
-            cell.border = BORDER; cell.fill = alt; cell.alignment = WRAP
-        ws_browser.row_dimensions[r].height = 22
-    _widths(ws_browser, [18, 14, 22, 32, 24, 20, 14, 16, 60, 14, 16, 14, 16, 60, 14, 16, 14, 16, 60, 14, 16, 16, 18, 14])
-    ws_browser.freeze_panes = "A2"
-    ws_browser.auto_filter.ref = ws_browser.dimensions
-
-    ws_inst = wb.create_sheet("📦 Browser Installs"); ws_inst.sheet_view.showGridLines = False
-    inst_h = ["Device", "Client", "Site", "Browser", "Version", "Architecture", "Install Scope", "Install Path", "Is 32-bit", "Is Per-User/AppData", "OS", "Username", "Last Response"]
-    for c, h in enumerate(inst_h, 1): ws_inst.cell(1, c, h)
-    _hdr(ws_inst, 1, len(inst_h), _fill(COL["green"]))
-    for r, rec in enumerate(browser_installs, 2):
-        is_risk = rec["Is 32-bit"] == "Yes" or rec["Is Per-User/AppData"] == "Yes"
-        alt = _fill(COL["row_orange"]) if is_risk else (_fill(COL["white"]) if r % 2 else _fill(COL["row_blue"]))
-        for c, key in enumerate(inst_h, 1):
-            cell = ws_inst.cell(r, c, rec.get(key, "")); cell.font = BODY_FONT
-            cell.border = BORDER; cell.fill = alt; cell.alignment = WRAP
-        ws_inst.row_dimensions[r].height = 24
-    _widths(ws_inst, [18, 14, 22, 20, 18, 14, 16, 68, 12, 20, 32, 24, 20])
-    ws_inst.freeze_panes = "A2"
-    ws_inst.auto_filter.ref = ws_inst.dimensions
+    # ── Per-browser sheets ────────────────────────────────────────────────────
+    for browser_name in BROWSERS_TRACKED:
+        _write_browser_sheet(wb, browser_name, all_browser_rows[browser_name])
 
     ws3 = wb.create_sheet("🔍 Not Scanned (Active)"); ws3.sheet_view.showGridLines = False
     ns_h = ["Device Name", "Customer", "Site", "Device Type", "OS Version", "Username", "Last Response", "Manufacturer", "Model"]
     for c, h in enumerate(ns_h, 1): ws3.cell(1, c, h)
     _hdr(ws3, 1, len(ns_h), _fill(COL["amber"]))
     for r, (_, rec) in enumerate(not_scanned.iterrows(), 2):
-        alt = _fill(COL["row_blue"]) if r % 2 == 0 else _fill(COL["white"])
+        alt = _fill(COL["row_blue"])
         vals = [rec["Device name"], rec["Customer name"], rec["Site name"], rec["Device type"],
                 rec["OS version"], rec["Username"], str(rec["Last response (Local time)"]), rec["Manufacturer"], rec["Model"]]
         for c, v in enumerate(vals, 1):
@@ -393,7 +577,7 @@ def build_report(flagged, not_scanned, stale_inv, inv_active, audit_active, brow
     for c, h in enumerate(st_h, 1): ws4.cell(1, c, h)
     _hdr(ws4, 1, len(st_h), _fill(COL["gold"]))
     for r, (_, rec) in enumerate(stale_inv.sort_values("days_since", ascending=False).iterrows(), 2):
-        alt = _fill(COL["row_gold2"]) if r % 2 == 0 else _fill(COL["row_gold"])
+        alt = _fill(COL["row_gold"])
         days = int(rec["days_since"]) if pd.notna(rec["days_since"]) else "?"
         vals = [rec["Device name"], rec["Customer name"], rec["Site name"], rec["Device type"],
                 rec["OS version"], rec["Username"], str(rec["Last response (Local time)"]), days, rec["Manufacturer"], rec["Model"]]
@@ -404,7 +588,7 @@ def build_report(flagged, not_scanned, stale_inv, inv_active, audit_active, brow
     _widths(ws4, [22, 14, 24, 14, 38, 26, 20, 18, 16, 34]); ws4.freeze_panes = "A2"
 
     wb.save(output_path)
-    return len(flagged), len(not_scanned), len(stale_inv)
+    return len({r["Device"] for r in flagged}), len(not_scanned), len(stale_inv)
 
 
 
@@ -625,7 +809,7 @@ class App(tk.Tk):
             self._log(f"Save as: {out_path}", "dim")
 
             self._log("Loading inventory…", "dim")
-            inv_active, stale_inv = load_inventory(self.inv_path, stale_days)
+            inv_active, stale_inv, client_name = load_inventory(self.inv_path, stale_days)
             self._log(f"  Active: {len(inv_active)}  |  Stale: {len(stale_inv)}", "dim")
 
             self._log(f"Loading {len(self.task_files)} CSV(s)…", "dim")
@@ -648,21 +832,25 @@ class App(tk.Tk):
 
             self._log("Checking browser installs…", "dim")
             flagged = build_flagged(audit_active, inv_active)
-            browser_matrix = build_browser_matrix(audit_active, inv_active)
-            browser_installs = build_browser_installs(audit_active, inv_active)
+            all_browser_rows = {b: build_browser_sheet_rows(audit_active, inv_active, b) for b in BROWSERS_TRACKED}
 
             self._log("Writing report…", "dim")
             Path(out_path).parent.mkdir(parents=True, exist_ok=True)
             n_f, n_ns, n_st = build_report(
                 flagged, not_scanned, stale_inv, inv_active, audit_active,
-                browser_matrix, browser_installs,
-                out_path, stale_days)
+                all_browser_rows,
+                out_path, stale_days, client_name)
 
+            all_rows_flat = [r for rows in all_browser_rows.values() for r in rows]
             self._log(f"\n✔  Saved to: {out_path}", "ok")
-            self._log(f"   Issues found    : {n_f}",  "warn" if n_f  else "ok")
-            self._log(f"   Browser installs: {len(browser_installs)}", "dim")
-            self._log(f"   32-bit devices  : {len({r['Device'] for r in browser_installs if r['Is 32-bit'] == 'Yes'})}", "warn")
-            self._log(f"   Per-user devices: {len({r['Device'] for r in browser_installs if r['Is Per-User/AppData'] == 'Yes'})}", "warn")
+            self._log(f"   Issues found    : {n_f} devices / {len(flagged)} issue rows",  "warn" if n_f  else "ok")
+            self._log(f"   Browser installs: {len(all_rows_flat)}", "dim")
+            n_dual   = len({r["Device"] for r in flagged if "Dual" in r["Issue Type"]})
+            n_only32 = len({r["Device"] for r in flagged if "Only" in r["Issue Type"]})
+            n_per    = len({r["Device"] for r in flagged if r["Issue Type"] == "Per-User (AppData) Install"})
+            self._log(f"   32-bit dual     : {n_dual} devices", "warn" if n_dual else "ok")
+            self._log(f"   32-bit only     : {n_only32} devices", "warn" if n_only32 else "ok")
+            self._log(f"   Per-user        : {n_per} devices", "warn" if n_per else "ok")
             self._log(f"   Not scanned     : {n_ns}", "warn" if n_ns else "ok")
             self._log(f"   Stale excluded  : {n_st}", "dim")
 
