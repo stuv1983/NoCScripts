@@ -108,27 +108,33 @@ def _normalise_scope(scope, path):
         return "System"
     return "Unknown"
 
-def _resolve_arch(reported_arch, path):
+def _resolve_arch(reported_arch, path, browser):
     """
-    Use the install path to sanity-check the architecture reported by N-able.
+    Correct N-able architecture mis-reporting using install path as ground truth.
 
-    N-able occasionally reports 32-bit for Chrome installs that live in
-    C:\\Program Files\\ (not Program Files (x86)).  A 32-bit Windows application
-    is redirected by the OS to Program Files (x86) at install time, so a binary
-    sitting in the non-(x86) Program Files tree cannot be 32-bit.
+    Rule 1 — Chrome in Program Files (x86) -> 32-bit regardless of N-able's report.
+      Chrome is deployed via Intune as a 64-bit MSI which always installs to
+      Program Files (not x86). If it lands in (x86) the Intune deployment failed
+      and the device has a legacy or manually installed 32-bit copy. Treat it as
+      the issue it is rather than trusting N-able's PE-header read.
 
-    Rule:
-      reported 32-bit + path in Program Files (no (x86))  → override to 64-bit
-      reported 32-bit + path in Program Files (x86)        → keep 32-bit  (genuine)
-      reported 32-bit + path in AppData                    → keep 32-bit  (per-user, may be 32-bit)
-      anything else                                         → trust N-able
+    Rule 2 — Any browser in Program Files (no (x86)) reported as 32-bit -> 64-bit.
+      A 32-bit binary cannot physically live in Program Files; Windows redirects
+      32-bit installers to Program Files (x86) at install time. N-able is wrong.
+
+    Anything else -> trust N-able.
     """
+    p    = path.lower()
+    x86  = "(x86)" in p
+
+    if browser == "Google Chrome" and x86:
+        return "32-bit"   # Chrome in (x86) = Intune deployment issue, treat as 32-bit
+
     if reported_arch == "32-bit":
-        p = path.lower()
-        in_program_files     = "\\program files\\" in p or p.startswith("c:\\program files\\")
-        in_program_files_x86 = "(x86)" in p
-        if in_program_files and not in_program_files_x86:
+        in_pf = "\\program files\\" in p or p.startswith("c:\\program files\\")
+        if in_pf and not x86:
             return "64-bit"   # path proves it cannot be 32-bit; N-able is wrong
+
     return reported_arch
 
 
@@ -138,7 +144,7 @@ def parse_browsers(output):
     for m in _BPAT.finditer(text):
         path  = m.group(2).strip()
         scope = _normalise_scope(m.group(5), path)
-        arch  = _resolve_arch(m.group(4).strip(), path)
+        arch  = _resolve_arch(m.group(4).strip(), path, m.group(1).strip())
         results.append({
             "browser": m.group(1).strip(),
             "path":    path,
