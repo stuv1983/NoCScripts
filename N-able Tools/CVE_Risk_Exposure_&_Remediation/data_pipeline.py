@@ -1023,6 +1023,7 @@ def load_previous_report(file_path):
         'trend summary', 'overview', 'all detections', 'raw data',
         'stale excluded devices', 'new this month', 'resolved', 'persisting cves',
         'patch match overview', 'patch match full data', 'patch report (full)',
+        'patch confirmed', 'resolved (patch confirmed)',
     }
     resolved_pairs = set()
     for sheet in xl.sheet_names:
@@ -1183,9 +1184,28 @@ def compute_trends(current_df, previous_df, threshold,
     cur_cve_ids  = set(cur_scoped['_CVE_Key'].unique())
     prev_cve_ids = set(prev_scoped['_CVE_Key'].unique())
 
-    new_cve_ids        = cur_cve_ids  - prev_cve_ids
-    resolved_cve_ids   = prev_cve_ids - cur_cve_ids
-    persisting_cve_ids = cur_cve_ids  & prev_cve_ids
+    new_cve_ids = cur_cve_ids - prev_cve_ids
+
+    # A CVE type is resolved if:
+    #   (a) scanner no longer detects it at all (prev_cve_ids - cur_cve_ids), OR
+    #   (b) every prev_scoped device-CVE pair for that CVE type was manually marked
+    #       ☑ in the previous report (checkbox_resolved covers all occurrences).
+    # Without (b), a CVE that is still detected on some devices but has been
+    # checkbox-resolved on every device that had it in the previous report would
+    # not appear in resolved_cve_count at all — producing an undercount.
+    scanner_resolved_cves = prev_cve_ids - cur_cve_ids
+    checkbox_resolved_cves: set = set()
+    if checkbox_resolved:
+        for _cve in prev_cve_ids:
+            _prev_devs_for_cve = {d for d, c in prev_keys if c == _cve}
+            _cb_devs_for_cve   = {d for d, c in checkbox_resolved if c == _cve}
+            if _prev_devs_for_cve and _prev_devs_for_cve.issubset(_cb_devs_for_cve):
+                checkbox_resolved_cves.add(_cve)
+    resolved_cve_ids = scanner_resolved_cves | checkbox_resolved_cves
+
+    # Persisting = in cur AND in prev, after checkbox removal from cur_scoped.
+    # new + persisting = all scoped cur CVEs; resolved + persisting = all scoped prev CVEs.
+    persisting_cve_ids = cur_cve_ids & (prev_cve_ids - resolved_cve_ids)
 
     cur_dev_set  = set(cur_scoped['_Name_Key'].unique())
     prev_dev_set = set(prev_scoped['_Name_Key'].unique())

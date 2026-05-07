@@ -260,7 +260,7 @@ def build_trend_summary_sheet(workbook, trend, threshold, prev_report_name, head
 
     row += 2; ws.merge_range(row, 0, row, 3, '  Detail Sheets in This Workbook', sect_fmt)
     row += 1; ws.write(row, 0, f'  📋  New This Month    →  {m["new_cve_count"]} new CVE types × all affected devices')
-    row += 1; ws.write(row, 0, f'  ✅  Resolved          →  {m["resolved_cve_count"]} CVE types no longer detected')
+    row += 1; ws.write(row, 0, f'  ✅  Resolved          →  {m["resolved_cve_count"]} CVE types resolved (no longer detected or all devices ☑)')
     row += 1; ws.write(row, 0, f'  ⏳  Persisting CVEs   →  {m["persisting_cve_count"]} CVE types carried over from previous report')
 
 
@@ -955,7 +955,8 @@ def build_patch_resolved_sheet(writer, patch_full_df: 'pd.DataFrame') -> None:
     compliant, install date post-dates first detection.
 
     Available on every run where a patch report is loaded. Does not require
-    a previous dashboard (unlike the trend-based Resolved sheet).
+    a previous dashboard (unlike the trend-based 'Resolved (Patch Confirmed)' sheet).
+    Written to the 'Patch Confirmed' sheet to avoid naming collision with the trend sheet.
     """
     import pandas as pd
 
@@ -993,8 +994,8 @@ def build_patch_resolved_sheet(writer, patch_full_df: 'pd.DataFrame') -> None:
                         ascending=[True, False])
            .reset_index(drop=True))
 
-    out.to_excel(writer, sheet_name='Resolved (Patch Confirmed)', index=False)
-    ws = writer.sheets['Resolved (Patch Confirmed)']
+    out.to_excel(writer, sheet_name='Patch Confirmed', index=False)
+    ws = writer.sheets['Patch Confirmed']
     ws.autofilter(0, 0, len(out), len(out.columns) - 1)
     ws.set_row(0, None, hdr)
 
@@ -1024,7 +1025,7 @@ def build_patch_resolved_sheet(writer, patch_full_df: 'pd.DataFrame') -> None:
                    f'device(s) via patch report. Install date confirmed after first detection date.',
                    note_fmt)
 
-    log.debug("Resolved (Patch Confirmed) sheet: %d rows, %d CVEs, %d devices",
+    log.debug("Patch Confirmed sheet: %d rows, %d CVEs, %d devices",
               len(out), unique_cves, unique_devices)
 
 

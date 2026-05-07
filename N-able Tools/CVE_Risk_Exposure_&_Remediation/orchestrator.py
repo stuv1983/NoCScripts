@@ -303,6 +303,7 @@ def run(request: DashboardRequest) -> DashboardResult:
             'trend summary', overview_sheet_name.lower(), 'all detections', 'raw data',
             'stale excluded devices', 'new this month', 'resolved', 'persisting cves',
             'patch match overview', 'patch match full data', 'patch report (full)',
+            'patch confirmed', 'resolved (patch confirmed)',
         }
         used_names       = set(reserved)
         product_to_sheet = {}
