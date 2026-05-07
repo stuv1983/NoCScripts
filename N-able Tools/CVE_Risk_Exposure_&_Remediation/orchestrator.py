@@ -285,17 +285,40 @@ def run(request: DashboardRequest) -> DashboardResult:
             return DashboardResult(success=False, message=msg)
 
         filtered_df = merged_df[merged_df['Vulnerability Score'] >= request.threshold].copy()
-        triage_df   = filtered_df[filtered_df['Last Response'] != 'Not Found in RMM'].copy()
 
-        not_in_rmm = filtered_df[filtered_df['Last Response'] == 'Not Found in RMM']['Name'].nunique()
+        # ── Two-scope split ───────────────────────────────────────────────────
+        # filtered_df  = evidence/history scope (RESOLVED + UNRESOLVED)
+        #                → used by Raw Data, All Detections, patch evidence
+        # active_df    = triage scope (UNRESOLVED only)
+        #                → used by Overview, Product sheets, New This Month,
+        #                  Persisting CVEs, exposure counts
+        # N-able exports the column as 'Threat Status' in direct exports and
+        # 'Status' in some views — check both so we never silently skip the filter.
+        _status_col = (
+            'Threat Status' if 'Threat Status' in filtered_df.columns
+            else 'Status'   if 'Status'        in filtered_df.columns
+            else None
+        )
+        if _status_col:
+            active_df = filtered_df[
+                filtered_df[_status_col].astype(str).str.strip().str.upper().eq('UNRESOLVED')
+            ].copy()
+        else:
+            log.warning("No status column found in merged_df — active_df equals filtered_df. "
+                        "RESOLVED detections will NOT be excluded from triage sheets.")
+            active_df = filtered_df.copy()
+
+        triage_df = active_df[active_df['Last Response'] != 'Not Found in RMM'].copy()
+
+        not_in_rmm = active_df[active_df['Last Response'] == 'Not Found in RMM']['Name'].nunique()
         if not_in_rmm:
             w = f"{not_in_rmm} device(s) with score ≥ {request.threshold} not found in RMM — excluded from triage sheets"
             log.warning(w)
             warnings.append(w)
 
         log.info(
-            "Filtered (score >= %.1f): %d rows, %d triage, %d not-in-RMM",
-            request.threshold, len(filtered_df), len(triage_df), not_in_rmm,
+            "Filtered (score >= %.1f): %d total rows, %d unresolved (active), %d triage, %d not-in-RMM",
+            request.threshold, len(filtered_df), len(active_df), len(triage_df), not_in_rmm,
         )
 
         overview_sheet_name = datetime.now().strftime('%B') + ' Detections'
@@ -464,7 +487,7 @@ def run(request: DashboardRequest) -> DashboardResult:
                                           customer_name=customer_name)
 
             build_overview_sheet(
-                wb, merged_df, filtered_df, triage_df, request.threshold,
+                wb, merged_df, active_df, triage_df, request.threshold,
                 product_to_sheet, header_fmt, link_fmt,
                 customer_name=customer_name,
                 patch_confirmed_count=patch_confirmed_count,
@@ -541,8 +564,8 @@ def run(request: DashboardRequest) -> DashboardResult:
             output_path       = request.output_path,
             customer          = customer_name,
             threshold         = request.threshold,
-            unique_cves       = int(filtered_df['Vulnerability Name'].nunique()),
-            unique_devices    = int(filtered_df['Name'].nunique()),
+            unique_cves       = int(active_df['Vulnerability Name'].nunique()),
+            unique_devices    = int(active_df['Name'].nunique()),
             trend_metrics     = trend_data['metrics'] if trend_data else None,
             root_cause_summary= rc_summary or None,
         )

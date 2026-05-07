@@ -457,8 +457,9 @@ def load_vulnerability_data(file_path: str) -> pd.DataFrame:
             rename[col] = 'Operating System Role'
     df.rename(columns=rename, inplace=True)
 
-    if 'Threat Status' in df.columns:
-        df = df[df['Threat Status'].astype(str).str.strip().str.upper() != 'RESOLVED']
+    # NOTE: Do NOT drop RESOLVED rows here. merged_df must retain full evidence
+    # history for Raw Data / All Detections sheets. Active-only filtering is
+    # applied downstream in orchestrator.py (active_df / triage_df scopes).
 
     defaults = {
         'Name': 'Unknown Device',          'Vulnerability Name': 'Unknown CVE',
@@ -1107,6 +1108,24 @@ def compute_trends(current_df, previous_df, threshold,
                 "Trend: excluded %d previous-period row(s) for decommissioned "
                 "device(s) not in current Device Inventory", dropped
             )
+
+    # ── Step 2b: Active-only filter — exclude RESOLVED rows from trend math ────
+    # Trend movement (new / persisting / resolved) must only count UNRESOLVED
+    # detections. N-able exports can contain a mix of RESOLVED and UNRESOLVED
+    # rows. Including RESOLVED rows in cur_t causes them to appear in "New This
+    # Month" if they were not in the previous report.
+    # The status column may be named 'Threat Status' (direct N-able export) or
+    # 'Status' (some views / re-exports) — check both.
+    _cur_status_col  = 'Threat Status' if 'Threat Status' in cur_t.columns  else ('Status' if 'Status' in cur_t.columns  else None)
+    _prev_status_col = 'Threat Status' if 'Threat Status' in prev_t.columns else ('Status' if 'Status' in prev_t.columns else None)
+    if _cur_status_col:
+        cur_t = cur_t[
+            cur_t[_cur_status_col].astype(str).str.strip().str.upper().eq('UNRESOLVED')
+        ].copy()
+    if _prev_status_col:
+        prev_t = prev_t[
+            prev_t[_prev_status_col].astype(str).str.strip().str.upper().eq('UNRESOLVED')
+        ].copy()
 
     # ── Step 3: Snapshot metrics — captured from FULL data before any scope filter
     # "Previous Report had X CVEs" means ALL CVEs in that report, not just the
