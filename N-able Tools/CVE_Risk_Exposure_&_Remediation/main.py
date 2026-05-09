@@ -15,14 +15,13 @@ Zero business logic. Zero data processing. Zero Excel writing.
 import logging
 import threading
 from typing import Optional
+from datetime import date, timedelta, datetime
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 from orchestrator import DashboardRequest, DashboardResult, run as run_dashboard
 
-# Configure logging once here at the application entry point.
-# All other modules call logging.getLogger(__name__) and inherit this config.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(name)s - %(message)s",
@@ -61,7 +60,7 @@ def _run_in_thread(request, progress):
             if result.warnings:
                 msg += "\n\nWarnings:\n" + "\n".join(f"  - {w}" for w in result.warnings)
 
-            _msg = msg  # capture value, not reference
+            _msg = msg 
 
             def _on_success():
                 progress.stop()
@@ -146,6 +145,7 @@ def process_reports():
         cutoff_date            = cutoff_date,
         show_all_dates         = show_all_dates_var.get(),
         sync_baselines         = sync_baselines_var.get(),
+        report_month           = report_month_var.get().strip(),
     )
 
     log.info("Starting dashboard generation: %s", output_path)
@@ -178,7 +178,7 @@ def toggle_trend_state():
 
 root = tk.Tk()
 root.title("N-able CVE Dashboard & Triage Tool")
-root.geometry("570x800")
+root.geometry("570x830")
 root.resizable(False, True)
 
 tk.Label(root, text="N-able CVE Dashboard & Triage Tool",
@@ -214,16 +214,23 @@ date_frame = tk.Frame(root)
 date_frame.pack(anchor="w", padx=14, pady=(6, 0))
 tk.Label(date_frame, text="Exclude stale devices last seen before", font=("Arial", 9, "bold")).pack(side=tk.LEFT)
 date_var = tk.StringVar()
-from datetime import date, timedelta
-_default_since = (date.today() - timedelta(days=90)).strftime('%Y-%m-%d')
+_default_since = (date.today() - timedelta(days=90)).strftime('%d/%m/%Y')
 date_var.set(_default_since)
 date_entry = tk.Entry(date_frame, textvariable=date_var, width=12)
 date_entry.pack(side=tk.LEFT, padx=6)
-tk.Label(date_frame, text="(yyyy-mm-dd)").pack(side=tk.LEFT, padx=4)
+tk.Label(date_frame, text="(dd/mm/yyyy)").pack(side=tk.LEFT, padx=4)
 show_all_dates_var = tk.BooleanVar()
 tk.Checkbutton(date_frame, text="Show All Dates",
                variable=show_all_dates_var, command=toggle_date_state).pack(side=tk.LEFT)
 toggle_date_state()
+
+# New GUI Field for Report Month
+month_frame = tk.Frame(root)
+month_frame.pack(anchor="w", padx=14, pady=(6, 0))
+tk.Label(month_frame, text="Report Month:", font=("Arial", 9, "bold")).pack(side=tk.LEFT)
+report_month_var = tk.StringVar(value=datetime.now().strftime('%B %Y'))
+tk.Entry(month_frame, textvariable=report_month_var, width=15).pack(side=tk.LEFT, padx=6)
+
 
 tk.Label(root, text="Patch Report  (optional, CSV or XLSX)",
          font=("Arial", 9, "bold")).pack(anchor="w", padx=14, pady=(10, 0))
@@ -239,7 +246,6 @@ include_patch_var = tk.BooleanVar()
 tk.Checkbutton(root, text="Include Patch Report matching",
                variable=include_patch_var, command=toggle_patch_state).pack(anchor="w", padx=14)
 
-# ── Patch Failure Report (optional) ───────────────────────────────────────────
 tk.Label(root, text="Patch Failure Report  (optional, CSV)",
          font=("Arial", 9, "bold")).pack(anchor="w", padx=14, pady=(6, 0))
 failure_var = tk.StringVar()

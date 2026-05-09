@@ -169,7 +169,6 @@ def build_trend_summary_sheet(workbook, trend, threshold, prev_report_name, head
     row += 1; ws.merge_range(row, 0, row, 3, f'  Snapshot  (score ≥ {threshold})', sect_fmt)
     row += 1; write_row(row, 'Unique CVEs (vulnerability types)', m['prev_cves'],    m['cur_cves'])
     row += 1; write_row(row, 'Unique devices affected',           m['prev_devices'], m['cur_devices'])
-    # 'Unique CVE-device pairs' removed — metric causes more confusion than value
     row += 1; write_row(row, 'CVEs with known exploit',           m['prev_exploit'], m['cur_exploit'])
     row += 1; write_row(row, 'CISA KEV CVEs',                     m['prev_kev'],     m['cur_kev'])
     row += 1; write_row(row, 'Servers affected',                  m['prev_servers'], m['cur_servers'])
@@ -277,12 +276,14 @@ def build_trend_detail_sheets(writer, workbook, trend, link_fmt, sheets_subset=N
 
     detail_cols = ['Name', 'Device Type', 'Vulnerability Name', 'Vulnerability Score',
                    'Vulnerability Severity', 'Affected Products',
-                   'Has Known Exploit', 'CISA KEV', 'Last Response']
+                   'Has Known Exploit', 'CISA KEV', 'Last Response', 'Days Since Last Response']
 
+    # CRITICAL FIX: The trend resolved sheet should be named 'Resolved' not 'Resolved (Patch Confirmed)'
+    # to avoid overwriting the actual patch confirmation sheet!
     all_sheets = [
         ('New This Month',  trend['new_df'],        new_bg,
          'New CVEs not seen in the previous report — investigate and prioritise.'),
-        ('Resolved (Patch Confirmed)',        trend['resolved_df'],   res_bg,
+        ('Resolved',        trend['resolved_df'],   res_bg,
          'CVEs present last report that are no longer detected — confirmed remediated.'),
         ('Persisting CVEs', trend['persisting_df'], per_bg,
          'CVEs carried over from the previous report — still unresolved.'),
@@ -331,8 +332,12 @@ def build_overview_sheet(workbook, merged_df, filtered_df, triage_df, threshold,
                           sheet_name='Detections', trend_metrics=None,
                           evidence_summary: Optional[dict] = None,
                           recommended_actions: Optional[list] = None,
-                          has_prev_report: bool = False):
+                          has_prev_report: bool = False,
+                          stale_excluded_df: Optional[pd.DataFrame] = None,
+                          report_month: str = ''):
     ws = workbook.add_worksheet(sheet_name)
+    if not report_month:
+        report_month = datetime.now().strftime("%B %Y")
 
     # ── Format definitions ────────────────────────────────────────────────────
     title_fmt = workbook.add_format({
@@ -357,9 +362,8 @@ def build_overview_sheet(workbook, merged_df, filtered_df, triage_df, threshold,
 
     # ── Title row ─────────────────────────────────────────────────────────────
     title_text = (
-        f'{customer_name}  —  CVE Risk Dashboard  (Score ≥ {threshold})  —  '
-        f'{datetime.now().strftime("%B %Y")}' if customer_name else
-        f'CVE Risk Dashboard  (Score ≥ {threshold})  —  {datetime.now().strftime("%B %Y")}'
+        f'{customer_name}  —  CVE Risk Dashboard  (Score ≥ {threshold})  —  {report_month}' if customer_name else
+        f'CVE Risk Dashboard  (Score ≥ {threshold})  —  {report_month}'
     )
     ws.merge_range(0, 0, 0, 9, title_text, title_fmt)
     row_offset = 2
@@ -452,9 +456,6 @@ def build_overview_sheet(workbook, merged_df, filtered_df, triage_df, threshold,
     ws.write(r0+4, 4, 'Servers Impacted');  ws.write(r0+4, 5, f'{srv_aff} ({srv_pct})')
 
     # ── Patch Evidence Summary (plain counts — client-safe) ─────────────────
-    # The synthetic Patch Reliability Score (0-100) uses internally-defined
-    # weighted penalties that are not standards-based.  For client-facing
-    # reports, plain counts are clearer and more defensible.
     if evidence_summary:
         summ_fmt  = workbook.add_format({'bold': True, 'font_size': 10})
         summ_note = workbook.add_format({'italic': True, 'font_color': '#595959', 'font_size': 9})
@@ -466,10 +467,6 @@ def build_overview_sheet(workbook, merged_df, filtered_df, triage_df, threshold,
         ws.write(sr, 7, 'See Patch Evidence Notes sheet for per-device detail', summ_note)
         ws.set_column('H:H', 48)
 
-    # ── N-able Patch Report note — Pending ≠ Installed ───────────────────────
-    # This note addresses a common source of confusion: the "Discovered / Install
-    # Date" column in the patch report has different meanings depending on Status.
-    # Surfacing it here prevents "why isn't this resolved?" questions.
     if evidence_summary:
         pending_note_fmt = workbook.add_format({
             'italic': True, 'font_color': '#7F6000', 'font_size': 8,
@@ -488,8 +485,6 @@ def build_overview_sheet(workbook, merged_df, filtered_df, triage_df, threshold,
         ws.set_row(pr + 1, 14)
         ws.set_row(pr + 2, 14)
 
-    # ── CVE Movement Context (only shown when trend data available) ────────────
-    # Answers the question "is this CVE count jump real risk or noise?"
     if trend_metrics:
         m = trend_metrics
         ctx_row = r0 + 6
@@ -508,10 +503,8 @@ def build_overview_sheet(workbook, merged_df, filtered_df, triage_df, threshold,
         prev_c = m['prev_cves']
         cur_c  = m['cur_cves']
 
-        # Scope-mismatch delta: snapshot counts full scope, movement counts common-product scope
-        # e.g. snapshot = 100, movement total = 99 → 1 CVE from new-product scope
-        scope_delta_cur  = cur_c  - (nc + pc)    # CVEs in snapshot but not movement (new products)
-        scope_delta_prev = prev_c - (rc + pc)    # CVEs in prev snapshot but not movement
+        scope_delta_cur  = cur_c  - (nc + pc)
+        scope_delta_prev = prev_c - (rc + pc)
 
         ws.merge_range(ctx_row, 4, ctx_row, 6,
                        f'CVE Change Context  ({prev_c} last period → {cur_c} this period)',
@@ -528,7 +521,6 @@ def build_overview_sheet(workbook, merged_df, filtered_df, triage_df, threshold,
                  f'✓  {nc} new + {pc} persisting = {nc+pc} in scope this period  |  '
                  f'{rc} resolved + {pc} persisting = {rc+pc} in scope previous period',
                  note_ctx)
-        # Scope mismatch note — only shown when snapshot ≠ movement totals
         if scope_delta_cur > 0 or scope_delta_prev > 0:
             parts = []
             if scope_delta_cur  > 0: parts.append(f'{scope_delta_cur} this period')
@@ -540,7 +532,6 @@ def build_overview_sheet(workbook, merged_df, filtered_df, triage_df, threshold,
         ws.set_column('E:E', 48)
         ws.set_column('F:G', 38)
 
-    # ── Fix 1: Severity counts use filtered_df (score ≥ threshold) only ──────
     row_t = r0 + 7
     ws.write(row_t, 0, f'Unique CVEs by Severity (Score {threshold}+)', header_fmt)
     sev_counts = filtered_df.drop_duplicates(subset=['Vulnerability Name'])['Vulnerability Severity'].value_counts()
@@ -548,12 +539,11 @@ def build_overview_sheet(workbook, merged_df, filtered_df, triage_df, threshold,
     for sev, cnt in sev_counts.items():
         ws.write(r, 0, str(sev)); ws.write(r, 1, cnt); r += 1
 
-    # ── Fix 2: Top 10 Products — Unique Devices + Unique CVEs columns ─────────
     row_p = max(r + 2, r0 + 14)
     hdr_small = workbook.add_format({'bold': True, 'bg_color': '#D9D9D9', 'border': 1})
     ws.write(row_p, 0, f'Top 10 Products (Score {threshold}+)', header_fmt)
-    ws.write(row_p, 1, 'Unique Devices', hdr_small)   # devices with ≥1 CVE for this product
-    ws.write(row_p, 2, 'Unique CVE Types', hdr_small) # distinct CVE IDs for this product
+    ws.write(row_p, 1, 'Unique Devices', hdr_small)
+    ws.write(row_p, 2, 'Unique CVE Types', hdr_small)
 
     prod_devices = triage_df.groupby('Base Product')['Name'].nunique()
     prod_cves    = triage_df.groupby('Base Product')['Vulnerability Name'].nunique()
@@ -581,22 +571,15 @@ def build_overview_sheet(workbook, merged_df, filtered_df, triage_df, threshold,
     ws.write(row_r, 4, f'Resolution Status (Score {threshold}+)', header_fmt)
     sub_grey = workbook.add_format({'font_color': '#595959', 'indent': 1})
     note_fmt_small = workbook.add_format({'font_color': '#595959', 'italic': True, 'font_size': 9})
-    # Compute unique pair counts directly from triage_df and patch data.
-    # COUNTIF across product sheets inflates counts when one CVE affects
-    # multiple products on the same device (it appears in each product sheet
-    # and is counted once per sheet, not once per unique device-CVE pair).
-    # Using the pre-computed sets gives the correct deduplicated totals.
     from data_pipeline import normalize_device_name, extract_cve_id
     triage_pairs_set = set(zip(
         triage_df['Name'].apply(normalize_device_name),
         triage_df['Vulnerability Name'].apply(extract_cve_id),
     ))
     n_total    = len(triage_pairs_set)
-    # patch_confirmed_count is already deduplicated (intersection with triage)
-    n_resolved = patch_confirmed_count  # patch-confirmed ☑ (unique pairs)
+    n_resolved = patch_confirmed_count
     n_unres    = n_total - n_resolved
 
-    # Keep COUNTIF formula for live user editing feedback (shown alongside)
     if product_to_sheet:
         f_res   = ' + '.join([f"COUNTIF('{s}'!A:A, \"☑\")" for s in product_to_sheet.values()])
         f_unres = ' + '.join([f"COUNTIF('{s}'!A:A, \"☐\")" for s in product_to_sheet.values()])
@@ -612,13 +595,12 @@ def build_overview_sheet(workbook, merged_df, filtered_df, triage_df, threshold,
     ws.write(row_r + 3, 5, n_total)
     ws.write(row_r + 3, 6, f'— {triage_df["Name"].nunique()} unique devices,  '
                             f'{triage_df["Vulnerability Name"].nunique()} unique CVE types', note_fmt_small)
-    # Live checkbox tally (may count cross-product duplicates — use as tracking aid)
     if product_to_sheet:
         ws.write(row_r + 4, 4, '   ☑ ticked in sheets', sub_grey)
         ws.write_formula(row_r + 4, 5, f'={f_res}')
         ws.write(row_r + 4, 6, 'incl. cross-product duplicates — use Total above for reporting', note_fmt_small)
 
-    extra_rows = 4   # rows used so far
+    extra_rows = 4
     if patch_confirmed_count > 0:
         ws.write(row_r + 5, 4, '── Resolved breakdown ──', sub_grey)
         ws.write(row_r + 6, 4, '  Patch via RMM', sub_grey)
@@ -641,34 +623,40 @@ def build_overview_sheet(workbook, merged_df, filtered_df, triage_df, threshold,
 
     # Push "Devices Not Found in RMM" section below all resolution rows
     row_m = row_r + extra_rows + 2
-    ws.write(row_m, 4, f'Devices Not Found in RMM (Score {threshold}+, All Dates)', header_fmt)
+    stale_devs = stale_excluded_df['Name'].unique().tolist() if stale_excluded_df is not None else []
+    
+    ws.write(row_m, 4, f'Devices Not Found in RMM ({len(missing_devices)}) / Excluded Stale ({len(stale_devs)}) (Score {threshold}+)', header_fmt)
     ws.write(row_m, 5, 'Last Response', hdr_small)
     ws.write(row_m, 6, 'Days Since Last Response', hdr_small)
 
-    now = datetime.now()
     mi = row_m + 1
-    if not missing_devices:
-        ws.write(mi, 4, 'All devices synced')
+    if not missing_devices and not stale_devs:
+        ws.write(mi, 4, 'All devices synced and active')
     else:
         for dev in missing_devices:
-            # Get any last-response value for this device (may be a date or 'Not Found in RMM')
             dev_rows = filtered_df[filtered_df['Name'] == dev]
             lr_vals  = dev_rows['Last Response'].dropna().unique()
             lr_val   = lr_vals[0] if len(lr_vals) else 'Not Found in RMM'
+            
+            days_vals = dev_rows['Days Since Last Response'].dropna().unique() if 'Days Since Last Response' in dev_rows.columns else []
+            days_val = days_vals[0] if len(days_vals) else '—'
 
             ws.write(mi, 4, str(dev))
             ws.write(mi, 5, str(lr_val))
+            ws.write(mi, 6, str(days_val))
+            mi += 1
+            
+        for dev in stale_devs:
+            dev_rows = stale_excluded_df[stale_excluded_df['Name'] == dev]
+            lr_vals  = dev_rows['Last Response'].dropna().unique()
+            lr_val   = lr_vals[0] if len(lr_vals) else '—'
+            
+            days_vals = dev_rows['Days Since Last Response'].dropna().unique() if 'Days Since Last Response' in dev_rows.columns else []
+            days_val = days_vals[0] if len(days_vals) else '—'
 
-            # Calculate days since last response
-            if str(lr_val).strip() not in ('Not Found in RMM', 'N/A', ''):
-                try:
-                    lr_dt  = parse_last_response(lr_val)
-                    days   = (now - lr_dt).days
-                    ws.write(mi, 6, days if days >= 0 else '—')
-                except Exception:
-                    ws.write(mi, 6, '—')
-            else:
-                ws.write(mi, 6, '—')
+            ws.write(mi, 4, f"{dev} (Stale)")
+            ws.write(mi, 5, str(lr_val))
+            ws.write(mi, 6, str(days_val))
             mi += 1
 
     ws.set_column('A:A', 38)
@@ -680,7 +668,6 @@ def build_overview_sheet(workbook, merged_df, filtered_df, triage_df, threshold,
 def build_all_detections_sheet(writer, merged_df, link_fmt, missing_row_fmt):
     df = _drop_internal(merged_df)
     df['NVD'] = ''                       # placeholder; filled below with write_url
-    # DO NOT apply make_cve_org_link here — formula strings cache as 0 on disk
 
     cols = df.columns.tolist()
     if 'Device Type' in cols and 'Name' in cols:
@@ -694,7 +681,6 @@ def build_all_detections_sheet(writer, merged_df, link_fmt, missing_row_fmt):
     ws.autofilter(0, 0, len(df), len(df.columns) - 1)
     cl = df.columns.tolist()
 
-    # Write proper hyperlinks AFTER to_excel so display text is cached correctly
     if 'Vulnerability Name' in cl:
         vn_idx = cl.index('Vulnerability Name')
         ws.set_column(vn_idx, vn_idx, 25, link_fmt)
@@ -730,7 +716,7 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
 
     cols_order = ['Resolved', 'Vulnerability Name', 'Name', 'Device Type',
                   'Vulnerability Severity', 'Vulnerability Score', 'Risk Severity Index',
-                  'Has Known Exploit', 'CISA KEV', 'Last Response', 'Affected Products',
+                  'Has Known Exploit', 'CISA KEV', 'Last Response', 'Days Since Last Response', 'Affected Products',
                   'Baseline Compliance', 'NVD']
     for product, group in triage_df.groupby('Base Product'):
         sheet_name = product_to_sheet[product]
@@ -738,15 +724,7 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
         group = group.sort_values(
             by=['Vulnerability Score', '_Sort_Time', 'Name'], ascending=[False, False, True])
 
-        # Derive canonical product key for this sheet's product so the resolved
-        # lookup uses (device, cve, canonical_product) instead of (device, cve).
-        # This prevents Edge patch evidence bleeding into Chrome rows for the
-        # same CVE — a cross-product false-positive resolved tick.
         from data_pipeline import _detect_product as _dp_detect_prod
-        # Use raw Affected Products values (not the base product name) so that
-        # 'Microsoft Office 365' maps to canonical key 'office365', not 'office'.
-        # get_base_product() strips '365' as if it were a version suffix, which
-        # breaks the lookup for any product whose name ends in a number.
         _raw_pnames = group['Affected Products'].dropna().astype(str).unique().tolist()
         _sheet_pk = ''
         for _rpn in _raw_pnames:
@@ -760,13 +738,8 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
         def _resolved_value(row):
             nk = normalize_device_name(row['Name'])
             ck = extract_cve_id(row['Vulnerability Name'])
-            # Check product-scoped key first; fall back to product-free key
-            # for backwards compatibility when patch_resolved_pairs was built
-            # without product (e.g. loaded from an older dashboard workbook).
             if (nk, ck, _sheet_pk) in patch_resolved_pairs:
                 return '☑'
-            # If any 3-tuple key exists for (nk, ck) — new format present
-            # If only 2-tuple keys exist — old format, use old check
             if patch_resolved_pairs and len(next(iter(patch_resolved_pairs))) == 2:
                 return '☑' if (nk, ck) in patch_resolved_pairs else '☐'
             return '☐'
@@ -781,7 +754,6 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
         wb_ = writer.book
         ws.autofilter(0, 0, len(group), len(final_cols) - 1)
 
-        # Row formats — use style registry to avoid per-sheet format recreation
         styles_           = get_workbook_styles(wb_)
         patch_res_fmt     = styles_['row_blue']
         exploit_fmt       = wb_.add_format({'bg_color': '#FFE0CC'})  # orange — no registry entry
@@ -803,7 +775,6 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
             ws.data_validation(1, ri, len(group), ri, {'validate': 'list', 'source': ['☐', '☑']})
             ws.set_column(ri, ri, 10)
 
-        # Row highlights — priority: blue > orange > gap-category > white
         _TRUE_VALS = {'yes', 'true', '1', 'y'}
         for row_i, (_, row) in enumerate(group[final_cols].iterrows(), start=1):
             nk = normalize_device_name(str(row.get('Name', '')))
@@ -837,7 +808,6 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
 
         log.debug("Sheet '%s': %d rows written", sheet_name, len(group))
 
-        # ── Legend ───────────────────────────────────────────────────────────
         legend_row = len(group) + 3
         l_title = wb_.add_format({'bold': True, 'font_size': 9, 'bg_color': '#F2F2F2', 'border': 1})
         l_cell  = wb_.add_format({'font_size': 9, 'border': 1})
@@ -851,7 +821,6 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
             ('#D9F0F4', 'teal row',   'Patch installing — patch is in progress, re-check after next RMM sync'),
             ('#FFFFFF', 'white row',  'Unresolved — patch available but not yet applied'),
         ]
-        # Baseline note below legend
         ws.write(legend_row + len(legend_entries) + 2, 0,
                  'ℹ  Baseline Compliance column: shows whether the installed version meets the '
                  'current rolling product baseline (_baseline in config.json), '
@@ -875,7 +844,6 @@ def build_diagnostics_sheets(writer, diagnostics: dict) -> None:
     grn  = wb.add_format({'bg_color': '#E2EFDA'})
     note = wb.add_format({'italic': True, 'font_color': '#595959'})
 
-    # Colour per display label
     _LABEL_COLOUR = {
         'Patch required':                '#FCE4D6',   # red
         'Installed but still detected':  '#FCE4D6',   # red
@@ -885,10 +853,8 @@ def build_diagnostics_sheets(writer, diagnostics: dict) -> None:
         'Installed but version unknown': '#DEEAF1',   # blue
     }
 
-    # ── Patch Evidence Notes ──────────────────────────────────────────────────
     rc_df = diagnostics.get('root_cause_df', pd.DataFrame())
     if not rc_df.empty:
-        # Only write columns intended for stakeholder view
         _SHOW_COLS = ['Device', 'Product', 'CVE', 'Patch Match Result',
                       'Resolved', 'Patch Evidence Notes', 'Baseline Compliance',
                       'Recommended Steps']
@@ -912,7 +878,6 @@ def build_diagnostics_sheets(writer, diagnostics: dict) -> None:
                  'patch report correlation — not confirmed root cause.', note)
         log.debug("Patch Evidence Notes sheet: %d rows", len(out))
 
-    # ── Patch Lag ─────────────────────────────────────────────────────────────
     lag_df = diagnostics.get('patch_lag_df', pd.DataFrame())
     if not lag_df.empty:
         lag_df.to_excel(writer, sheet_name='Patch Lag', index=False)
@@ -927,7 +892,6 @@ def build_diagnostics_sheets(writer, diagnostics: dict) -> None:
         ws.write(len(lag_df) + 2, 0,
                  'Negative lag = patch installed before CVE was first detected.', note)
 
-    # ── Version Drift ─────────────────────────────────────────────────────────
     drift_df = diagnostics.get('version_drift_df', pd.DataFrame())
     if not drift_df.empty:
         drift_df.to_excel(writer, sheet_name='Version Drift', index=False)
@@ -938,7 +902,6 @@ def build_diagnostics_sheets(writer, diagnostics: dict) -> None:
             ws.set_row(i, None, red if spread >= 4 else amb if spread >= 2 else grn)
         ws.write(len(drift_df) + 2, 0,
                  'High distinct-version count = inconsistent update cadence across fleet.', note)
-        # Note products with no version data (patch tool not tracking them)
         no_data = diagnostics.get('version_drift_no_data', [])
         if no_data:
             ws.write(len(drift_df) + 4, 0,
@@ -947,7 +910,6 @@ def build_diagnostics_sheets(writer, diagnostics: dict) -> None:
                      f'Version drift cannot be assessed until they are tracked.',
                      wb.add_format({'italic': True, 'font_color': '#7F6000', 'text_wrap': True}))
     else:
-        # Still create the sheet with an explanation
         ws = writer.book.add_worksheet('Version Drift')
         no_data = diagnostics.get('version_drift_no_data', [])
         if no_data:
@@ -965,10 +927,6 @@ def build_patch_resolved_sheet(writer, patch_full_df: 'pd.DataFrame') -> None:
     """
     CVEs confirmed resolved via the patch report — patch installed, version
     compliant, install date post-dates first detection.
-
-    Available on every run where a patch report is loaded. Does not require
-    a previous dashboard (unlike the trend-based 'Resolved (Patch Confirmed)' sheet).
-    Written to the 'Patch Confirmed' sheet to avoid naming collision with the trend sheet.
     """
     import pandas as pd
 
@@ -985,7 +943,6 @@ def build_patch_resolved_sheet(writer, patch_full_df: 'pd.DataFrame') -> None:
                                'font_color': 'white', 'border': 1})
     note_fmt = wb.add_format({'italic': True, 'font_color': '#595959'})
 
-    # Compute lag days
     if 'Patch Install Date' in resolved.columns and 'First detected' in resolved.columns:
         idt = pd.to_datetime(resolved['Patch Install Date'], errors='coerce')
         fdt = pd.to_datetime(resolved['First detected'],    errors='coerce')
@@ -1024,7 +981,6 @@ def build_patch_resolved_sheet(writer, patch_full_df: 'pd.DataFrame') -> None:
     for i in range(1, len(out) + 1):
         ws.set_row(i, None, grn)
 
-    # Summary note
     note_row = len(out) + 2
     unique_cves     = out['Vulnerability Name'].nunique()
     unique_devices  = out['Name'].nunique()
@@ -1043,16 +999,6 @@ def build_patch_resolved_sheet(writer, patch_full_df: 'pd.DataFrame') -> None:
 
 def build_products_not_tracked_sheet(writer,
                                       patch_full_df: 'pd.DataFrame') -> None:
-    """
-    Products detected by N-able with unresolved CVEs where the device IS in the
-    patch report but this specific product is not being patched/tracked on it.
-
-    This means the product needs to be added to the RMM patch policy for those
-    devices — not a config.json issue, a patch scope issue.
-
-    Also flags products not in config.json product_map at all (no canonical key),
-    with a suggested entry to add.
-    """
     import pandas as pd, re
     from data_pipeline import get_base_product, _detect_product, _norm_text
 
@@ -1077,7 +1023,6 @@ def build_products_not_tracked_sheet(writer,
     unmanaged['_pk'] = unmanaged['Affected Products'].apply(
         lambda v: _detect_product(_norm_text(str(v))))
 
-    # Aggregate per base product
     agg = (unmanaged.groupby(['_bp', '_pk'])
            .agg(
                devices       = ('Name',               'nunique'),
@@ -1089,7 +1034,6 @@ def build_products_not_tracked_sheet(writer,
            .sort_values('devices', ascending=False)
            .reset_index(drop=True))
 
-    # Build suggested config.json entries
     def _suggest_entry(bp, pk):
         bp_clean = re.sub(r'\s+\d[\d.]+\s*$', '', str(bp).lower().strip())
         key      = pk if pk else bp_clean.replace(' ', '_')
@@ -1121,9 +1065,8 @@ def build_products_not_tracked_sheet(writer,
     ws.set_column('F:F', 45)   # Suggested entry
 
     for i, row in enumerate(out.itertuples(), start=1):
-        n = row._2  # Devices Affected
+        n = row._2
         ws.set_row(i, None, red if n >= 10 else amb)
-        # Code-style formatting for the suggested entry column
         ws.write(i, 5, row._6, code_fmt)
 
     note_row = len(out) + 2
@@ -1143,11 +1086,6 @@ def build_patch_failure_sheet(writer, failure_df: 'pd.DataFrame',
                               failure_lookup: dict,
                               cve_device_overlap: 'pd.DataFrame',
                               inventory_devices: 'set | None' = None) -> None:
-    """
-    inventory_devices: normalised device names from the RMM inventory.
-    If supplied, devices absent from the inventory are excluded — they are
-    decommissioned and patch failures on them are not actionable.
-    """
     import pandas as pd
     wb  = writer.book
     red = wb.add_format({'bg_color': '#FCE4D6'})
@@ -1156,9 +1094,6 @@ def build_patch_failure_sheet(writer, failure_df: 'pd.DataFrame',
     hdr = wb.add_format({'bold': True, 'bg_color': '#D9D9D9', 'border': 1})
     note_fmt = wb.add_format({'italic': True, 'font_color': '#595959'})
 
-    # ── Sheet 1: Device failure summary ──────────────────────────────────────
-    # Filter to active (inventoried) devices only — decommissioned devices
-    # appear in patch reports but are not actionable.
     active_lookup = failure_lookup
     excluded_count = 0
     if inventory_devices:
@@ -1191,12 +1126,10 @@ def build_patch_failure_sheet(writer, failure_df: 'pd.DataFrame',
     ws.set_column('A:A', 26); ws.set_column('D:D', 30)
     ws.set_column('E:E', 55); ws.set_column('F:F', 55)
 
-    # Colour by failure count severity
     for i, row in enumerate(rows, start=1):
         fc = row['Total Failures']
         ws.set_row(i, None, red if fc >= 20 else amb if fc >= 5 else grn)
 
-    # Category totals (active devices only)
     active_devices_set = set(active_lookup.keys())
     active_fail = failure_df[failure_df['_device_norm'].isin(active_devices_set)]
     cat_totals = active_fail['_failure_cat'].value_counts()
@@ -1211,7 +1144,6 @@ def build_patch_failure_sheet(writer, failure_df: 'pd.DataFrame',
                  f'(decommissioned)',
                  wb.add_format({'italic': True, 'font_color': '#595959'}))
 
-    # ── CVEs on failing devices ───────────────────────────────────────────────
     if not cve_device_overlap.empty:
         out_cols = [c for c in ['Name', 'Vulnerability Name', 'Vulnerability Score',
                                 'Affected Products', 'Has Known Exploit']
@@ -1234,29 +1166,26 @@ def build_patch_failure_sheet(writer, failure_df: 'pd.DataFrame',
 def build_stale_excluded_sheet(writer, stale_df) -> None:
     if stale_df.empty:
         return
-    df = stale_df[['Name', 'Last Response', 'Device Type']]\
-           .drop_duplicates(subset=['Name']).copy()
+    cols_to_keep = ['Name', 'Last Response', 'Days Since Last Response', 'Device Type']
+    cols_present = [c for c in cols_to_keep if c in stale_df.columns]
+    df = stale_df[cols_present].drop_duplicates(subset=['Name']).copy()
     df = df.sort_values('Last Response').rename(columns={'Name': 'Device Name'})
     df.to_excel(writer, sheet_name='Stale Excluded Devices', index=False)
     ws = writer.sheets['Stale Excluded Devices']
-    ws.set_column('A:A', 35); ws.set_column('B:B', 25); ws.set_column('C:C', 20)
+    ws.set_column('A:A', 35); ws.set_column('B:B', 25); ws.set_column('C:C', 25); ws.set_column('D:D', 20)
     ws.autofilter(0, 0, len(df), len(df.columns) - 1)
 
 
 def build_client_summary_sheet(workbook, filtered_df, trend_data=None, customer_name='',
                                cutoff_date=None, stale_excluded_df=None,
-                               not_in_rmm_count=0, not_in_rmm_cve_count=0):
+                               not_in_rmm_count=0, not_in_rmm_cve_count=0,
+                               report_month=''):
     """
     Client-facing summary sheet — first sheet in the workbook.
-
-    Contains:
-      - Key metrics table (total rows, unique CVEs, CVSS 9+ counts)
-      - CVSS score split table
-      - Vulnerability Distribution pie chart (CVSS score spread)
-      - Patching Effort bar chart (detections by CVSS score)
-      - Month-over-month patching progress table + line chart (when trend available)
     """
     ws = workbook.add_worksheet('Client Summary')
+    if not report_month:
+        report_month = datetime.now().strftime("%B %Y")
 
     # ── Formats ───────────────────────────────────────────────────────────────
     title_fmt  = workbook.add_format({'bold': True, 'font_size': 15,
@@ -1290,7 +1219,7 @@ def build_client_summary_sheet(workbook, filtered_df, trend_data=None, customer_
     title_text = (f'{customer_name}  —  ' if customer_name else '') + 'CVE Risk Exposure Summary'
     ws.merge_range('A1:D1', title_text, title_fmt)
     ws.set_row(0, 28)
-    ws.write('A2', f'Generated: {datetime.now().strftime("%d %B %Y")}', note_fmt)
+    ws.write('A2', f'Report Month: {report_month}  |  Generated: {datetime.now().strftime("%d %b %Y")}', workbook.add_format({'italic': True, 'font_color': '#595959', 'font_size': 9}))
 
     # ── Compute metrics ───────────────────────────────────────────────────────
     total_rows      = len(filtered_df)
@@ -1303,10 +1232,10 @@ def build_client_summary_sheet(workbook, filtered_df, trend_data=None, customer_
     crit_cves = int(filtered_df.loc[crit_mask, 'Vulnerability Name'].nunique()) if score_col and 'Vulnerability Name' in filtered_df.columns else unique_cves
 
     exploit_col = 'Has Known Exploit' if 'Has Known Exploit' in filtered_df.columns else None
-    exploit_count = int((filtered_df[exploit_col] == True).sum()) if exploit_col else 0  # noqa: E712
+    exploit_count = int((filtered_df[exploit_col] == True).sum()) if exploit_col else 0
 
     kev_col = 'CISA KEV' if 'CISA KEV' in filtered_df.columns else None
-    kev_count = int((filtered_df[kev_col] == True).sum()) if kev_col else 0  # noqa: E712
+    kev_count = int((filtered_df[kev_col] == True).sum()) if kev_col else 0
 
     device_type_col = 'Device Type' if 'Device Type' in filtered_df.columns else None
     server_count = 0

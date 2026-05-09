@@ -660,6 +660,29 @@ def merge_data(df_vuln, df_rmm, skip_rmm, exclude_missing_rmm=True):
                 _stale_mask = merged['_Sort_Time'] <= _epoch
                 if not _stale_mask.any():
                     break
+                    
+    now_ts = pd.Timestamp.now()
+    def _calc_days_from_lr(val):
+        if str(val).strip() in ('Not Found in RMM', 'N/A', ''):
+            return '—'
+        dt = parse_last_response(val)
+        if pd.isna(dt) or dt <= pd.to_datetime('1900-01-01'):
+            return '—'
+        if dt.tzinfo is not None:
+            dt = dt.tz_localize(None)
+        days = (now_ts - dt).days
+        return days if days >= 0 else 0
+
+    merged['Days Since Last Response'] = merged['Last Response'].apply(_calc_days_from_lr)
+    
+    # Reorder column so it always sits natively beside "Last Response"
+    cols = merged.columns.tolist()
+    if 'Days Since Last Response' in cols:
+        cols.remove('Days Since Last Response')
+        lr_idx = cols.index('Last Response') if 'Last Response' in cols else len(cols)
+        cols.insert(lr_idx + 1, 'Days Since Last Response')
+        merged = merged[cols]
+
     return merged
 
 

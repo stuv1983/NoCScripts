@@ -42,12 +42,6 @@ log = logging.getLogger(__name__)
 
 
 def _try_sync_baselines() -> None:
-    """
-    Refresh _baseline values in config.json from vendor APIs.
-    Only called when request.sync_baselines is True (opt-in).
-    Updates FIXED_VERSION_RULES in-place so this run uses the fresh baselines.
-    Never raises — a sync failure must not block the dashboard run.
-    """
     try:
         from version_sync import sync_baselines
         updated = sync_baselines()
@@ -66,13 +60,8 @@ def _try_sync_baselines() -> None:
         log.debug("Baseline sync skipped: %s", exc)
 
 
-# ==============================================================================
-# REQUEST / RESULT TYPES
-# ==============================================================================
-
 @dataclass
 class DashboardRequest:
-    """All inputs needed to produce one dashboard workbook."""
     vuln_path:            str
     output_path:          str
     rmm_path:             Optional[str]  = None
@@ -88,35 +77,21 @@ class DashboardRequest:
     show_all_dates:       bool           = False
     sync_baselines:       bool           = False
     exclude_missing_rmm:  bool           = True
-
+    report_month:         str            = ''
 
 @dataclass
 class DashboardResult:
-    """Outcome returned to the caller (GUI or CLI)."""
     success:          bool
     output_path:      str             = ''
     message:          str             = ''
-    trend_summary:    Optional[dict]  = None  # subset of trend metrics for display
+    trend_summary:    Optional[dict]  = None
     warnings:         list            = field(default_factory=list)
 
+def _config_health_check(cfg: dict) -> list[str]:
+    import re as _re
 
-# ==============================================================================
-# MAIN ENTRY POINT
-# ==============================================================================
 
 def _config_health_check(cfg: dict) -> list[str]:
-    """
-    Pre-flight validation of config.json.  Returns a list of warning strings.
-    Non-fatal — warnings are surfaced in the workbook and logs but never block
-    the run.  Hard errors (missing config, empty product_map) are handled
-    earlier by config.py.
-
-    Checks:
-      1. No duplicate product_map keys
-      2. No fixed_version_rules product missing from product_map
-      3. All version strings are parseable
-      4. No Chrome version stored under Edge canonical key (or vice versa)
-    """
     import re as _re
     _VER_RE = _re.compile(r'^\d+(?:\.\d+){1,5}$')
 
@@ -124,18 +99,14 @@ def _config_health_check(cfg: dict) -> list[str]:
     pm     = cfg.get('product_map', [])
     fvr    = cfg.get('fixed_version_rules', {})
 
-    # 1. Duplicate product_map keys
     seen_keys: dict[str, int] = {}
     for k, _ in pm:
         kl = str(k).lower()
         seen_keys[kl] = seen_keys.get(kl, 0) + 1
     dupes = [k for k, n in seen_keys.items() if n > 1]
     if dupes:
-        issues.append(
-            f"config.json: duplicate product_map key(s): {', '.join(dupes[:5])}"
-        )
+        issues.append(f"config.json: duplicate product_map key(s): {', '.join(dupes[:5])}")
 
-    # 2. fixed_version_rules product not in product_map
     pm_values = {str(v).lower() for _, v in pm}
     for product in fvr:
         if product.startswith('_'):
@@ -146,7 +117,6 @@ def _config_health_check(cfg: dict) -> list[str]:
                 f"product_map entry — version rules will never be applied"
             )
 
-    # 3. Unparseable version strings
     for product, rules in fvr.items():
         if not isinstance(rules, dict):
             continue
@@ -166,11 +136,6 @@ def _config_health_check(cfg: dict) -> list[str]:
                         f"= {ver_str!r} is not a parseable version"
                     )
 
-    # 4. Chrome versions in Edge rules or vice versa
-    # Heuristic: Chrome versions have 4 dotted parts (major.0.build.patch)
-    # Edge versions also have 4 parts but different build numbers.
-    # Flag if the numeric 3rd segment (build) is identical — that would mean
-    # a Chrome version was copy-pasted into the edge rules.
     chrome_rules = fvr.get('chrome', {})
     edge_rules   = fvr.get('edge', {})
     for cve_id in set(chrome_rules) & set(edge_rules):
@@ -194,19 +159,11 @@ def _config_health_check(cfg: dict) -> list[str]:
 
 
 def run(request: DashboardRequest) -> DashboardResult:
-    """
-    Execute the full dashboard pipeline for one request.
-
-    Always returns a DashboardResult — never raises to the caller.
-    Errors are captured into result.success=False and result.message.
-    Warnings are non-fatal issues logged and collected in result.warnings.
-    """
     warnings: list[str] = []
 
     try:
         log.info("Dashboard run started — output: %s", request.output_path)
 
-        # Pre-flight config health check — non-fatal, warnings surfaced in workbook
         import json as _json
         try:
             with open(Path(__file__).parent / 'config.json', encoding='utf-8') as _fh:
@@ -218,24 +175,17 @@ def run(request: DashboardRequest) -> DashboardResult:
             log.warning("Config health check failed: %s", _e)
             config_issues = []
 
-        # Refresh version baselines from vendor APIs (only when explicitly requested)
         if request.sync_baselines:
             _try_sync_baselines()
 
-        # ── Load & merge ──────────────────────────────────────────────────────
         log.info("Loading vulnerability data: %s", request.vuln_path)
         df_vuln = load_vulnerability_data(request.vuln_path)
         log.info("  %d rows loaded", len(df_vuln))
 
-        # Auto-enrich fixed_version_rules for any CVE not yet in config.json.
-        # config.json is the persistent cache — each CVE is only looked up once.
-        # After the first run its version data is saved and reused every time.
         try:
             from cve_lookup import enrich_from_detections
             enriched = enrich_from_detections(df_vuln)
             if enriched:
-                # Update FIXED_VERSION_RULES in-place so this run uses the
-                # freshly added version data — no module reload needed
                 import json as _json
                 cfg_path = str(Path(__file__).parent / 'config.json')
                 with open(cfg_path, encoding='utf-8') as _fh:
@@ -260,7 +210,9 @@ def run(request: DashboardRequest) -> DashboardResult:
         stale_excluded = pd.DataFrame()
 
         if not request.show_all_dates and request.cutoff_date:
-            cutoff = pd.to_datetime(request.cutoff_date)
+            cutoff = pd.to_datetime(request.cutoff_date, dayfirst=True, errors='coerce')
+            if pd.isna(cutoff):
+                cutoff = pd.to_datetime('1900-01-01')
             high   = merged_df[merged_df['Vulnerability Score'] >= request.threshold]
             stale_excluded = high[
                 (high['_Sort_Time'] < cutoff) &
@@ -299,7 +251,11 @@ def run(request: DashboardRequest) -> DashboardResult:
             request.threshold, len(filtered_df), len(triage_df), not_in_rmm,
         )
 
-        overview_sheet_name = datetime.now().strftime('%B') + ' Detections'
+        # ── Dynamic Report Month Naming ──
+        report_month_val = request.report_month if request.report_month else datetime.now().strftime('%B %Y')
+        report_month_name = report_month_val.split()[0] if ' ' in report_month_val else report_month_val
+        overview_sheet_name = f"{report_month_name} Detections"
+        
         reserved = {
             'trend summary', overview_sheet_name.lower(), 'all detections', 'raw data',
             'stale excluded devices', 'new this month', 'resolved', 'persisting cves',
@@ -311,7 +267,6 @@ def run(request: DashboardRequest) -> DashboardResult:
         for product, _ in triage_df.groupby('Base Product'):
             product_to_sheet[product] = clean_sheet_name(product, used_names)
 
-        # ── Optional: patch match ─────────────────────────────────────────────
         patch_data = None
         if request.include_patch and request.patch_path:
             log.info("Running patch match: %s", request.patch_path)
@@ -320,7 +275,6 @@ def run(request: DashboardRequest) -> DashboardResult:
             patch_data = (p_ov, p_full, p_raw, tot_r, filt_r)
             log.info("  Patch match: %d total rows, %d above threshold", tot_r, filt_r)
 
-        # ── Optional: trend comparison ────────────────────────────────────────
         trend_data       = None
         prev_report_name = ''
         if request.include_trend and request.prev_report_path:
@@ -337,7 +291,6 @@ def run(request: DashboardRequest) -> DashboardResult:
                 m['new_cve_count'], m['resolved_cve_count'], m['persisting_cve_count'],
             )
 
-        # ── Customer name ─────────────────────────────────────────────────────
         customer_name = ''
         for col in ('Customer', 'Customer Name', 'Client', 'Client Name'):
             if col in merged_df.columns:
@@ -347,8 +300,7 @@ def run(request: DashboardRequest) -> DashboardResult:
                     customer_name = vals.iloc[0]
                     break
 
-        # ── Classify patch gaps (explicit yellow-state categories) ────────────
-        patch_resolved_pairs: Set[Tuple[str, str, str]] = set()  # (device, cve, canonical_product)
+        patch_resolved_pairs: Set[Tuple[str, str, str]] = set() 
         patch_gap_pairs:      dict[Tuple[str, str], str] = {}
         diagnostics: dict = {'patch_lag_df': pd.DataFrame(),
                              'version_drift_df': pd.DataFrame(),
@@ -361,10 +313,6 @@ def run(request: DashboardRequest) -> DashboardResult:
 
             if 'Patch Evidence Status' in p_full.columns:
                 confirmed = p_full[p_full['Patch Evidence Status'] == 'Patch confirmed - pending rescan']
-                # Key is (device, cve, canonical_product) so Edge patch evidence
-                # cannot bleed into Chrome product sheet rows for the same CVE.
-                # _cascade_pk carries the canonical product key (e.g. 'edge', 'chrome').
-                # Fall back to Affected Products if _cascade_pk is absent.
                 if '_cascade_pk' in confirmed.columns:
                     pk_col = confirmed['_cascade_pk'].astype(str)
                 else:
@@ -377,12 +325,10 @@ def run(request: DashboardRequest) -> DashboardResult:
                 ))
                 log.info("Patch-confirmed resolved pairs: %d", len(patch_resolved_pairs))
 
-            # Root cause per row — drives both highlight colour and diagnostics sheet
             p_full['_root_cause'] = p_full.apply(classify_root_cause, axis=1)
             for _, row in p_full[p_full['_root_cause'].notna()].iterrows():
                 patch_gap_pairs[(row['_nk'], row['_ck'])] = row['_root_cause']
 
-            # Summarise gaps as warnings
             cause_counts: dict[str, int] = {}
             for c in patch_gap_pairs.values():
                 cause_counts[c] = cause_counts.get(c, 0) + 1
@@ -391,7 +337,6 @@ def run(request: DashboardRequest) -> DashboardResult:
                 log.warning(w)
                 warnings.append(w)
 
-            # Full diagnostics (lag, drift, root cause table)
             product_rules = FIXED_VERSION_RULES
             diagnostics = compute_patch_diagnostics(
                 patch_data[1], product_rules,
@@ -407,9 +352,6 @@ def run(request: DashboardRequest) -> DashboardResult:
                         f"see 'Patch Evidence Notes' sheet"
                     )
 
-        # ── Inject raw-data RESOLVED rows into patch_resolved_pairs ─────────────
-        # Any N-able Status=RESOLVED row is treated as confirmed regardless of
-        # patch-report matching, so product sheets show ☑ and Resolved sheet is complete.
         _status_col_inj = ('Threat Status' if 'Threat Status' in merged_df.columns
                            else 'Status'   if 'Status'        in merged_df.columns
                            else None)
@@ -456,12 +398,10 @@ def run(request: DashboardRequest) -> DashboardResult:
             except Exception as exc:
                 log.warning("Could not compute re-detected count: %s", exc)
 
-        # Initialise failure_df before workbook write block so all branches can reference it
         failure_df     = None
         failure_lookup = {}
         failure_devices: set = set()
 
-        # ── Load failure report early (before workbook block) ─────────────────
         if request.include_failure_report and request.failure_report_path:
             try:
                 log.info("Loading patch failure report: %s", request.failure_report_path)
@@ -472,7 +412,6 @@ def run(request: DashboardRequest) -> DashboardResult:
                 log.warning("Could not process patch failure report: %s", exc)
                 warnings.append(f"Could not process patch failure report: {exc}")
 
-        # ── Write workbook ────────────────────────────────────────────────────
         log.info("Writing workbook: %s", request.output_path)
         with pd.ExcelWriter(request.output_path, engine='xlsxwriter') as writer:
             wb = writer.book
@@ -481,8 +420,6 @@ def run(request: DashboardRequest) -> DashboardResult:
             header_fmt = styles['header']
             miss_fmt   = styles['row_missing']
 
-            # ── Sheet 1: Client Summary (always first) ────────────────────────
-            # Compute not-in-RMM CVE detection row count for the exclusion table
             _not_in_rmm_cve_rows = int(
                 len(filtered_df[filtered_df['Last Response'] == 'Not Found in RMM'])
             ) if 'Last Response' in filtered_df.columns else 0
@@ -495,6 +432,7 @@ def run(request: DashboardRequest) -> DashboardResult:
                 stale_excluded_df=stale_excluded if not stale_excluded.empty else None,
                 not_in_rmm_count=not_in_rmm,
                 not_in_rmm_cve_count=_not_in_rmm_cve_rows,
+                report_month=report_month_val,
             )
 
             if trend_data:
@@ -513,6 +451,8 @@ def run(request: DashboardRequest) -> DashboardResult:
                 evidence_summary=diagnostics.get('evidence_summary'),
                 recommended_actions=diagnostics.get('recommended_actions'),
                 has_prev_report=trend_data is not None,
+                stale_excluded_df=stale_excluded if not stale_excluded.empty else None,
+                report_month=report_month_val,
             )
 
             if trend_data:
@@ -525,14 +465,11 @@ def run(request: DashboardRequest) -> DashboardResult:
 
             if trend_data:
                 build_trend_detail_sheets(writer, wb, trend_data, link_fmt,
-                                          sheets_subset={'Resolved (Patch Confirmed)'})
-
-            # All Detections sheet removed — redundant with product sheets + Raw Data
+                                          sheets_subset={'Resolved'})
 
             if not stale_excluded.empty:
                 build_stale_excluded_sheet(writer, stale_excluded)
 
-            # Build raw_resolved_df for augmenting the Resolved sheet
             _status_col_wb = ('Threat Status' if 'Threat Status' in merged_df.columns
                               else 'Status'   if 'Status'        in merged_df.columns
                               else None)
@@ -545,8 +482,6 @@ def run(request: DashboardRequest) -> DashboardResult:
             if patch_data:
                 build_patch_sheets(writer, patch_data[0], patch_data[1], patch_data[2])
 
-                # Augment patch_full_df with raw RESOLVED rows so Resolved (Patch Confirmed)
-                # contains ALL resolved items — not just patch-report confirmed ones.
                 _patch_full_aug = patch_data[1].copy()
                 if not _raw_resolved_df.empty:
                     _raw_for_sheet = _raw_resolved_df.copy()
@@ -562,18 +497,15 @@ def run(request: DashboardRequest) -> DashboardResult:
                        if isinstance(diagnostics[k], pd.DataFrame)):
                     build_diagnostics_sheets(writer, diagnostics)
 
-                # Products in CVE data, device in patch report, but product not tracked
                 build_products_not_tracked_sheet(writer, patch_data[1])
 
             elif not _raw_resolved_df.empty:
-                # No patch report but raw RESOLVED rows exist — still write Resolved sheet
                 _raw_for_sheet2 = _raw_resolved_df.copy()
                 _raw_for_sheet2['Patch Evidence Status'] = 'Patch confirmed - pending rescan'
                 if 'Patch Match Result' not in _raw_for_sheet2.columns:
                     _raw_for_sheet2['Patch Match Result'] = 'Resolved in N-able (Status=RESOLVED)'
                 build_patch_resolved_sheet(writer, _raw_for_sheet2)
 
-            # ── Write patch failure sheets (data already loaded above) ─────────
             if failure_df is not None and failure_lookup:
                 inventory_devices = (
                     set(df_rmm['Device_Join'].unique()) if df_rmm is not None else None
@@ -583,7 +515,6 @@ def run(request: DashboardRequest) -> DashboardResult:
                 ].copy()
                 build_patch_failure_sheet(writer, failure_df, failure_lookup,
                                           cve_overlap, inventory_devices=inventory_devices)
-                # Surface in warnings
                 for dev, info in sorted(failure_lookup.items(),
                                         key=lambda x: -x[1]['failure_count'])[:3]:
                     warnings.append(
@@ -597,12 +528,10 @@ def run(request: DashboardRequest) -> DashboardResult:
                         f"actively failing — see 'Patch Failures' sheet"
                     )
 
-            # ── Raw Data last ─────────────────────────────────────────────────
             build_raw_data_sheet(writer, raw_df)
 
         log.info("Workbook written successfully")
 
-        # ── Save structured snapshot ──────────────────────────────────────────
         rc_summary: dict[str, int] = {}
         rc_df = diagnostics.get('root_cause_df', pd.DataFrame())
         if not rc_df.empty and 'Patch Evidence Notes' in rc_df.columns:
