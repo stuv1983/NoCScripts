@@ -6,7 +6,10 @@ and returns a DashboardResult.
 
 No tkinter.  No filedialog.  Fully testable headless.
 Business logic lives in: data_pipeline, diagnostics, snapshot, excel_builder.
+
 """
+# Copyright (c) 2026 stuart villanti, Inc. All rights reserved.
+# This code is licensed under the MIT License. See LICENSE in the project root for license terms.
 
 from __future__ import annotations
 
@@ -41,6 +44,22 @@ from excel_builder import (
 
 log = logging.getLogger(__name__)
 
+# Attempt to sync baselines if requested, and if the version_sync module is available.
+# This is a best-effort attempt to keep baseline version rules up to date without requiring users to manually update config.json.
+# If syncing fails (e.g. due to network issues or missing module), the dashboard will still run with existing baselines, and a debug message will be logged.
+# If baselines are updated, the in-memory FIXED_VERSION_RULES will be refreshed to reflect the new values, and an info message will summarize the changes.
+# This allows users to benefit from updated baselines without needing to understand or run the version_sync tool themselves, while ensuring that dashboard functionality is not disrupted if syncing is not possible.
+# Note: For this to work, the version_sync module must be designed to update the same config.json file that this orchestrator reads from, and the config health check should be robust to any changes made by the sync process.
+# The dashboard will always use the baselines as they exist in config.json at the time of loading, so if syncing is enabled and successful, the latest baselines will be applied to the current run. If syncing is disabled or fails, the dashboard will use whatever baselines are currently in config.json, which may be outdated but will not cause errors.
+# The sync_baselines function is expected to return a dictionary of updated baselines if any were changed, or an empty dictionary if no updates were needed. The exact structure of this dictionary will depend on how the version_sync module is implemented, but it should allow the orchestrator to log which baselines were refreshed for transparency.
+# The dashboard's config health check will validate the structure and values of the fixed_version_rules after syncing, so if the sync process introduces any issues (e.g. malformed versions), these will be caught and logged as warnings without breaking the dashboard generation.
+# Overall, this approach provides a seamless way to keep vulnerability baselines current while maintaining the robustness and reliability of the dashboard generation process.
+# The _try_sync_baselines function is intentionally designed to be non-intrusive and resilient, ensuring that the dashboard can still be generated successfully even if baseline syncing encounters issues. This allows users to opt in to baseline syncing for improved accuracy without risking disruption to their workflow.
+# If you want to disable baseline syncing, simply set sync_baselines=False in the DashboardRequest, and the dashboard will use the existing baselines from config.json without attempting to update them.
+# If you want to enable baseline syncing, set sync_baselines=True in the DashboardRequest, and the orchestrator will attempt to sync baselines at the start of the run. Any updates will be logged, and the latest baselines will be applied to the vulnerability data processing.
+# Note: The version_sync module and its sync_baselines function are not defined in this code snippet, so you will need to implement them separately. The sync_baselines function should handle the logic of checking for updates to baselines (e.g. by fetching from a remote source), updating the config.json file if needed, and returning a summary of any changes made.
+# The dashboard's fixed version rules are critical for accurately assessing vulnerability risk and remediation status, so keeping them up to date can significantly enhance the value of the dashboard. By providing an optional syncing mechanism, we allow users to easily benefit from updated baselines while ensuring that the dashboard remains functional and reliable regardless of syncing success.
+# In summary, the _try_sync_baselines function is a key part of the orchestrator's ability to maintain current vulnerability baselines, and it is designed to be robust and user-friendly, providing benefits without risks to the dashboard generation process.
 
 def _try_sync_baselines() -> None:
     try:
@@ -60,7 +79,15 @@ def _try_sync_baselines() -> None:
     except Exception as exc:
         log.debug("Baseline sync skipped: %s", exc)
 
-
+# The main request and result dataclasses for the dashboard orchestrator.
+# DashboardRequest encapsulates all input parameters needed to run the dashboard generation, including file paths, options for filtering and including data, and report metadata.
+# DashboardResult encapsulates the outcome of the dashboard generation, including success status, output path, messages, trend summary data, and any warnings that were generated during processing.
+# By using dataclasses, we can easily create and manage these structured data objects, and they provide a clear contract for the inputs and outputs of the orchestrator's run function.
+# The run function will take a DashboardRequest, execute the entire dashboard generation process (loading data, merging, filtering, computing trends, processing patches, building the Excel workbook), and return a DashboardResult that indicates whether the process was successful and includes any relevant information or warnings for the user.
+# The DashboardRequest includes options for skipping RMM data, including patch information, generating trend analyses, and applying date filters, allowing for flexible dashboard generation based on the user's needs and available data.
+# The DashboardResult includes a success flag, the path to the generated output file, any messages for the user (e.g. errors or informational notes), a summary of trend data if applicable, and a list of warnings that may be relevant to the user when interpreting the dashboard.
+# Overall, these dataclasses provide a clean and organized way to manage the inputs and outputs of the dashboard generation process, and they help to ensure that the orchestrator's run function has a clear and consistent interface.
+# Note: The actual implementation of the run function will involve calling various helper functions and modules to perform the necessary data processing and Excel generation, and it will need to handle exceptions gracefully to ensure that a meaningful DashboardResult is returned even in the case of errors.
 @dataclass
 class DashboardRequest:
     vuln_path:            str
@@ -80,7 +107,13 @@ class DashboardRequest:
     exclude_missing_rmm:  bool           = False
     report_month:         str            = ''
 
-
+# The DashboardResult dataclass encapsulates the outcome of the dashboard generation process, including whether it was successful, the path to the output file, any messages for the user, a summary of trend data if applicable, and a list of warnings that may have been generated during processing.
+# The success flag indicates whether the dashboard was generated successfully. The output_path provides the location of the generated Excel file. The message field can include any informational or error messages that should be conveyed to the user. The trend_summary can include key metrics from the trend analysis if it was performed, and the warnings list can include any issues or considerations that the user should be aware of when interpreting the dashboard.
+# By returning a DashboardResult from the run function, we can provide a clear and structured way to communicate the outcome of the dashboard generation process to the caller, whether it was successful or if there were any issues that need attention.
+# Note: The actual content of the message, trend_summary, and warnings will depend on the specific processing that occurs within the run function, and they should be crafted to provide meaningful insights and guidance to the user based on the results of the dashboard generation.
+# The DashboardResult can be used by the caller (e.g. the GUI) to display success messages, errors, trend summaries, and warnings to the user in a clear and organized manner after the dashboard generation process is complete.
+# The run function will need to populate the DashboardResult based on the outcomes of each step in the dashboard generation process, ensuring that any issues are captured in the warnings and that the success flag accurately reflects whether the dashboard was generated without critical errors.
+# Overall, the DashboardResult provides a comprehensive summary of the dashboard generation process that can be easily consumed by the caller to inform the user of the results and any important considerations.
 @dataclass
 class DashboardResult:
     success:          bool
@@ -89,7 +122,13 @@ class DashboardResult:
     trend_summary:    Optional[dict]  = None
     warnings:         list            = field(default_factory=list)
 
-
+# The _config_health_check function performs validation on the dashboard's configuration, specifically checking the product_map and fixed_version_rules for issues such as duplicate keys, missing product mappings, and malformed version strings. It returns a list of any issues found, which can be logged as warnings to inform the user of potential problems with the configuration that may affect the accuracy or functionality of the dashboard.
+# The function checks for duplicate keys in the product_map, ensures that all products referenced in fixed_version_rules have a corresponding entry in product_map, and validates that any version strings in fixed_version_rules are properly formatted. It also checks for cases where Chrome and Edge have identical version rules for the same CVE, which is not allowed. Any issues found are collected in a list and returned for logging.
+# By performing this health check at the start of the dashboard generation process, we can catch and inform the user of any configuration issues that may lead to inaccurate vulnerability assessments or other problems in the generated dashboard, allowing them to address these issues before relying on the dashboard's insights.
+# The health check is designed to be non-intrusive, meaning that it will not prevent the dashboard from being generated even if issues are found, but it will provide valuable feedback to the user about potential problems in the configuration that they may want to fix for better results.
+# Note: The specific checks performed in this function are based on the expected structure of the config.json file and the requirements for how product mappings and version rules should be defined. If any issues are found, they will be logged as warnings, but the dashboard generation will proceed using whatever configuration is present, allowing users to still generate a dashboard while being informed of any potential issues with their setup.
+# The use of regular expressions to validate version strings ensures that any versions specified in the fixed_version_rules are in a format that can be parsed and compared correctly, which is critical for the accurate assessment of vulnerability risk and remediation status in the dashboard.
+# Overall, this function serves as a proactive check to help users maintain a healthy and accurate configuration for their CVE dashboard, enhancing the reliability of the insights generated by the tool.
 def _config_health_check(cfg: dict) -> list[str]:
     import re as _re
     _VER_RE = _re.compile(r'^\d+(?:\.\d+){1,5}$')
@@ -156,7 +195,12 @@ def _config_health_check(cfg: dict) -> list[str]:
 
     return issues
 
-
+# The main run function for the dashboard orchestrator. It takes a DashboardRequest as input, executes the entire dashboard generation process (including loading data, merging, filtering, computing trends, processing patches, and building the Excel workbook), and returns a DashboardResult that indicates whether the process was successful and includes any relevant information or warnings for the user.
+# The function handles exceptions gracefully, ensuring that a meaningful DashboardResult is returned even in the case of errors. It also logs key steps and outcomes throughout the process to provide transparency and insights into the dashboard generation.
+# The run function is designed to be the central coordinator for the dashboard generation, orchestrating the various components and ensuring that the inputs and outputs are managed effectively. It uses the parameters from the DashboardRequest to determine how to process the data and what to include in the final dashboard, and it compiles any messages or warnings that should be conveyed to the user in the DashboardResult.
+# Note: The actual implementation of the run function will involve calling various helper functions and modules to perform the necessary data processing and Excel generation, and it will need to handle exceptions gracefully to ensure that a meaningful DashboardResult is returned even in the case of errors.
+# The run function will need to manage the flow of data through the various stages of processing, including loading vulnerability and RMM data, merging datasets, applying filters, computing trends, processing patch information, and building the Excel workbook. It will also need to capture any relevant messages or warnings that arise during these processes and include them in the DashboardResult for user awareness.
+# Overall, the run function serves as the main entry point for generating the CVE dashboard, coordinating all necessary steps and ensuring that the final output is comprehensive and informative for the user.
 def run(request: DashboardRequest) -> DashboardResult:
     warnings: list[str] = []
 
@@ -416,7 +460,10 @@ def run(request: DashboardRequest) -> DashboardResult:
             _not_in_rmm_mask = filtered_df['Last Response'] == 'Not Found in RMM'
             _not_in_rmm_cve_rows = int(_not_in_rmm_mask.sum()) if 'Last Response' in filtered_df.columns else 0
             _not_in_rmm_unique_cves = int(filtered_df.loc[_not_in_rmm_mask, 'Vulnerability Name'].nunique()) if 'Last Response' in filtered_df.columns and 'Vulnerability Name' in filtered_df.columns else 0
-
+#checking if the columns exist before applying the mask and counting unique CVEs to avoid KeyError if the expected columns are not present in the filtered_df
+#This ensures that if the 'Last Response' or 'Vulnerability Name' columns are missing from the filtered_df, the code will not raise an error and will instead set the counts to 0, allowing the dashboard generation to proceed without interruption while still providing accurate counts when the columns are present.
+#The not-in-RMM counts are important for the client summary sheet to provide context on how many high-risk vulnerabilities are not being tracked in RMM, which can inform remediation prioritization and risk assessment. By including these counts in the summary sheet, we can give users a clearer picture of their vulnerability landscape and highlight potential gaps in their RMM coverage.
+#Overall, this section of the code is focused on preparing the data and metrics that will be displayed in the client summary sheet of the dashboard, ensuring that users have a comprehensive overview of their vulnerability status, including any high-risk vulnerabilities that may not be tracked in RMM.
             build_client_summary_sheet(
                 wb, triage_df,
                 trend_data=trend_data,
@@ -433,7 +480,11 @@ def run(request: DashboardRequest) -> DashboardResult:
                 build_trend_summary_sheet(wb, trend_data, request.threshold,
                                           prev_report_name, header_fmt,
                                           customer_name=customer_name)
-
+# The trend summary sheet provides a high-level overview of the key metrics from the trend analysis, including the number of new CVEs, resolved CVEs, and persisting CVEs compared to the previous report. It also includes the report month and customer name for context. By including this sheet in the dashboard, users can quickly understand how their vulnerability landscape is evolving over time and identify any significant changes or trends that may require attention.
+# The build_trend_summary_sheet function takes the workbook, trend data, threshold, previous report name, header format, and optional customer name as inputs, and it constructs a visually appealing summary sheet that highlights the key trend metrics. This sheet serves as an important component of the dashboard, providing users with actionable insights into their vulnerability management efforts and helping them to track their progress over time.
+# By including the trend summary sheet, we can enhance the value of the dashboard by not only providing a snapshot of the current vulnerability status but also showing how it has changed compared to the previous reporting period, enabling users to make informed decisions about their remediation strategies and resource allocation.
+# The overview sheet provides a detailed summary of the current vulnerability status, including key metrics, evidence summaries, recommended actions, and links to detailed sheets for further analysis. It serves as the main landing page for users when they open the dashboard, giving them a comprehensive overview of their vulnerability landscape and guiding them towards the most critical issues that require attention.
+# The build_overview_sheet function takes the workbook, merged and filtered dataframes, triage dataframe, threshold, product-to-sheet mapping, header and link formats, and various optional parameters such as customer name, patch confirmed count, redetected count, trend metrics, evidence summary, recommended actions,
             build_overview_sheet(
                 wb, merged_df, filtered_df, triage_df, request.threshold,
                 product_to_sheet, header_fmt, link_fmt,

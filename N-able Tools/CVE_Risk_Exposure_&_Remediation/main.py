@@ -175,17 +175,30 @@ def toggle_trend_state():
     prev_report_entry.config(state=state)
     prev_report_browse_btn.config(state=state)
 
-
+# Create the main window and all GUI components 
+# (labels, entries, buttons, checkboxes) with appropriate layout and styling.
+# Each "Browse" button calls select_file() with the corresponding StringVar to update the entry field.
+# The "Generate" button calls process_reports() to validate inputs and start the background processing thread.
+# Checkboxes toggle the state of related input fields (e.g. skipping RMM disables the RMM file input).
+# The background thread runs _run_in_thread(), which calls the orchestrator and then uses root.after() to update the GUI with results or errors once processing is complete.
+# No business logic or data processing should be done in this file - it should only handle the GUI and user interactions.
 root = tk.Tk()
 root.title("N-able CVE Dashboard & Triage Tool")
 root.geometry("570x830")
+# root.configure(bg="black")
+# root.iconbitmap("icon.ico")
 root.resizable(False, True)
-
+# Set a consistent font for all widgets
+default_font = ("Arial", 10)
+# style = ttk.Style(root)
+# style.configure("TLabel", font=default_font, background="black", foreground="white")
+# style.configure("TButton", font=default_font, background="#0078D7", foreground="white")   
 tk.Label(root, text="N-able CVE Dashboard & Triage Tool",
          font=("Arial", 13, "bold")).pack(pady=(12, 4))
 
 tk.Label(root, text="Vulnerability / CVE Report  (CSV or XLSX)",
          font=("Arial", 9, "bold")).pack(anchor="w", padx=14)
+
 vuln_var = tk.StringVar()
 vuln_entry = tk.Entry(root, textvariable=vuln_var, width=55, state="readonly")
 vuln_entry.pack(padx=14)
@@ -203,7 +216,17 @@ rmm_browse_btn.pack(side=tk.LEFT, padx=4)
 skip_rmm_var = tk.BooleanVar()
 tk.Checkbutton(root, text="Skip RMM (CVE export includes device info)",
                variable=skip_rmm_var, command=toggle_rmm_state).pack(anchor="w", padx=14)
-
+# By default, we expect RMM data to be included since it's needed for the most comprehensive analysis and remediation guidance.
+# If the user checks "Skip RMM", we disable the RMM file input since it's not needed. This allows users who only have a CVE report to still use the tool with limited functionality, while encouraging those with RMM data to include it for the best results.
+# Note: If "Skip RMM" is checked, the orchestrator should still be able to run and generate a dashboard, but it will not have device-specific insights or remediation steps that rely on RMM data. The CVE analysis will be based solely on the vulnerability report, and any sections of the dashboard that require RMM data should be hidden or show a message indicating that RMM data was not included.
+# This option is intended for users who may have a CVE report from a source other than RMM, or who want to test the tool without providing RMM data. However, for the most accurate and actionable dashboard, including RMM data is recommended.
+# The toggle_rmm_state() function will enable or disable the RMM file input fields based on the state of the "Skip RMM" checkbox. When "Skip RMM" is checked, the RMM entry and browse button will be disabled, and the background processing logic should be designed to handle the case where no RMM data is provided (e.g. by skipping any steps that require RMM data and adjusting the dashboard output accordingly).
+# This design allows for flexibility in how the tool can be used, while still guiding users towards providing the most comprehensive data for the best results.
+# The default state is to include RMM data, so the RMM file input is enabled by default. If the user decides to skip RMM, they can check the box and the input will be disabled to reflect that it's not needed.
+# The orchestrator should be designed to handle both cases (with or without RMM data) gracefully, ensuring that the tool remains functional and provides useful insights even if RMM data is not included, while still encouraging users to include it for the best possible analysis and remediation guidance.
+# The "Skip RMM" option is essentially a way to allow users to use the tool with just a CVE report, while making it clear that including RMM data will provide a richer and more actionable dashboard. The GUI should reflect this by enabling/disabling the RMM file input based on the state of the checkbox, and the background processing logic should be robust enough to handle either scenario without errors.
+# This approach provides flexibility for different user needs and data availability, while still promoting the inclusion of RMM data for the best results.
+# The toggle_rmm_state() function is a simple way to manage the state of the RMM file input fields based on the user's choice to include or skip RMM data. By default, the tool expects RMM data to be included for the most comprehensive analysis, but it can still function with just a CVE report if the user chooses to skip RMM. The GUI should make it clear that including RMM data is recommended for the best results, while still allowing users to proceed without it if necessary.
 score_frame = tk.Frame(root)
 score_frame.pack(anchor="w", padx=14, pady=(8, 0))
 tk.Label(score_frame, text="Minimum CVE Score:", font=("Arial", 9, "bold")).pack(side=tk.LEFT)
