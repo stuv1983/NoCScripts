@@ -33,6 +33,7 @@ from excel_builder import (
     build_trend_summary_sheet, build_trend_detail_sheets,
     build_overview_sheet, build_all_detections_sheet,
     build_product_sheets, build_stale_excluded_sheet,
+    build_stale_cves_sheet,
     build_raw_data_sheet, build_patch_sheets, build_diagnostics_sheets,
     build_patch_failure_sheet,
     build_products_not_tracked_sheet, build_patch_resolved_sheet,
@@ -79,6 +80,7 @@ class DashboardRequest:
     exclude_missing_rmm:  bool           = True
     report_month:         str            = ''
 
+
 @dataclass
 class DashboardResult:
     success:          bool
@@ -86,9 +88,6 @@ class DashboardResult:
     message:          str             = ''
     trend_summary:    Optional[dict]  = None
     warnings:         list            = field(default_factory=list)
-
-def _config_health_check(cfg: dict) -> list[str]:
-    import re as _re
 
 
 def _config_health_check(cfg: dict) -> list[str]:
@@ -251,13 +250,12 @@ def run(request: DashboardRequest) -> DashboardResult:
             request.threshold, len(filtered_df), len(triage_df), not_in_rmm,
         )
 
-        # ── Dynamic Report Month Naming ──
         report_month_val = request.report_month if request.report_month else datetime.now().strftime('%B %Y')
         report_month_name = report_month_val.split()[0] if ' ' in report_month_val else report_month_val
         overview_sheet_name = f"{report_month_name} Detections"
         
         reserved = {
-            'trend summary', overview_sheet_name.lower(), 'all detections', 'raw data',
+            "cves on stale devices", 'trend summary', overview_sheet_name.lower(), 'all detections', 'raw data',
             'stale excluded devices', 'new this month', 'resolved', 'persisting cves',
             'patch match overview', 'patch match full data', 'patch report (full)',
             'patch confirmed', 'resolved (patch confirmed)',
@@ -277,19 +275,30 @@ def run(request: DashboardRequest) -> DashboardResult:
 
         trend_data       = None
         prev_report_name = ''
+        redetected_count = 0
         if request.include_trend and request.prev_report_path:
             log.info("Loading previous report for trend: %s", request.prev_report_path)
             prev_df          = load_previous_report(request.prev_report_path)
             prev_report_name = Path(request.prev_report_path).name
             inventory_set    = (set(df_rmm['Device_Join'].unique())
                                 if df_rmm is not None else None)
+                                
+            stale_names = set(stale_excluded['Name'].apply(normalize_device_name)) if not stale_excluded.empty else set()
+            
             trend_data       = compute_trends(merged_df, prev_df, request.threshold,
-                                              inventory_devices=inventory_set)
+                                              inventory_devices=inventory_set,
+                                              stale_devices=stale_names)
             m = trend_data['metrics']
             log.info(
                 "Trend: %d new CVEs, %d resolved, %d persisting (common-product scope)",
                 m['new_cve_count'], m['resolved_cve_count'], m['persisting_cve_count'],
             )
+            
+            redetected_count = trend_data.get('redetected_count', 0)
+            if redetected_count > 0:
+                w = f"{redetected_count} CVE(s) manually marked resolved last report but re-detected this period"
+                log.warning(w)
+                warnings.append(w)
 
         customer_name = ''
         for col in ('Customer', 'Customer Name', 'Client', 'Client Name'):
@@ -381,23 +390,6 @@ def run(request: DashboardRequest) -> DashboardResult:
             ))
             patch_confirmed_count = len(patch_resolved_pairs & triage_keys)
 
-        redetected_count = 0
-        if trend_data and request.prev_report_path:
-            try:
-                xl_prev = pd.ExcelFile(request.prev_report_path)
-                if 'Resolved' in xl_prev.sheet_names:
-                    prev_res = xl_prev.parse('Resolved')
-                    if 'Vulnerability Name' in prev_res.columns:
-                        prev_res_cves  = set(prev_res['Vulnerability Name'].apply(extract_cve_id))
-                        cur_cves_scope = set(triage_df['Vulnerability Name'].apply(extract_cve_id))
-                        redetected_count = len(prev_res_cves & cur_cves_scope)
-                        if redetected_count:
-                            w = f"{redetected_count} CVE(s) resolved last period but re-detected this period"
-                            log.warning(w)
-                            warnings.append(w)
-            except Exception as exc:
-                log.warning("Could not compute re-detected count: %s", exc)
-
         failure_df     = None
         failure_lookup = {}
         failure_devices: set = set()
@@ -463,12 +455,21 @@ def run(request: DashboardRequest) -> DashboardResult:
                                   patch_resolved_pairs=patch_resolved_pairs,
                                   patch_gap_pairs=patch_gap_pairs)
 
-            if trend_data:
-                build_trend_detail_sheets(writer, wb, trend_data, link_fmt,
-                                          sheets_subset={'Resolved'})
-
             if not stale_excluded.empty:
                 build_stale_excluded_sheet(writer, stale_excluded)
+                
+                stale_device_names = stale_excluded['Name'].unique()
+                stale_raw_rows = raw_df[raw_df['Name'].isin(stale_device_names)].copy()
+                
+                _status_col_stale = ('Threat Status' if 'Threat Status' in stale_raw_rows.columns
+                                     else 'Status'   if 'Status'        in stale_raw_rows.columns
+                                     else None)
+                if _status_col_stale:
+                    stale_unresolved_cves = stale_raw_rows[stale_raw_rows[_status_col_stale].astype(str).str.strip().str.upper() == 'UNRESOLVED'].copy()
+                else:
+                    stale_unresolved_cves = stale_raw_rows.copy()
+                
+                build_stale_cves_sheet(writer, stale_unresolved_cves, link_fmt)
 
             _status_col_wb = ('Threat Status' if 'Threat Status' in merged_df.columns
                               else 'Status'   if 'Status'        in merged_df.columns

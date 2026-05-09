@@ -66,22 +66,12 @@ def classify_patch_gap(patch_match_result: str,
                        resolved: Optional[str] = None) -> Optional[str]:
     """
     Return the explicit gap category for a patch row, or None if no gap.
-
-    Categories:
-        coverage_gap         device not in the patch report at all
-        unmanaged_app        device present, product not tracked by patch tool
-        detection_mismatch   patch tool says installed but N-able still detects
-                             the CVE — scanner vs patch tool disagreement, OR
-                             the patch was applied before the CVE was first
-                             detected (pre-existing install, not a real fix)
     """
     pmr = str(patch_match_result).strip()
 
-    # No-match cases
     if pmr in _GAP_NO_MATCH:
         return _GAP_NO_MATCH[pmr]
 
-    # Matched + still unresolved → detection mismatch
     if pmr in _MATCHED_INSTALLED and str(resolved).strip() == 'Unresolved':
         return 'detection_mismatch'
 
@@ -103,13 +93,9 @@ def normalize_device_name(name: str) -> str:
 def _normalize_device_col(series: 'pd.Series') -> 'pd.Series':
     """
     Vectorised version of normalize_device_name for DataFrame columns.
-    Uses pandas str methods (C-level) instead of a Python-level apply loop.
-    Equivalent transformation: strip → upper → take last \\-segment → take first .-segment.
     """
     s = series.astype(str).str.strip().str.upper()
-    # split on backslash, take last part (handles DOMAIN\HOSTNAME)
     s = s.str.split('\\\\').str[-1]
-    # split on dot, take first part (handles FQDN)
     s = s.str.split('\\.').str[0]
     return s
 
@@ -191,16 +177,6 @@ def _norm_text(v):    return _NORM_CHARS.sub(' ', str(v).lower()).strip()
 _ARCH_TAG_RE = re.compile(r'[(](x64|x86|32[\-\s]?bit|64[\-\s]?bit)[)]', re.IGNORECASE)
 
 def _get_arch(text: str) -> str:
-    """
-    Extract the architecture tag from a product name or patch entry.
-    Returns 'x64', 'x86', or '' when no tag is present.
-
-    Examples:
-        'Mozilla Firefox (x64)'        → 'x64'
-        'Firefox (x86) 150.0.1'        → 'x86'
-        'Google Chrome'                → ''   (no tag — neutral)
-        'Microsoft Edge 80+'           → ''   (no tag — neutral)
-    """
     m = _ARCH_TAG_RE.search(str(text))
     if not m:
         return ''
@@ -254,25 +230,6 @@ def _make_excel_safe(df):
     return out
 
 def _resolve_fixed_version(row):
-    """
-    Return the CVE-specific minimum fixed version for a CVE+product combination.
-
-    Answers: "What is the minimum version that addresses THIS specific CVE?"
-
-    Priority:
-      1. 'Fixed Version' column in the CVE workbook (explicit override)
-      2. CVE-specific rule in config.json fixed_version_rules
-      3. Empty string if no per-CVE rule exists
-
-    Does NOT fall back to the rolling baseline.  Baseline compliance is a
-    separate concern answered by _resolve_baseline / 'Baseline Compliance'.
-    Keeping them separate means:
-      - A device on Chrome 147.0.7727.117 is correctly "Patch confirmed" for
-        CVE-2026-5858 (fixed at 147.0.7727.55) even though the current
-        baseline is 148.x.
-      - The same device shows "Below baseline" in the Baseline Compliance
-        column, which is also true and actionable — but for a different reason.
-    """
     if 'Fixed Version' in row.index:
         v = str(row.get('Fixed Version', '')).strip()
         if v: return v, 'CVE workbook column'
@@ -283,21 +240,7 @@ def _resolve_fixed_version(row):
         if cve in rules: return rules[cve], f'config rule ({cve})'
     return '', ''
 
-
 def _resolve_baseline(row) -> tuple[str, str]:
-    """
-    Return the rolling product baseline for the product canonical key.
-
-    Answers: "What is the current minimum recommended version for this product?"
-
-    This is independent of any specific CVE.  A device can be:
-      - CVE compliant (version >= fixed for that CVE)  AND
-      - Below baseline (version < current recommended minimum)
-
-    Both are true and both are actionable — they just mean different things.
-    CVE compliance = this vulnerability is addressed.
-    Baseline compliance = the device is on a currently supported release.
-    """
     product = row.get('_pk', '')
     if not product: return '', ''
     rules = FIXED_VERSION_RULES.get(product, {})
@@ -307,16 +250,6 @@ def _resolve_baseline(row) -> tuple[str, str]:
 
 
 def _classify_baseline_compliance(row) -> str:
-    """
-    Is the installed version at or above the current product baseline?
-
-    Returns one of:
-      'Compliant'           installed >= baseline
-      'Below baseline'      installed < baseline
-      'No baseline defined' no _baseline entry for this product
-      'Version unknown'     version data not available
-      'Not installed'       status is not Installed/Reboot Required
-    """
     status = str(row.get('Status', '')).strip()
     if status not in INSTALLED_STATUSES:
         return 'Not installed'
@@ -330,7 +263,6 @@ def _classify_baseline_compliance(row) -> str:
     if cmp is True:  return 'Compliant'
     if cmp is False: return 'Below baseline'
     return 'Version unknown'
-
 
 
 def _classify_version_check(row):
@@ -348,24 +280,12 @@ def _classify_version_check(row):
     return 'Version comparison failed'
 
 def _classify_resolution(row):
-    """
-    Classify whether patch evidence proves remediation for this device/CVE pair.
-
-    A row is marked Resolved only when all of the following are true:
-      1. The patch report status is Installed or Reboot Required.
-      2. The matched patch version is confirmed >= the fixed baseline.
-      3. The patch install date is on or after the CVE detection/published date.
-
-    This prevents pre-existing installed rows, stale patch rows, or unrelated
-    product matches from marking an active CVE as resolved.
-    """
     status = str(row.get('Status', '')).strip()
     if status not in INSTALLED_STATUSES:
         return 'Unresolved'
 
     vcr = str(row.get('Version Check Result', '')).strip().lower()
 
-    # Version must be explicitly compliant. Anything weaker is not proof.
     if 'below fixed version' in vcr:
         return 'Unresolved'
 
@@ -402,13 +322,6 @@ def _classify_resolution(row):
 # ==============================================================================
 
 def load_vulnerability_data(file_path: str) -> pd.DataFrame:
-    """
-    Load vulnerability/CVE data from a CSV or XLSX file.
-
-    If the file is a previously generated dashboard workbook (identified by
-    having a 'Raw Data' sheet), that sheet is used directly rather than the
-    default first sheet, which would be 'Trend Summary' and contain no CVE rows.
-    """
     if str(file_path).lower().endswith(('.xlsx', '.xls')):
         xl = pd.ExcelFile(file_path)
         if 'Raw Data' in xl.sheet_names:
@@ -435,18 +348,14 @@ def load_vulnerability_data(file_path: str) -> pd.DataFrame:
             rename[col] = 'Vulnerability Severity'
         elif c in ('threat status',):
             rename[col] = 'Threat Status'
-        # N-able exports use 'Customer Name' / 'Site Name' — normalise for patch matching
         elif c in ('customer name', 'client name', 'account name', 'client'):
             rename[col] = 'Customer'
         elif c in ('site name', 'location name'):
             rename[col] = 'Site'
-        # Exploit/KEV fields vary across N-able export versions
-        # Only rename if the canonical target column doesn't already exist
         elif c in ('has exploit', 'exploit') and 'Has Known Exploit' not in df.columns:
             rename[col] = 'Has Known Exploit'
         elif c == 'cisa kev' and col != 'CISA KEV' and 'CISA KEV' not in df.columns:
             rename[col] = 'CISA KEV'
-        # Date field capitalisation varies (e.g. 'First Detected' vs 'First detected')
         elif c == 'first detected' and col != 'First detected':
             rename[col] = 'First detected'
         elif c == 'last updated' and col != 'Last updated':
@@ -456,10 +365,6 @@ def load_vulnerability_data(file_path: str) -> pd.DataFrame:
         elif c in ('operating system role', 'os role'):
             rename[col] = 'Operating System Role'
     df.rename(columns=rename, inplace=True)
-
-    # NOTE: Do NOT drop RESOLVED rows here. merged_df must retain full evidence
-    # history for Raw Data / All Detections sheets. Active-only filtering is
-    # applied downstream in orchestrator.py (active_df / triage_df scopes).
 
     defaults = {
         'Name': 'Unknown Device',          'Vulnerability Name': 'Unknown CVE',
@@ -475,13 +380,6 @@ def load_vulnerability_data(file_path: str) -> pd.DataFrame:
     df['Affected Products']  = df['Affected Products'].fillna('Unknown Product')
     df['Base Product']       = df['Affected Products'].apply(get_base_product)
 
-    # NOTE: category dtype is intentionally NOT used here even though these
-    # columns are low-cardinality. In pandas < 3.0, groupby() on category
-    # columns defaults to observed=False, producing the cartesian product of
-    # all category value combinations. process_patch_match() groups by all
-    # CVE columns including Vulnerability Severity and Threat Status, so a
-    # 5-severity * 3-status * 2-exploit * 2-kev cross with hundreds of
-    # device/CVE rows produces trillions of rows → numpy MemoryError.
     return df
 
 def load_rmm_data(file_path):
@@ -495,15 +393,10 @@ def load_rmm_data(file_path):
         if key in col_lower: resp_col = col_lower[key]; break
     for key in ('os version', 'os'):
         if key in col_lower: os_col = col_lower[key]; break
-    # N-able Device Inventory exports include a direct 'Device type' column
-    # (values: LAPTOP, SERVER, WORKSTATION, DESKTOP, etc.) — use it when present
     for key in ('device type',):
         if key in col_lower: device_type_col = col_lower[key]; break
 
     if not dev_col or not resp_col:
-        # ── Positional fallback for N-able Device Inventory header-less exports ──
-        # Column names are configurable in config.json "rmm_inventory_columns"
-        # so export format changes can be fixed without touching Python source.
         cols_are_positional = all(
             isinstance(c, int) or str(c).startswith('Unnamed')
             for c in df.columns
@@ -524,7 +417,6 @@ def load_rmm_data(file_path):
     df['Device_Join'] = _normalize_device_col(df['Device'])
 
     if device_type_col:
-        # Map N-able device type strings → Server / Workstation / Unknown
         def _map_device_type(val):
             v = str(val).strip().upper()
             if v == 'SERVER':  return 'Server'
@@ -539,26 +431,16 @@ def load_rmm_data(file_path):
     return df.drop_duplicates(subset=['Device_Join'], keep='first')
 
 def merge_data(df_vuln, df_rmm, skip_rmm, exclude_missing_rmm=True):
-    # Some N-able CVE exports already include Last Response and Device Type inline.
-    # Detect this upfront so we don't create _x/_y collision columns during the merge.
     vuln_has_lr = 'Last Response' in df_vuln.columns
     vuln_has_dt = 'Device Type'   in df_vuln.columns
 
     if not skip_rmm and df_rmm is not None:
-        # Only pull the columns from RMM that the vuln data is missing
         rmm_pull = ['Device_Join']
         if not vuln_has_lr: rmm_pull.append('Last Response')
         if not vuln_has_dt: rmm_pull.append('Device Type')
 
         if len(rmm_pull) > 1:
             before = len(df_vuln)
-            # exclude_missing_rmm=True (default):
-            #   INNER join — devices absent from the inventory are decommissioned.
-            #   Their CVEs are excluded entirely.
-            # exclude_missing_rmm=False:
-            #   LEFT join — all CVE rows are kept.  Devices not in the inventory
-            #   get Last Response = 'Not Found in RMM' so they remain visible
-            #   for evidence/scope-gap reporting.
             join_how = 'inner' if exclude_missing_rmm else 'left'
             merged = pd.merge(df_vuln, df_rmm[rmm_pull],
                               left_on='Name_Join', right_on='Device_Join', how=join_how)
@@ -576,7 +458,6 @@ def merge_data(df_vuln, df_rmm, skip_rmm, exclude_missing_rmm=True):
                     ' ...' if len(decom_names) > 5 else '',
                 )
             elif not exclude_missing_rmm:
-                # Tag unmatched devices so downstream code can identify them
                 missing_mask = merged['Device_Join'].isna()
                 if missing_mask.any():
                     if not vuln_has_lr:
@@ -602,13 +483,9 @@ def merge_data(df_vuln, df_rmm, skip_rmm, exclude_missing_rmm=True):
             else:
                 merged['Device Type'] = 'Unknown'
 
-    # Guarantee these columns always exist downstream
     if 'Last Response' not in merged.columns: merged['Last Response'] = 'N/A'
     if 'Device Type'   not in merged.columns: merged['Device Type']   = 'Unknown'
 
-    # ── Device Type fallback layer 1: Operating System Role ──────────────────
-    # N-able CVE exports carry an 'Operating System Role' column (WORKSTATION /
-    # SERVER / UNKNOWN) that is more reliable than the free-text OS string.
     if 'Operating System Role' in merged.columns:
         _OS_ROLE_MAP = {'WORKSTATION': 'Workstation', 'SERVER': 'Server'}
         mask_unk = merged['Device Type'].astype(str).str.strip().str.lower() == 'unknown'
@@ -619,9 +496,6 @@ def merge_data(df_vuln, df_rmm, skip_rmm, exclude_missing_rmm=True):
             .fillna('Unknown')
         )
 
-    # ── Device Type fallback layer 2: OS string heuristic ────────────────────
-    # For any devices still Unknown, inspect the OS string.
-    # "Windows 10 / 11" → Workstation; anything with "server" → Server.
     if 'OS' in merged.columns:
         mask_still_unk = merged['Device Type'].astype(str).str.strip().str.lower() == 'unknown'
         if mask_still_unk.any():
@@ -636,16 +510,12 @@ def merge_data(df_vuln, df_rmm, skip_rmm, exclude_missing_rmm=True):
 
     merged['Vulnerability Score'] = pd.to_numeric(merged['Vulnerability Score'], errors='coerce')
 
-    # _Sort_Time drives the date filter.  When RMM is skipped, Last Response = 'N/A'
-    # which parse_last_response maps to epoch (1900-01-01), causing the date filter
-    # to exclude every row.  Fall back to CVE detection dates in that case.
     merged['_Sort_Time'] = merged['Last Response'].apply(parse_last_response)
 
     _epoch = pd.to_datetime('1900-01-01')
     _stale_mask = merged['_Sort_Time'] <= _epoch
 
     if _stale_mask.any():
-        # Try CVE date columns in preference order
         for _date_col in ('Last updated', 'First detected', 'Date Published'):
             if _date_col in merged.columns:
                 _parsed = pd.to_datetime(
@@ -656,7 +526,6 @@ def merge_data(df_vuln, df_rmm, skip_rmm, exclude_missing_rmm=True):
                 merged.loc[_stale_mask & _parsed.notna(), '_Sort_Time'] = (
                     _parsed[_stale_mask & _parsed.notna()]
                 )
-                # Update mask — only rows still at epoch need the next fallback
                 _stale_mask = merged['_Sort_Time'] <= _epoch
                 if not _stale_mask.any():
                     break
@@ -675,7 +544,6 @@ def merge_data(df_vuln, df_rmm, skip_rmm, exclude_missing_rmm=True):
 
     merged['Days Since Last Response'] = merged['Last Response'].apply(_calc_days_from_lr)
     
-    # Reorder column so it always sits natively beside "Last Response"
     cols = merged.columns.tolist()
     if 'Days Since Last Response' in cols:
         cols.remove('Days Since Last Response')
@@ -691,40 +559,14 @@ def merge_data(df_vuln, df_rmm, skip_rmm, exclude_missing_rmm=True):
 # ==============================================================================
 
 def _apply_cascade_resolution(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Version-based cascade resolution.
-
-    After per-row `_classify_resolution`, find any rows still Unresolved where
-    we already know from another row that the device has a product version that
-    satisfies the fixed-version threshold for that CVE.
-
-    Logic:
-      1. Collect best known (device, product_key, installed_version, install_date)
-         from any rows where Matched Patch Version is populated.
-      2. For each CVE in FIXED_VERSION_RULES, check whether any device's known
-         version for that product_key >= fixed version AND install_date >= first_detected.
-      3. If so, mark the Unresolved row as 'Patch confirmed - pending rescan'.
-
-    This specifically handles the case where CVE-5288, 5289, 5290 all share the
-    same Edge fixed version. Once we confirm Edge is at 147.x (which resolves 5290),
-    5288 and 5289 are also satisfied by the same installed version.
-
-    Does NOT cross product boundaries — an Edge install never resolves a Chrome CVE.
-    """
     if df.empty or 'Matched Patch Version' not in df.columns:
         return df
 
     df = df.copy()
 
-    # Step 1: build best installed version per (device, product_key)
-    # CRITICAL: only use rows where Status is Installed or Reboot Required.
-    # Pending/Missing/Installing rows have a Matched Patch Version (from the
-    # patch name) but the patch is NOT actually on the device yet.
-    # The "Discovered / Install Date" for Pending is the discovery date, not install.
     df['_cascade_pk'] = df.get('_pk', df['Affected Products'].apply(
         lambda v: _detect_product(str(v).lower())))
 
-    # Filter to installed rows first, then check version
     installed_mask = df['Patch Match Result'].astype(str).str.strip().isin(
         {'Matched - installed', 'Matched - reboot required'}
     )
@@ -737,8 +579,6 @@ def _apply_cascade_resolution(df: pd.DataFrame) -> pd.DataFrame:
 
     best_ver: dict[tuple, dict] = {}
     for _, row in has_ver.iterrows():
-        # Include arch in the key so x86 and x64 installs are tracked independently.
-        # An x86 version cannot be used as cascade evidence for an x64 CVE.
         _patch_arch = _get_arch(str(row.get('Matched Patch', '')))
         key = (str(row['Name']), str(row['_cascade_pk']), _patch_arch)
         vt  = row['_vt']
@@ -750,14 +590,8 @@ def _apply_cascade_resolution(df: pd.DataFrame) -> pd.DataFrame:
                 '_arch':        _patch_arch,
             }
 
-    # Step 2: build set of (device, product_key, cve_id) that cascade-satisfy
-    # Priority: explicit CVE rule > _baseline for that product.
-    # For CVEs with no explicit rule, the product _baseline acts as the threshold —
-    # "if the device is above the minimum safe version, all CVEs fixed by that release
-    # are considered resolved."
     cascade_resolve: set[tuple[str, str, str]] = set()
 
-    # Build per-product baseline lookup for CVEs without explicit rules
     product_baselines: dict[str, tuple] = {}
     for pk, rules in FIXED_VERSION_RULES.items():
         if isinstance(rules, dict) and '_baseline' in rules:
@@ -770,29 +604,19 @@ def _apply_cascade_resolution(df: pd.DataFrame) -> pd.DataFrame:
         if not isinstance(rules, dict):
             continue
 
-        # Explicit per-CVE rules: CVE is resolved when the installed version
-        # is >= the version that first fixed this specific CVE.
-        # Baseline compliance is tracked separately in 'Baseline Compliance'.
         for cve_id, fixed_str in rules.items():
             if cve_id.startswith('_'):
                 continue
             fixed_t = _parse_version(fixed_str)
             if fixed_t and ver_info['_vt'] >= fixed_t:
-                # Include arch in cascade key: (device, pk, cve_id, inst_arch)
-                # Step 3 will only apply this to CVE rows with a matching arch.
                 cascade_resolve.add((device, pk, cve_id.upper(), inst_arch))
 
-        # Baseline fallback
         if pk in product_baselines and ver_info['_vt'] >= product_baselines[pk]:
             cascade_resolve.add((device, pk, '_BASELINE_', inst_arch))
 
     if not cascade_resolve:
         return df
 
-    # Step 3: apply to Unresolved rows that match (device, product_key, cve_id)
-    # Two paths to cascade resolve:
-    #   A) Explicit CVE rule + version compliant → always resolve (timing irrelevant)
-    #   B) Baseline sentinel + version compliant + install post-dates detection
     cascade_applied = 0
     for idx, row in df.iterrows():
         if str(row.get('Patch Evidence Status', '')).strip() != 'Unresolved':
@@ -801,13 +625,8 @@ def _apply_cascade_resolution(df: pd.DataFrame) -> pd.DataFrame:
         pk      = str(row.get('_cascade_pk', ''))
         cve_ids = [c.upper() for c in _extract_cves(str(row.get('Vulnerability Name', '')))]
 
-        # Arch guard: the cascade key now includes arch so we only resolve
-        # a CVE row when the installed version has the same arch as the CVE.
-        # When either side has no arch tag, we allow the cascade (neutral).
         cve_arch = _get_arch(str(row.get('Affected Products', '')))
 
-        # Find the best_ver entry for this device+product+arch combination.
-        # Prefer arch-matched key; fall back to no-arch key if no match found.
         key_exact   = (device, pk, cve_arch)
         key_neutral = (device, pk, '')
         if key_exact in best_ver:
@@ -815,10 +634,9 @@ def _apply_cascade_resolution(df: pd.DataFrame) -> pd.DataFrame:
         elif key_neutral in best_ver and not cve_arch:
             key = key_neutral
         elif not cve_arch and any(k[:2] == (device, pk) for k in best_ver):
-            # CVE has no arch — allow any arch version as evidence
             key = next(k for k in best_ver if k[:2] == (device, pk))
         else:
-            continue  # no matching version found for this arch
+            continue
 
         ver_info   = best_ver[key]
         install_dt = pd.to_datetime(ver_info['install_date'], errors='coerce')
@@ -826,18 +644,14 @@ def _apply_cascade_resolution(df: pd.DataFrame) -> pd.DataFrame:
         inst_arch  = ver_info['_arch']
 
         for cve_id in cve_ids:
-            if (device, pk, cve_id, inst_arch) in cascade_resolve or                (not cve_arch and any((device, pk, cve_id, a) in cascade_resolve for a in ['', 'x64', 'x86'])):
-                # Explicit CVE rule matched + version compliant, but still require
-                # timing proof. This prevents a pre-existing installed row from
-                # resolving an active CVE when the patch report did not prove
-                # remediation happened after detection.
+            if (device, pk, cve_id, inst_arch) in cascade_resolve or \
+               (not cve_arch and any((device, pk, cve_id, a) in cascade_resolve for a in ['', 'x64', 'x86'])):
                 if not pd.isna(install_dt) and not pd.isna(first_dt) and install_dt >= first_dt:
                     df.at[idx, 'Patch Evidence Status'] = 'Patch confirmed - pending rescan'
                     cascade_applied += 1
                     break
             elif (device, pk, '_BASELINE_', inst_arch) in cascade_resolve or \
                    (not cve_arch and any((device, pk, '_BASELINE_', a) in cascade_resolve for a in ['', 'x64', 'x86'])):
-                # Baseline: also need timing check (we don't know the per-CVE threshold)
                 if not pd.isna(install_dt) and not pd.isna(first_dt) and install_dt >= first_dt:
                     df.at[idx, 'Patch Evidence Status'] = 'Patch confirmed - pending rescan'
                     cascade_applied += 1
@@ -851,10 +665,6 @@ def _apply_cascade_resolution(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def process_patch_match(patch_path, cve_df, min_score=9.0):
-    """
-    Match a Patch Report against an already-loaded CVE DataFrame.
-    Returns (overview_df, full_df, patch_df, total_rows, filtered_rows).
-    """
     patch  = load_data(patch_path)
     miss_p = {'Client', 'Site', 'Device', 'Status', 'Patch',
               'Discovered / Install Date'} - set(patch.columns)
@@ -911,17 +721,9 @@ def process_patch_match(patch_path, cve_df, min_score=9.0):
 
     def _classify_match(row):
         if not pd.isna(row.get('Patch')):
-            # Architecture guard: if both the CVE detection and the matched
-            # patch carry an explicit arch tag, they must agree.
-            # A 32-bit patch cannot be evidence that a 64-bit install is fixed.
-            # Example: CVE on Firefox (x64) must NOT match patch Firefox (x86).
-            # When either side has no arch tag we allow the match — the product
-            # may not be tagged at all (e.g. 'Google Chrome', 'Microsoft Edge 80+').
             cve_arch   = _get_arch(str(row.get('Affected Products', '')))
             patch_arch = _get_arch(str(row.get('Patch', '')))
             if cve_arch and patch_arch and cve_arch != patch_arch:
-                # Cross-arch mismatch: treat as if the device is in the patch
-                # report but the correct-arch product was not found.
                 return 'Device in patch report - product not found'
             return STATUS_LABEL.get(str(row.get('Status', '')).strip(),
                                      f"Matched - {str(row.get('Status', '')).lower()}")
@@ -935,9 +737,6 @@ def process_patch_match(patch_path, cve_df, min_score=9.0):
     fv.columns = ['Fixed Version Used', 'Fixed Version Source']
     best = pd.concat([best, fv], axis=1)
 
-    # Baseline compliance — separate from CVE-specific fix version.
-    # A device can be CVE-compliant (version >= fixed for that CVE) AND below
-    # the current product baseline.  Both are true and both are surfaced.
     bl = best.apply(_resolve_baseline, axis=1, result_type='expand')
     bl.columns = ['Product Baseline', 'Product Baseline Source']
     best = pd.concat([best, bl], axis=1)
@@ -948,21 +747,9 @@ def process_patch_match(patch_path, cve_df, min_score=9.0):
     best['Version Check Result']         = best.apply(_classify_version_check, axis=1)
     best['Baseline Compliance']          = best.apply(_classify_baseline_compliance, axis=1)
 
-    # Rename _pd → Patch Install Date BEFORE calling _classify_resolution so the
-    # date-comparison logic can find the column by its final name.
     best = best.rename(columns={'Patch': 'Matched Patch', '_pd': 'Patch Install Date'})
     best['Patch Evidence Status'] = best.apply(_classify_resolution, axis=1)
 
-    # ── Cascade resolution: version-based bulk resolve ────────────────────────
-    # If a device has product P at installed version V, and V >= fixed_version(CVE-X, P)
-    # for the same product, mark CVE-X as Resolved regardless of whether that specific
-    # CVE row had a matched patch entry.
-    #
-    # Example: Edge 147 resolves CVE-5290 → Edge 147 also satisfies the fixed version
-    # for CVE-5288 and CVE-5289 (same Edge threshold) → cascade to Resolved.
-    #
-    # Constraint: install date must still post-date the CVE's First detected.
-    # This does NOT cross products (Edge resolving doesn't fix a Chrome CVE).
     best = _apply_cascade_resolution(best)
 
     best = best.drop(columns=[c for c in best.columns if c.startswith('_')], errors='ignore')
@@ -981,39 +768,22 @@ def process_patch_match(patch_path, cve_df, min_score=9.0):
 # ==============================================================================
 
 def load_previous_report(file_path):
-    """
-    Load CVE data from a previously generated dashboard workbook.
-    Prefers the 'Raw Data' sheet (clean strings), falls back to 'All Detections'
-    (may contain HYPERLINK formulas — extract_cve_id handles those too).
-    """
     try:
         xl = pd.ExcelFile(file_path)
     except PermissionError:
         fname = os.path.basename(file_path)
-        raise ValueError(
-            f"'{fname}' is currently open in Excel.\n\n"
-            f"Please close the file in Excel and try again."
-        )
+        raise ValueError(f"'{fname}' is currently open in Excel.\n\nPlease close the file in Excel and try again.")
     except FileNotFoundError:
         fname = os.path.basename(file_path)
-        raise ValueError(
-            f"'{fname}' could not be found.\n\n"
-            f"Please check the file path and try again."
-        )
+        raise ValueError(f"'{fname}' could not be found.\n\nPlease check the file path and try again.")
     except Exception as e:
         fname = os.path.basename(file_path)
-        raise ValueError(
-            f"Could not open '{fname}'.\n\n"
-            f"Details: {e}"
-        )
+        raise ValueError(f"Could not open '{fname}'.\n\nDetails: {e}")
 
-    # Validate the file is a dashboard before parsing — gives a clear error if the
-    # user accidentally selects a Device Inventory or raw CVE export instead.
     _DASHBOARD_SHEETS = {'Raw Data', 'All Detections'}
     if not (_DASHBOARD_SHEETS & set(xl.sheet_names)):
         fname = os.path.basename(file_path)
-        _is_inventory = any('inventory' in s.lower() or 'device' in s.lower()
-                            for s in xl.sheet_names)
+        _is_inventory = any('inventory' in s.lower() or 'device' in s.lower() for s in xl.sheet_names)
         if _is_inventory:
             _hint = ("'" + fname + "' looks like a Device Inventory / RMM report. "
                      "Select the previously generated dashboard .xlsx file instead.")
@@ -1022,21 +792,15 @@ def load_previous_report(file_path):
                      "The Previous Dashboard field expects a .xlsx produced by a prior run, "
                      "not a raw CVE export or inventory report.")
         _sheets_str = ', '.join(xl.sheet_names[:6]) + (' ...' if len(xl.sheet_names) > 6 else '')
-        raise ValueError("Cannot use '" + fname + "' as a previous dashboard.\n\n"
-                         + _hint + "\n\nSheets found: " + _sheets_str)
+        raise ValueError("Cannot use '" + fname + "' as a previous dashboard.\n\n" + _hint + "\n\nSheets found: " + _sheets_str)
 
-    target = next((s for s in ('Raw Data', 'All Detections') if s in xl.sheet_names),
-                  xl.sheet_names[0])
+    target = next((s for s in ('Raw Data', 'All Detections') if s in xl.sheet_names), xl.sheet_names[0])
     df = xl.parse(target)
 
     missing = {'Name', 'Vulnerability Name'} - set(df.columns)
     if missing:
-        raise ValueError(
-            f"Previous report sheet '{target}' is missing columns: {', '.join(sorted(missing))}.\n"
-            "Please load a dashboard generated by this tool."
-        )
+        raise ValueError(f"Previous report sheet '{target}' is missing columns: {', '.join(sorted(missing))}.\nPlease load a dashboard generated by this tool.")
 
-    # Normalise column names that vary between N-able export versions
     prev_rename = {}
     for col in df.columns:
         c = str(col).strip().lower()
@@ -1051,22 +815,16 @@ def load_previous_report(file_path):
     if prev_rename:
         df.rename(columns=prev_rename, inplace=True)
 
-    # Build normalised join keys; extract_cve_id handles raw IDs and HYPERLINK formulas
     df['_Name_Key'] = df['Name'].apply(normalize_device_name)
     df['_CVE_Key']  = df['Vulnerability Name'].apply(extract_cve_id)
-    df['Vulnerability Score'] = pd.to_numeric(
-        df.get('Vulnerability Score', 0), errors='coerce').fillna(0)
+    df['Vulnerability Score'] = pd.to_numeric(df.get('Vulnerability Score', 0), errors='coerce').fillna(0)
 
-    # ── Collect manually-resolved pairs (☑) from product sheets ─────────────
-    # Product sheets have a 'Resolved' column with ☑/☐ checkboxes.
-    # Any pair marked ☑ in the previous report should be counted as resolved
-    # in the trend analysis even if N-able still detects the CVE.
     _RESERVED = {
         'trend summary', 'overview', 'all detections', 'raw data',
         'stale excluded devices', 'new this month', 'new device-cve pairs', 'new cve types',
         'resolved', 'persisting cves',
         'patch match overview', 'patch match full data', 'patch report (full)',
-        'patch confirmed', 'resolved (patch confirmed)',
+        'patch confirmed', 'resolved (patch confirmed)', "cves on stale devices",
     }
     resolved_pairs = set()
     for sheet in xl.sheet_names:
@@ -1085,7 +843,6 @@ def load_previous_report(file_path):
         except Exception:
             continue
 
-    # Tag checkbox-resolved rows so compute_trends can honour them
     if resolved_pairs:
         df['_Checkbox_Resolved'] = df.apply(
             lambda r: (r['_Name_Key'], r['_CVE_Key']) in resolved_pairs, axis=1
@@ -1097,7 +854,8 @@ def load_previous_report(file_path):
 
 
 def _active_trend_scope(df: pd.DataFrame, threshold: float,
-                        inventory_devices=None) -> pd.DataFrame:
+                        inventory_devices=None,
+                        stale_devices=None) -> pd.DataFrame:
     """
     Produce a clean, consistently-keyed DataFrame for trend arithmetic.
 
@@ -1105,12 +863,8 @@ def _active_trend_scope(df: pd.DataFrame, threshold: float,
       • Score threshold
       • UNRESOLVED-only (status column named 'Threat Status' or 'Status')
       • Inventory filter (decommissioned devices dropped)
-      • Deduplication on (_Name_Key, _CVE_Key, _Product_Key) — keeps the
-        highest-scoring row; product key prevents Chrome/Edge/Office rows
-        collapsing across products on the same device
-      • Base Product populated
-
-    Returns a copy with synthetic key columns attached.
+      • Stale filter (stale devices dropped completely from trend comparison)
+      • Deduplication on (_Name_Key, _CVE_Key, _Product_Key)
     """
     out = df.copy()
     out['_Name_Key']    = out['Name'].apply(normalize_device_name)
@@ -1131,6 +885,9 @@ def _active_trend_scope(df: pd.DataFrame, threshold: float,
     if inventory_devices:
         out = out[out['_Name_Key'].isin(inventory_devices)].copy()
 
+    if stale_devices:
+        out = out[~out['_Name_Key'].isin(stale_devices)].copy()
+
     out = (
         out.sort_values('Vulnerability Score', ascending=False)
            .drop_duplicates(subset=['_Name_Key', '_CVE_Key', '_Product_Key'], keep='first')
@@ -1143,61 +900,26 @@ def _active_trend_scope(df: pd.DataFrame, threshold: float,
 
 
 def compute_trends(current_df, previous_df, threshold,
-                   inventory_devices: set = None):
+                   inventory_devices: set = None,
+                   stale_devices: set = None):
     """
     Compare current and previous reports at or above the score threshold.
-
-    inventory_devices: normalised device names from the current Device Inventory.
-    If supplied, devices absent from the inventory are excluded from BOTH
-    current and previous data — decommissioned devices must not affect trends.
-
-    Snapshot metrics come from the FULL filtered datasets (no product-scope
-    restriction) so "Previous Report" always reflects the actual previous run.
-
-    CVE Movement and Device Movement are computed on the COMMON-PRODUCT scope
-    so comparisons are apples-to-apples across months.
-
-    Two output frames are produced for "new" detections:
-      new_pairs_df      — device/CVE/product triples new this period
-                          (patching workload view)
-      new_cve_types_df  — rows for CVE types not present at all last period
-                          (executive risk view)
-
-    Processing order (important — each step feeds correctly into the next):
-      1. Score threshold + UNRESOLVED filter + inventory filter + deduplication
-         (via _active_trend_scope)
-      2. Snapshot metrics captured from full-scope data
-      3. Common-product scope applied to both datasets
-      4. Checkbox-resolved pairs removed from cur only
-      5. Pair-level AND CVE-type-level set arithmetic
+    Raw Data is strictly honored as the single source of truth for active vulnerabilities.
     """
-    # ── Step 1: Build consistently-scoped cur_t and prev_t ───────────────────
-    # _active_trend_scope applies: threshold, UNRESOLVED filter, inventory
-    # filter, and dedup on (device, CVE, product) in one call.
-    # prev may lack a status column if loaded from an older workbook — that is
-    # fine; _active_trend_scope skips the status filter when absent.
     cur  = current_df.copy()
     cur['_Name_Key'] = cur['Name'].apply(normalize_device_name)
     cur['_CVE_Key']  = cur['Vulnerability Name'].apply(extract_cve_id)
 
-    prev = previous_df.copy()  # already has _Name_Key, _CVE_Key from load_previous_report
+    prev = previous_df.copy()
 
-    cur_t  = _active_trend_scope(current_df,  threshold, inventory_devices)
-    prev_t = _active_trend_scope(previous_df, threshold, inventory_devices)
+    cur_t  = _active_trend_scope(current_df,  threshold, inventory_devices, stale_devices)
+    prev_t = _active_trend_scope(previous_df, threshold, inventory_devices, stale_devices)
 
-    if inventory_devices:
-        dropped = (
-            len(_active_trend_scope(previous_df, threshold)) - len(prev_t)
-        )
+    if inventory_devices or stale_devices:
+        dropped = len(_active_trend_scope(previous_df, threshold)) - len(prev_t)
         if dropped > 0:
-            log.info(
-                "Trend: excluded %d previous-period row(s) for decommissioned "
-                "device(s) not in current Device Inventory", dropped
-            )
+            log.info("Trend: excluded %d previous-period row(s) for decommissioned or stale devices", dropped)
 
-    # ── Step 2: Snapshot metrics — full active scope, no product restriction ──
-    # "This report has X unique CVEs" = all current UNRESOLVED CVEs across all
-    # products.  "In the comparable scope" = common-product subset (Step 3).
     def _kev_count(df):
         if 'CISA KEV' not in df.columns: return 0
         return int(df[df['CISA KEV'].astype(str).str.strip().str.lower()
@@ -1223,13 +945,7 @@ def compute_trends(current_df, previous_df, threshold,
     snap_prev_servers = _srv_count(prev_t)
     snap_cur_servers  = _srv_count(cur_t)
 
-    # ── Step 3: Common-product scope ─────────────────────────────────────────
-    # For PERSISTING and RESOLVED movement, restrict to products present in
-    # BOTH reports — apples-to-apples comparison only.
-    # For NEW detections, use the FULL cur_t so genuinely new products (e.g.
-    # Office appearing for the first time this month) are not silently dropped.
-    common_products = (set(cur_t['Base Product'].unique())
-                       & set(prev_t['Base Product'].unique()))
+    common_products = (set(cur_t['Base Product'].unique()) & set(prev_t['Base Product'].unique()))
     new_products    = set(cur_t['Base Product'].unique()) - set(prev_t['Base Product'].unique())
 
     cur_scoped  = cur_t[cur_t['Base Product'].isin(common_products)].copy()
@@ -1239,45 +955,24 @@ def compute_trends(current_df, previous_df, threshold,
         log.info("Trend: %d product(s) new this period (not in previous report): %s",
                  len(new_products), sorted(new_products))
 
-    # ── Step 4: Checkbox-resolved pairs removed from cur_scoped only ─────────
+    # ── Checkbox Triage Data (For Re-detection tracking ONLY) ──
     checkbox_resolved = set()
     if '_Checkbox_Resolved' in prev_t.columns:
         checkbox_resolved = set(
             zip(prev_t.loc[prev_t['_Checkbox_Resolved'], '_Name_Key'],
                 prev_t.loc[prev_t['_Checkbox_Resolved'], '_CVE_Key'])
         )
-    if checkbox_resolved:
-        cur_scoped = cur_scoped[~cur_scoped.apply(
-            lambda r: (r['_Name_Key'], r['_CVE_Key']) in checkbox_resolved, axis=1
-        )]
+    
+    cur_active_pairs_2d = set(zip(cur_t['_Name_Key'], cur_t['_CVE_Key']))
+    redetected_pairs = checkbox_resolved & cur_active_pairs_2d
+    redetected_count = len(redetected_pairs)
 
-    # ── Step 5: Dual set arithmetic — pairs AND CVE types ────────────────────
-    #
-    # PAIR-LEVEL  (device × CVE × product triple)
-    #   new_pairs      = in cur_t (ALL products), not in prev  → patching workload added
-    #   resolved_pairs = in prev, not in cur_scoped            → work completed
-    #   persisting_pairs = in cur_scoped AND prev              → backlog (common products)
-    #
-    # CVE-TYPE-LEVEL  (CVE ID only)
-    #   new_cve_ids      = CVEs in cur_t not in prev at all    → executive risk view
-    #   resolved_cve_ids = CVEs gone from cur entirely         → remediation signal
-    #   persisting_cve_ids = CVEs in cur_scoped AND prev
-    #
-    # Using cur_t (not cur_scoped) for "new" ensures genuinely new products
-    # (e.g. Office first appearing this month) are captured in the New sheets
-    # rather than silently excluded by the common-product filter.
-    # Persisting and Resolved still use the common-product scope for
-    # apples-to-apples comparison.
-
-    cur_all_pair_keys  = set(zip(cur_t['_Name_Key'],
-                                  cur_t['_CVE_Key'],
-                                  cur_t['_Product_Key']))
-    cur_scoped_pair_keys = set(zip(cur_scoped['_Name_Key'],
-                                    cur_scoped['_CVE_Key'],
-                                    cur_scoped['_Product_Key']))
-    prev_pair_keys     = set(zip(prev_scoped['_Name_Key'],
-                                  prev_scoped['_CVE_Key'],
-                                  prev_scoped['_Product_Key']))
+    # ── Set Arithmetic ──
+    # NOTE: We strictly DO NOT filter cur_scoped based on previous manual checkboxes. 
+    # Raw data wins. If it is UNRESOLVED in the raw data, it persists.
+    cur_all_pair_keys  = set(zip(cur_t['_Name_Key'], cur_t['_CVE_Key'], cur_t['_Product_Key']))
+    cur_scoped_pair_keys = set(zip(cur_scoped['_Name_Key'], cur_scoped['_CVE_Key'], cur_scoped['_Product_Key']))
+    prev_pair_keys     = set(zip(prev_scoped['_Name_Key'], prev_scoped['_CVE_Key'], prev_scoped['_Product_Key']))
 
     new_pair_keys        = cur_all_pair_keys  - prev_pair_keys
     resolved_pair_keys   = prev_pair_keys     - cur_scoped_pair_keys
@@ -1291,41 +986,26 @@ def compute_trends(current_df, previous_df, threshold,
     resolved_df       = _filter_pairs(prev_scoped,  resolved_pair_keys).sort_values('Vulnerability Score', ascending=False)
     persisting_df     = _filter_pairs(cur_scoped,   persisting_pair_keys).sort_values('Vulnerability Score', ascending=False)
 
-    # CVE-type sets — "new" uses all of cur_t, persisting/resolved use scoped
+    # CVE-type sets
     cur_all_cve_ids  = set(cur_t['_CVE_Key'].unique())
     cur_cve_ids      = set(cur_scoped['_CVE_Key'].unique())
     prev_cve_ids     = set(prev_scoped['_CVE_Key'].unique())
 
     new_cve_ids          = cur_all_cve_ids - prev_cve_ids
-    scanner_resolved_cves = prev_cve_ids - cur_cve_ids
+    resolved_cve_ids     = prev_cve_ids - cur_cve_ids
+    persisting_cve_ids   = cur_cve_ids & prev_cve_ids
 
-    # A CVE type is also resolved if EVERY previous occurrence was checkbox-resolved
-    checkbox_resolved_cves: set = set()
-    if checkbox_resolved:
-        for _cve in prev_cve_ids:
-            _prev_devs = {d for d, c in zip(prev_scoped['_Name_Key'], prev_scoped['_CVE_Key']) if c == _cve}
-            _cb_devs   = {d for d, c in checkbox_resolved if c == _cve}
-            if _prev_devs and _prev_devs.issubset(_cb_devs):
-                checkbox_resolved_cves.add(_cve)
-    resolved_cve_ids   = scanner_resolved_cves | checkbox_resolved_cves
-    persisting_cve_ids = cur_cve_ids & (prev_cve_ids - resolved_cve_ids)
-
-    # new_cve_types_df: all devices affected by truly-new CVE types this period
-    # Uses cur_t (not cur_scoped) so new products like Office are included
     new_cve_types_df = _drop_internal(
         cur_t[cur_t['_CVE_Key'].isin(new_cve_ids)].copy()
     ).sort_values('Vulnerability Score', ascending=False)
 
-    # Device movement uses full cur_t vs prev_t for honest device counts
     cur_dev_set  = set(cur_t['_Name_Key'].unique())
     prev_dev_set = set(prev_t['_Name_Key'].unique())
 
-    # Scoped CVE counts (comparable scope only — for Trend Summary clarity rows)
     scoped_cur_cves  = len(cur_all_cve_ids)
     scoped_prev_cves = len(prev_cve_ids)
 
     metrics = {
-        # ── Snapshot — full active scope, no product restriction ──────────────
         'cur_cves':             snap_cur_cves,
         'prev_cves':            snap_prev_cves,
         'cur_devices':          snap_cur_devices,
@@ -1336,23 +1016,18 @@ def compute_trends(current_df, previous_df, threshold,
         'prev_exploit':         snap_prev_exploit,
         'cur_servers':          snap_cur_servers,
         'prev_servers':         snap_prev_servers,
-        # ── Comparable scope — common products only ───────────────────────────
         'scoped_cur_cves':      scoped_cur_cves,
         'scoped_prev_cves':     scoped_prev_cves,
-        # ── CVE-type movement — common-product scope ──────────────────────────
         'new_cve_count':        len(new_cve_ids),
         'resolved_cve_count':   len(resolved_cve_ids),
         'persisting_cve_count': len(persisting_cve_ids),
-        # ── Pair-level movement — common-product scope ────────────────────────
         'new_pair_count':       len(new_pair_keys),
         'resolved_pair_count':  len(resolved_pair_keys),
         'persisting_pair_count':len(persisting_pair_keys),
-        # ── Device movement — common-product scope ────────────────────────────
         'new_devices':          len(cur_dev_set  - prev_dev_set),
         'remediated_devices':   len(prev_dev_set - cur_dev_set),
     }
 
-    # ── Product-level trend (Top 10, FULL current active scope) ──────────────
     cur_prod      = cur_t.groupby('Base Product')['_Name_Key'].nunique()
     cur_cve_prod  = cur_t.groupby('Base Product')['_CVE_Key'].nunique()
     prev_prod     = prev_t.groupby('Base Product')['_Name_Key'].nunique()
@@ -1372,15 +1047,14 @@ def compute_trends(current_df, previous_df, threshold,
 
     return {
         'metrics':                 metrics,
-        'new_df':                  new_pairs_df,       # kept for back-compat (pair-level)
+        'new_df':                  new_pairs_df,
         'new_pairs_df':            new_pairs_df,
         'new_cve_types_df':        new_cve_types_df,
         'resolved_df':             resolved_df,
         'persisting_df':           persisting_df,
         'product_trend':           product_trend,
-        'checkbox_resolved_count': len(checkbox_resolved),
+        'redetected_count':        redetected_count,
     }
-
 
 
 # ==============================================================================
@@ -1388,32 +1062,6 @@ def compute_trends(current_df, previous_df, threshold,
 # ==============================================================================
 
 def compute_patch_diagnostics(patch_full_df: pd.DataFrame) -> dict:
-    """
-    Answer "why is patching failing on these devices?" by computing three signals
-    that go beyond the binary resolved/unresolved classification.
-
-    patch_full_df
-        The 'Patch Match Full Data' DataFrame produced by process_patch_match.
-
-    Returns a dict with three keys:
-
-    patch_lag_df
-        Per device-CVE pair: how many days between CVE first detection and
-        the patch being applied.  Negative lag = patch predated detection
-        (likely why it shows as Unresolved despite being installed).
-        Sorted by lag descending (longest-outstanding first).
-
-    version_drift_df
-        Per product: the min, max, and spread of installed patch versions
-        across the device fleet.  Large spread = inconsistent update cadence.
-        Sorted by version_spread descending.
-
-    mismatch_summary_df
-        Device-CVE pairs classified as detection_mismatch.
-        Includes the installed version, the fixed-version baseline (if known),
-        and the lag — so the analyst can see whether the issue is a stale
-        scanner signature or a genuinely ineffective patch.
-    """
     df = patch_full_df.copy()
     required = {'Name', 'Vulnerability Name', 'Patch Match Result',
                 'Patch Evidence Status'}
@@ -1424,7 +1072,6 @@ def compute_patch_diagnostics(patch_full_df: pd.DataFrame) -> dict:
                 'version_drift_df': pd.DataFrame(),
                 'mismatch_summary_df': pd.DataFrame()}
 
-    # ── Patch lag ─────────────────────────────────────────────────────────────
     lag_rows = []
     if 'Patch Install Date' in df.columns and 'First detected' in df.columns:
         for _, row in df.iterrows():
@@ -1446,13 +1093,7 @@ def compute_patch_diagnostics(patch_full_df: pd.DataFrame) -> dict:
                     .sort_values('Lag (days)', ascending=False)
                     .reset_index(drop=True)
                     if lag_rows else pd.DataFrame())
-    if not patch_lag_df.empty:
-        avg = patch_lag_df['Lag (days)'].mean()
-        neg = (patch_lag_df['Lag (days)'] < 0).sum()
-        log.info("Patch lag: avg=%.0f days, %d pairs with negative lag (install predates detection)",
-                 avg, neg)
 
-    # ── Version drift ─────────────────────────────────────────────────────────
     drift_rows = []
     if 'Matched Patch Version' in df.columns:
         df['_bp'] = df['Affected Products'].apply(get_base_product)
@@ -1482,11 +1123,7 @@ def compute_patch_diagnostics(patch_full_df: pd.DataFrame) -> dict:
                         .sort_values('Distinct Versions', ascending=False)
                         .reset_index(drop=True)
                         if drift_rows else pd.DataFrame())
-    if not version_drift_df.empty:
-        log.info("Version drift: %d products with inconsistent installed versions",
-                 len(version_drift_df))
 
-    # ── Detection mismatch ────────────────────────────────────────────────────
     mismatch_rows = []
     for _, row in df.iterrows():
         gap = classify_patch_gap(
@@ -1517,9 +1154,6 @@ def compute_patch_diagnostics(patch_full_df: pd.DataFrame) -> dict:
     mismatch_summary_df = (pd.DataFrame(mismatch_rows)
                            .reset_index(drop=True)
                            if mismatch_rows else pd.DataFrame())
-    if not mismatch_summary_df.empty:
-        log.warning("Detection mismatches: %d device-CVE pairs where patch "
-                    "is installed but CVE still detected", len(mismatch_summary_df))
 
     return {
         'patch_lag_df':       patch_lag_df,
@@ -1566,13 +1200,6 @@ def _classify_failure_reason(reason: str) -> str:
 
 
 def load_patch_failure_report(file_path: str) -> pd.DataFrame:
-    """
-    Load and classify a patch failure report CSV.
-
-    Returns a DataFrame with columns:
-        Device, Site, Patch, Failure Status, Failure Reason,
-        _device_norm, _failure_cat, _failure_desc, _kbs
-    """
     df = load_data(file_path)
 
     rename = {}
@@ -1592,27 +1219,10 @@ def load_patch_failure_report(file_path: str) -> pd.DataFrame:
     df['_failure_desc']  = df['_failure_cat'].map(_FAIL_CATEGORY_MAP)
     df['_kbs']           = df['Patch'].astype(str).apply(_extract_kbs)
 
-    log.info("Patch failure report: %d rows, %d devices, %d distinct KBs",
-             len(df), df['_device_norm'].nunique(),
-             len({kb for kbs in df['_kbs'] for kb in kbs}))
     return df
 
 
 def build_patch_failure_lookup(failure_df: pd.DataFrame) -> dict:
-    """
-    Build a dict keyed by normalised device name → failure summary dict.
-
-    {
-      'DEVICE-01': {
-          'failure_count': 40,
-          'unique_kbs': 6,
-          'top_category': 'catalog_miss',
-          'top_description': 'Patch not found in WUA catalog ...',
-          'categories': {'catalog_miss': 30, 'network_timeout': 10},
-      },
-      ...
-    }
-    """
     result = {}
     for device, grp in failure_df.groupby('_device_norm'):
         cats    = grp['_failure_cat'].value_counts().to_dict()
