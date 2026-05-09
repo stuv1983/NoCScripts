@@ -29,6 +29,7 @@ from diagnostics import compute_patch_diagnostics, classify_root_cause
 import snapshot as snap_store
 from excel_builder import (
     get_workbook_styles,
+    build_client_summary_sheet,
     build_trend_summary_sheet, build_trend_detail_sheets,
     build_overview_sheet, build_all_detections_sheet,
     build_product_sheets, build_stale_excluded_sheet,
@@ -82,11 +83,11 @@ class DashboardRequest:
     include_failure_report: bool         = False
     prev_report_path:     Optional[str]  = None
     include_trend:        bool           = False
-    threshold:            float          = 1.0
+    threshold:            float          = 9.0
     cutoff_date:          Optional[str]  = None
     show_all_dates:       bool           = False
     sync_baselines:       bool           = False
-    exclude_missing_rmm:  bool           = False
+    exclude_missing_rmm:  bool           = True
 
 
 @dataclass
@@ -285,52 +286,23 @@ def run(request: DashboardRequest) -> DashboardResult:
             return DashboardResult(success=False, message=msg)
 
         filtered_df = merged_df[merged_df['Vulnerability Score'] >= request.threshold].copy()
+        triage_df   = filtered_df[filtered_df['Last Response'] != 'Not Found in RMM'].copy()
 
-        # ── Two-scope split ───────────────────────────────────────────────────
-        # filtered_df  = evidence/history scope (RESOLVED + UNRESOLVED)
-        #                → used by Raw Data, All Detections, patch evidence
-        # active_df    = triage scope (UNRESOLVED only)
-        #                → used by Overview, Product sheets, New Device-CVE Pairs,
-        #                  Persisting CVEs, exposure counts
-        # N-able exports the column as 'Threat Status' in direct exports and
-        # 'Status' in some views — check both so we never silently skip the filter.
-        _status_col = (
-            'Threat Status' if 'Threat Status' in filtered_df.columns
-            else 'Status'   if 'Status'        in filtered_df.columns
-            else None
-        )
-        if _status_col:
-            active_df = filtered_df[
-                filtered_df[_status_col].astype(str).str.strip().str.upper().eq('UNRESOLVED')
-            ].copy()
-        else:
-            log.warning("No status column found in merged_df — active_df equals filtered_df. "
-                        "RESOLVED detections will NOT be excluded from triage sheets.")
-            active_df = filtered_df.copy()
-
-        # triage_df = active_df: ALL unresolved detections go into product sheets
-        # and the overview, regardless of whether the device is in the RMM export.
-        # If a device is missing from the RMM file its Last Response will read
-        # 'Not Found in RMM' — that is surfaced in the sheet so the analyst can
-        # investigate, but the CVE must not be silently dropped.
-        triage_df = active_df.copy()
-
-        not_in_rmm = active_df[active_df['Last Response'] == 'Not Found in RMM']['Name'].nunique()
+        not_in_rmm = filtered_df[filtered_df['Last Response'] == 'Not Found in RMM']['Name'].nunique()
         if not_in_rmm:
-            w = f"{not_in_rmm} device(s) with score ≥ {request.threshold} not found in RMM — shown in report with 'Not Found in RMM' status"
+            w = f"{not_in_rmm} device(s) with score ≥ {request.threshold} not found in RMM — excluded from triage sheets"
             log.warning(w)
             warnings.append(w)
 
         log.info(
-            "Filtered (score >= %.1f): %d total rows, %d unresolved (active), %d triage, %d not-in-RMM",
-            request.threshold, len(filtered_df), len(active_df), len(triage_df), not_in_rmm,
+            "Filtered (score >= %.1f): %d rows, %d triage, %d not-in-RMM",
+            request.threshold, len(filtered_df), len(triage_df), not_in_rmm,
         )
 
         overview_sheet_name = datetime.now().strftime('%B') + ' Detections'
         reserved = {
             'trend summary', overview_sheet_name.lower(), 'all detections', 'raw data',
-            'stale excluded devices', 'new device-cve pairs', 'new cve types',
-            'resolved', 'persisting cves',
+            'stale excluded devices', 'new this month', 'resolved', 'persisting cves',
             'patch match overview', 'patch match full data', 'patch report (full)',
             'patch confirmed', 'resolved (patch confirmed)',
         }
@@ -357,13 +329,12 @@ def run(request: DashboardRequest) -> DashboardResult:
             prev_report_name = Path(request.prev_report_path).name
             inventory_set    = (set(df_rmm['Device_Join'].unique())
                                 if df_rmm is not None else None)
-            trend_data       = compute_trends(active_df, prev_df, request.threshold,
+            trend_data       = compute_trends(merged_df, prev_df, request.threshold,
                                               inventory_devices=inventory_set)
             m = trend_data['metrics']
             log.info(
-                "Trend: %d new CVE types, %d new pairs, %d resolved, %d persisting (common-product scope)",
-                m['new_cve_count'], m.get('new_pair_count', 0),
-                m['resolved_cve_count'], m['persisting_cve_count'],
+                "Trend: %d new CVEs, %d resolved, %d persisting (common-product scope)",
+                m['new_cve_count'], m['resolved_cve_count'], m['persisting_cve_count'],
             )
 
         # ── Customer name ─────────────────────────────────────────────────────
@@ -436,6 +407,28 @@ def run(request: DashboardRequest) -> DashboardResult:
                         f"see 'Patch Evidence Notes' sheet"
                     )
 
+        # ── Inject raw-data RESOLVED rows into patch_resolved_pairs ─────────────
+        # Any N-able Status=RESOLVED row is treated as confirmed regardless of
+        # patch-report matching, so product sheets show ☑ and Resolved sheet is complete.
+        _status_col_inj = ('Threat Status' if 'Threat Status' in merged_df.columns
+                           else 'Status'   if 'Status'        in merged_df.columns
+                           else None)
+        if _status_col_inj:
+            from data_pipeline import _detect_product as _dp_detect_raw
+            _raw_resolved = merged_df[
+                merged_df[_status_col_inj].astype(str).str.strip().str.upper() == 'RESOLVED'
+            ].copy()
+            if not _raw_resolved.empty:
+                _raw_pairs = set(zip(
+                    _raw_resolved['Name'].apply(normalize_device_name),
+                    _raw_resolved['Vulnerability Name'].apply(extract_cve_id),
+                    _raw_resolved['Affected Products'].astype(str).apply(_dp_detect_raw),
+                ))
+                _before = len(patch_resolved_pairs)
+                patch_resolved_pairs |= _raw_pairs
+                log.info("Raw RESOLVED injection: %d pair(s) added (%d already present)",
+                         len(patch_resolved_pairs) - _before, len(_raw_pairs) - (len(patch_resolved_pairs) - _before))
+
         patch_confirmed_count = 0
         if patch_resolved_pairs:
             from data_pipeline import _detect_product as _dp_detect
@@ -488,13 +481,29 @@ def run(request: DashboardRequest) -> DashboardResult:
             header_fmt = styles['header']
             miss_fmt   = styles['row_missing']
 
+            # ── Sheet 1: Client Summary (always first) ────────────────────────
+            # Compute not-in-RMM CVE detection row count for the exclusion table
+            _not_in_rmm_cve_rows = int(
+                len(filtered_df[filtered_df['Last Response'] == 'Not Found in RMM'])
+            ) if 'Last Response' in filtered_df.columns else 0
+
+            build_client_summary_sheet(
+                wb, triage_df,
+                trend_data=trend_data,
+                customer_name=customer_name,
+                cutoff_date=request.cutoff_date if not request.show_all_dates else None,
+                stale_excluded_df=stale_excluded if not stale_excluded.empty else None,
+                not_in_rmm_count=not_in_rmm,
+                not_in_rmm_cve_count=_not_in_rmm_cve_rows,
+            )
+
             if trend_data:
                 build_trend_summary_sheet(wb, trend_data, request.threshold,
                                           prev_report_name, header_fmt,
                                           customer_name=customer_name)
 
             build_overview_sheet(
-                wb, merged_df, active_df, triage_df, request.threshold,
+                wb, merged_df, filtered_df, triage_df, request.threshold,
                 product_to_sheet, header_fmt, link_fmt,
                 customer_name=customer_name,
                 patch_confirmed_count=patch_confirmed_count,
@@ -508,7 +517,7 @@ def run(request: DashboardRequest) -> DashboardResult:
 
             if trend_data:
                 build_trend_detail_sheets(writer, wb, trend_data, link_fmt,
-                                          sheets_subset={'New Device-CVE Pairs', 'New CVE Types', 'Persisting CVEs'})
+                                          sheets_subset={'New This Month', 'Persisting CVEs'})
 
             build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
                                   patch_resolved_pairs=patch_resolved_pairs,
@@ -518,22 +527,51 @@ def run(request: DashboardRequest) -> DashboardResult:
                 build_trend_detail_sheets(writer, wb, trend_data, link_fmt,
                                           sheets_subset={'Resolved (Patch Confirmed)'})
 
-            build_all_detections_sheet(writer, merged_df, link_fmt, miss_fmt)
+            # All Detections sheet removed — redundant with product sheets + Raw Data
 
             if not stale_excluded.empty:
                 build_stale_excluded_sheet(writer, stale_excluded)
 
-            build_raw_data_sheet(writer, raw_df)
+            # Build raw_resolved_df for augmenting the Resolved sheet
+            _status_col_wb = ('Threat Status' if 'Threat Status' in merged_df.columns
+                              else 'Status'   if 'Status'        in merged_df.columns
+                              else None)
+            _raw_resolved_df = pd.DataFrame()
+            if _status_col_wb:
+                _raw_resolved_df = merged_df[
+                    merged_df[_status_col_wb].astype(str).str.strip().str.upper() == 'RESOLVED'
+                ].copy()
 
             if patch_data:
                 build_patch_sheets(writer, patch_data[0], patch_data[1], patch_data[2])
-                build_patch_resolved_sheet(writer, patch_data[1])
+
+                # Augment patch_full_df with raw RESOLVED rows so Resolved (Patch Confirmed)
+                # contains ALL resolved items — not just patch-report confirmed ones.
+                _patch_full_aug = patch_data[1].copy()
+                if not _raw_resolved_df.empty:
+                    _raw_for_sheet = _raw_resolved_df.copy()
+                    _raw_for_sheet['Patch Evidence Status'] = 'Patch confirmed - pending rescan'
+                    if 'Patch Match Result' not in _raw_for_sheet.columns:
+                        _raw_for_sheet['Patch Match Result'] = 'Resolved in N-able (Status=RESOLVED)'
+                    _patch_full_aug = pd.concat(
+                        [_patch_full_aug, _raw_for_sheet], ignore_index=True, sort=False
+                    ).drop_duplicates(subset=['Name', 'Vulnerability Name'], keep='first')
+
+                build_patch_resolved_sheet(writer, _patch_full_aug)
                 if any(not diagnostics[k].empty for k in diagnostics
                        if isinstance(diagnostics[k], pd.DataFrame)):
                     build_diagnostics_sheets(writer, diagnostics)
 
                 # Products in CVE data, device in patch report, but product not tracked
                 build_products_not_tracked_sheet(writer, patch_data[1])
+
+            elif not _raw_resolved_df.empty:
+                # No patch report but raw RESOLVED rows exist — still write Resolved sheet
+                _raw_for_sheet2 = _raw_resolved_df.copy()
+                _raw_for_sheet2['Patch Evidence Status'] = 'Patch confirmed - pending rescan'
+                if 'Patch Match Result' not in _raw_for_sheet2.columns:
+                    _raw_for_sheet2['Patch Match Result'] = 'Resolved in N-able (Status=RESOLVED)'
+                build_patch_resolved_sheet(writer, _raw_for_sheet2)
 
             # ── Write patch failure sheets (data already loaded above) ─────────
             if failure_df is not None and failure_lookup:
@@ -559,6 +597,9 @@ def run(request: DashboardRequest) -> DashboardResult:
                         f"actively failing — see 'Patch Failures' sheet"
                     )
 
+            # ── Raw Data last ─────────────────────────────────────────────────
+            build_raw_data_sheet(writer, raw_df)
+
         log.info("Workbook written successfully")
 
         # ── Save structured snapshot ──────────────────────────────────────────
@@ -571,8 +612,8 @@ def run(request: DashboardRequest) -> DashboardResult:
             output_path       = request.output_path,
             customer          = customer_name,
             threshold         = request.threshold,
-            unique_cves       = int(active_df['Vulnerability Name'].nunique()),
-            unique_devices    = int(active_df['Name'].nunique()),
+            unique_cves       = int(filtered_df['Vulnerability Name'].nunique()),
+            unique_devices    = int(filtered_df['Name'].nunique()),
             trend_metrics     = trend_data['metrics'] if trend_data else None,
             root_cause_summary= rc_summary or None,
         )

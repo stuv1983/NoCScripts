@@ -166,77 +166,31 @@ def build_trend_summary_sheet(workbook, trend, threshold, prev_report_name, head
         ws.write(r, 2, f'{cur:,}')
         ws.write(r, 3, ch_str, ch_fmt)
 
-    row += 1; ws.merge_range(row, 0, row, 3,
-                              f'  Snapshot  (score ≥ {threshold}, UNRESOLVED only, all current products)',
-                              sect_fmt)
-    row += 1; write_row(row, 'Unique active CVEs — all current products', m['prev_cves'],    m['cur_cves'])
-    row += 1; write_row(row, 'Unique devices affected',                   m['prev_devices'], m['cur_devices'])
-    row += 1; write_row(row, 'CVEs with known exploit',                   m['prev_exploit'], m['cur_exploit'])
-    row += 1; write_row(row, 'CISA KEV CVEs',                             m['prev_kev'],     m['cur_kev'])
-    row += 1; write_row(row, 'Servers affected',                          m['prev_servers'], m['cur_servers'])
+    row += 1; ws.merge_range(row, 0, row, 3, f'  Snapshot  (score ≥ {threshold})', sect_fmt)
+    row += 1; write_row(row, 'Unique CVEs (vulnerability types)', m['prev_cves'],    m['cur_cves'])
+    row += 1; write_row(row, 'Unique devices affected',           m['prev_devices'], m['cur_devices'])
+    # 'Unique CVE-device pairs' removed — metric causes more confusion than value
+    row += 1; write_row(row, 'CVEs with known exploit',           m['prev_exploit'], m['cur_exploit'])
+    row += 1; write_row(row, 'CISA KEV CVEs',                     m['prev_kev'],     m['cur_kev'])
+    row += 1; write_row(row, 'Servers affected',                  m['prev_servers'], m['cur_servers'])
 
-    # ── Comparable-scope clarification row ───────────────────────────────────
-    # The movement numbers below use the common-product scope (products present
-    # in BOTH reports). This row makes that difference visible so readers know
-    # why "all products" and "comparable scope" totals differ.
-    scoped_cur  = m.get('scoped_cur_cves',  m['cur_cves'])
-    scoped_prev = m.get('scoped_prev_cves', m['prev_cves'])
-    if scoped_cur != m['cur_cves'] or scoped_prev != m['prev_cves']:
-        row += 1
-        note_scope_fmt = workbook.add_format({'italic': True, 'font_color': '#7F6000', 'font_size': 9})
-        ws.write(row, 0,
-                 f'  ℹ  Comparable scope (products in both reports): '
-                 f'prev = {scoped_prev:,} CVE types,  this = {scoped_cur:,} CVE types  '
-                 f'— movement counts below use this scope.',
-                 note_scope_fmt)
-
-    row += 2; ws.merge_range(row, 0, row, 3,
-                              '  CVE Movement  (comparable scope — products in both reports)',
-                              sect_fmt)
+    row += 2; ws.merge_range(row, 0, row, 3, '  CVE Movement  (unique CVE types)', sect_fmt)
     nc, rc, pc = m['new_cve_count'], m['resolved_cve_count'], m['persisting_cve_count']
-    np_, rp, pp = (m.get('new_pair_count', nc),
-                   m.get('resolved_pair_count', rc),
-                   m.get('persisting_pair_count', pc))
-
-    sub_fmt2 = workbook.add_format({'bold': True, 'bg_color': '#EBF3FB', 'font_size': 9})
-    row += 1; ws.write(row, 0, 'CVE types view  (executive risk — unique vulnerability types)', sub_fmt2)
     row += 1
-    ws.write(row, 0, '  New CVE types introduced', lbl_fmt)
+    ws.write(row, 0, 'New CVE types introduced', lbl_fmt)
     ws.write(row, 2, f'{nc:,}')
     ws.write(row, 3, f'  ▲  {nc:,}' if nc else '  —  none', up_fmt if nc else same_fmt)
     row += 1
-    ws.write(row, 0, '  CVE types resolved / no longer detected', lbl_fmt)
+    ws.write(row, 0, 'CVE types resolved / no longer detected', lbl_fmt)
     ws.write(row, 2, f'{rc:,}')
     ws.write(row, 3, f'  ▼  {rc:,}' if rc else '  —  none', down_fmt if rc else same_fmt)
     row += 1
-    ws.write(row, 0, '  CVE types persisting from last period', lbl_fmt)
+    ws.write(row, 0, 'CVE types persisting from last period', lbl_fmt)
     ws.write(row, 2, f'{pc:,}')
     ws.write(row, 3, '  (see Persisting CVEs sheet)', same_fmt)
     row += 1
     note_fmt = workbook.add_format({'font_color': '#595959', 'italic': True})
-    ws.write(row, 0,
-             f'  ✓  {nc} new + {pc} persisting = {nc+pc} CVE types this scope  |  '
-             f'{rc} resolved + {pc} persisting = {rc+pc} CVE types previous scope',
-             note_fmt)
-
-    row += 1; ws.write(row, 0, 'Device-CVE pairs view  (patching workload — unique device × CVE pairs)', sub_fmt2)
-    row += 1
-    ws.write(row, 0, '  New device-CVE pairs', lbl_fmt)
-    ws.write(row, 2, f'{np_:,}')
-    ws.write(row, 3, f'  ▲  {np_:,}' if np_ else '  —  none', up_fmt if np_ else same_fmt)
-    row += 1
-    ws.write(row, 0, '  Resolved device-CVE pairs', lbl_fmt)
-    ws.write(row, 2, f'{rp:,}')
-    ws.write(row, 3, f'  ▼  {rp:,}' if rp else '  —  none', down_fmt if rp else same_fmt)
-    row += 1
-    ws.write(row, 0, '  Persisting device-CVE pairs', lbl_fmt)
-    ws.write(row, 2, f'{pp:,}')
-    ws.write(row, 3, '  (see Persisting CVEs sheet)', same_fmt)
-    row += 1
-    ws.write(row, 0,
-             f'  ℹ  Pairs > CVE types when one CVE spreads to multiple devices. '
-             f'Pairs < CVE types when a CVE is resolved on some devices but not all.',
-             note_fmt)
+    ws.write(row, 0, f'  ✓  {nc} + {pc} = {nc+pc} unique CVEs this report  |  {rc} + {pc} = {rc+pc} unique CVEs previous', note_fmt)
 
     row += 2; ws.merge_range(row, 0, row, 3, '  Device Movement', sect_fmt)
     row += 1
@@ -305,18 +259,16 @@ def build_trend_summary_sheet(workbook, trend, threshold, prev_report_name, head
                  note_fmt2)
 
     row += 2; ws.merge_range(row, 0, row, 3, '  Detail Sheets in This Workbook', sect_fmt)
-    row += 1; ws.write(row, 0, f'  📋  New Device-CVE Pairs  →  {np_:,} device/CVE pairs not present in previous report  (patching workload)')
-    row += 1; ws.write(row, 0, f'  🆕  New CVE Types         →  {nc:,} CVE types not present in previous report at all  (executive risk)')
-    row += 1; ws.write(row, 0, f'  ✅  Resolved              →  {rc:,} CVE types resolved (no longer detected or all devices ☑)')
-    row += 1; ws.write(row, 0, f'  ⏳  Persisting CVEs       →  {pc:,} CVE types carried over from previous report')
+    row += 1; ws.write(row, 0, f'  📋  New This Month    →  {m["new_cve_count"]} new CVE types × all affected devices')
+    row += 1; ws.write(row, 0, f'  ✅  Resolved          →  {m["resolved_cve_count"]} CVE types resolved (no longer detected or all devices ☑)')
+    row += 1; ws.write(row, 0, f'  ⏳  Persisting CVEs   →  {m["persisting_cve_count"]} CVE types carried over from previous report')
 
 
 # ── Trend Detail Sheets ───────────────────────────────────────────────────────
 
 def build_trend_detail_sheets(writer, workbook, trend, link_fmt, sheets_subset=None):
     """
-    Write trend detail sheets:
-      New Device-CVE Pairs / New CVE Types / Resolved / Persisting CVEs.
+    Write trend detail sheets: New This Month / Resolved / Persisting CVEs.
     sheets_subset: if given, only write sheets whose names are in this set.
     """
     new_bg  = workbook.add_format({'bg_color': '#FCE4D6'})  # orange – new
@@ -328,42 +280,18 @@ def build_trend_detail_sheets(writer, workbook, trend, link_fmt, sheets_subset=N
                    'Has Known Exploit', 'CISA KEV', 'Last Response']
 
     all_sheets = [
-        (
-            'New Device-CVE Pairs',
-            trend.get('new_pairs_df', trend.get('new_df', pd.DataFrame())),
-            new_bg,
-            'Device/CVE pairs not present in the previous report — new patching workload this period.',
-        ),
-        (
-            'New CVE Types',
-            trend.get('new_cve_types_df', pd.DataFrame()),
-            new_bg,
-            'CVE types not present in the previous report at all — new vulnerability types introduced this period.',
-        ),
-        (
-            'Resolved (Patch Confirmed)',
-            trend['resolved_df'],
-            res_bg,
-            'CVEs present last report that are no longer detected — confirmed remediated.',
-        ),
-        (
-            'Persisting CVEs',
-            trend['persisting_df'],
-            per_bg,
-            'CVEs carried over from the previous report — still unresolved.',
-        ),
+        ('New This Month',  trend['new_df'],        new_bg,
+         'New CVEs not seen in the previous report — investigate and prioritise.'),
+        ('Resolved (Patch Confirmed)',        trend['resolved_df'],   res_bg,
+         'CVEs present last report that are no longer detected — confirmed remediated.'),
+        ('Persisting CVEs', trend['persisting_df'], per_bg,
+         'CVEs carried over from the previous report — still unresolved.'),
     ]
-
-    # Back-compat: callers that still pass 'New This Month' in sheets_subset
-    # should receive the renamed sheet instead.
-    _compat_map = {'New This Month': 'New Device-CVE Pairs'}
-    if sheets_subset:
-        sheets_subset = {_compat_map.get(s, s) for s in sheets_subset}
 
     for sheet_name, df, row_fmt, note in all_sheets:
         if sheets_subset and sheet_name not in sheets_subset:
             continue
-        if df is None or df.empty:
+        if df.empty:
             ws = workbook.add_worksheet(sheet_name)
             ws.write(0, 0, f'No records — {note}')
             continue
@@ -815,7 +743,19 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
         # This prevents Edge patch evidence bleeding into Chrome rows for the
         # same CVE — a cross-product false-positive resolved tick.
         from data_pipeline import _detect_product as _dp_detect_prod
-        _sheet_pk = _dp_detect_prod(str(product))
+        # Use raw Affected Products values (not the base product name) so that
+        # 'Microsoft Office 365' maps to canonical key 'office365', not 'office'.
+        # get_base_product() strips '365' as if it were a version suffix, which
+        # breaks the lookup for any product whose name ends in a number.
+        _raw_pnames = group['Affected Products'].dropna().astype(str).unique().tolist()
+        _sheet_pk = ''
+        for _rpn in _raw_pnames:
+            _pk_candidate = _dp_detect_prod(_rpn)
+            if _pk_candidate:
+                _sheet_pk = _pk_candidate
+                break
+        if not _sheet_pk:
+            _sheet_pk = _dp_detect_prod(str(product))
 
         def _resolved_value(row):
             nk = normalize_device_name(row['Name'])
@@ -1066,8 +1006,8 @@ def build_patch_resolved_sheet(writer, patch_full_df: 'pd.DataFrame') -> None:
                         ascending=[True, False])
            .reset_index(drop=True))
 
-    out.to_excel(writer, sheet_name='Patch Confirmed', index=False)
-    ws = writer.sheets['Patch Confirmed']
+    out.to_excel(writer, sheet_name='Resolved (Patch Confirmed)', index=False)
+    ws = writer.sheets['Resolved (Patch Confirmed)']
     ws.autofilter(0, 0, len(out), len(out.columns) - 1)
     ws.set_row(0, None, hdr)
 
@@ -1089,7 +1029,7 @@ def build_patch_resolved_sheet(writer, patch_full_df: 'pd.DataFrame') -> None:
     unique_cves     = out['Vulnerability Name'].nunique()
     unique_devices  = out['Name'].nunique()
     ws.write(note_row, 0,
-             f'{unique_cves} CVE type(s) confirmed patched across {unique_devices} device(s) '
+             f'{unique_cves} CVE type(s) resolved across {unique_devices} device(s) '
              f'via patch report. Install date confirmed after first detection date.',
              note_fmt)
     ws.merge_range(note_row, 0, note_row, len(out.columns) - 1,
@@ -1301,6 +1241,319 @@ def build_stale_excluded_sheet(writer, stale_df) -> None:
     ws = writer.sheets['Stale Excluded Devices']
     ws.set_column('A:A', 35); ws.set_column('B:B', 25); ws.set_column('C:C', 20)
     ws.autofilter(0, 0, len(df), len(df.columns) - 1)
+
+
+def build_client_summary_sheet(workbook, filtered_df, trend_data=None, customer_name='',
+                               cutoff_date=None, stale_excluded_df=None,
+                               not_in_rmm_count=0, not_in_rmm_cve_count=0):
+    """
+    Client-facing summary sheet — first sheet in the workbook.
+
+    Contains:
+      - Key metrics table (total rows, unique CVEs, CVSS 9+ counts)
+      - CVSS score split table
+      - Vulnerability Distribution pie chart (CVSS score spread)
+      - Patching Effort bar chart (detections by CVSS score)
+      - Month-over-month patching progress table + line chart (when trend available)
+    """
+    ws = workbook.add_worksheet('Client Summary')
+
+    # ── Formats ───────────────────────────────────────────────────────────────
+    title_fmt  = workbook.add_format({'bold': True, 'font_size': 15,
+                                       'bg_color': '#1F4E79', 'font_color': 'white',
+                                       'border': 1, 'valign': 'vcenter'})
+    hdr_fmt    = workbook.add_format({'bold': True, 'bg_color': '#2E75B6',
+                                       'font_color': 'white', 'border': 1, 'align': 'center'})
+    sect_fmt   = workbook.add_format({'bold': True, 'bg_color': '#D6E4F0',
+                                       'border': 1, 'font_size': 11})
+    lbl_fmt    = workbook.add_format({'bold': True, 'bg_color': '#F2F2F2', 'border': 1})
+    val_fmt    = workbook.add_format({'border': 1, 'align': 'right', 'num_format': '#,##0'})
+    val_pct    = workbook.add_format({'border': 1, 'align': 'right', 'num_format': '0.0%'})
+    red_fmt    = workbook.add_format({'bold': True, 'font_color': 'white',
+                                       'bg_color': '#C00000', 'border': 1,
+                                       'align': 'right', 'num_format': '#,##0'})
+    grn_fmt    = workbook.add_format({'bold': True, 'font_color': 'white',
+                                       'bg_color': '#375623', 'border': 1,
+                                       'align': 'right', 'num_format': '#,##0'})
+    note_fmt   = workbook.add_format({'italic': True, 'font_color': '#595959', 'font_size': 9})
+    trend_up   = workbook.add_format({'bold': True, 'font_color': '#375623', 'border': 1,
+                                       'align': 'right'})
+    trend_dn   = workbook.add_format({'bold': True, 'font_color': '#C00000', 'border': 1,
+                                       'align': 'right'})
+    trend_eq   = workbook.add_format({'font_color': '#595959', 'border': 1, 'align': 'right'})
+
+    ws.set_column('A:A', 38)
+    ws.set_column('B:C', 18)
+    ws.set_column('D:D', 14)
+
+    # ── Title ─────────────────────────────────────────────────────────────────
+    title_text = (f'{customer_name}  —  ' if customer_name else '') + 'CVE Risk Exposure Summary'
+    ws.merge_range('A1:D1', title_text, title_fmt)
+    ws.set_row(0, 28)
+    ws.write('A2', f'Generated: {datetime.now().strftime("%d %B %Y")}', note_fmt)
+
+    # ── Compute metrics ───────────────────────────────────────────────────────
+    total_rows      = len(filtered_df)
+    unique_cves     = int(filtered_df['Vulnerability Name'].nunique()) if 'Vulnerability Name' in filtered_df.columns else 0
+    unique_devices  = int(filtered_df['Name'].nunique()) if 'Name' in filtered_df.columns else 0
+
+    score_col = 'Vulnerability Score' if 'Vulnerability Score' in filtered_df.columns else None
+    crit_mask = filtered_df[score_col] >= 9.0 if score_col else pd.Series([True] * len(filtered_df))
+    crit_rows = int(crit_mask.sum())
+    crit_cves = int(filtered_df.loc[crit_mask, 'Vulnerability Name'].nunique()) if score_col and 'Vulnerability Name' in filtered_df.columns else unique_cves
+
+    exploit_col = 'Has Known Exploit' if 'Has Known Exploit' in filtered_df.columns else None
+    exploit_count = int((filtered_df[exploit_col] == True).sum()) if exploit_col else 0  # noqa: E712
+
+    kev_col = 'CISA KEV' if 'CISA KEV' in filtered_df.columns else None
+    kev_count = int((filtered_df[kev_col] == True).sum()) if kev_col else 0  # noqa: E712
+
+    device_type_col = 'Device Type' if 'Device Type' in filtered_df.columns else None
+    server_count = 0
+    if device_type_col:
+        server_mask = filtered_df[device_type_col].astype(str).str.lower().str.contains('server', na=False)
+        server_count = int(filtered_df.loc[server_mask, 'Name'].nunique()) if 'Name' in filtered_df.columns else 0
+
+    # ── Key Metrics table ─────────────────────────────────────────────────────
+    row = 3
+    ws.merge_range(row, 0, row, 3, '  Key Metrics  (active devices only — excludes stale / not in RMM)', sect_fmt)
+    row += 1
+
+    metrics = [
+        ('Total CVE detection rows',          total_rows,     val_fmt),
+        ('Unique CVE types detected',          unique_cves,    val_fmt),
+        ('Unique devices affected',            unique_devices, val_fmt),
+        ('Detections at CVSS 9.0+',            crit_rows,      red_fmt),
+        ('Unique CVEs at CVSS 9.0+',           crit_cves,      red_fmt),
+        ('Detections with known exploit',      exploit_count,  red_fmt if exploit_count else val_fmt),
+        ('Detections on CISA KEV list',        kev_count,      red_fmt if kev_count else val_fmt),
+        ('Servers with CVE detections',        server_count,   val_fmt),
+    ]
+    for label, value, fmt in metrics:
+        ws.write(row, 0, label, lbl_fmt)
+        ws.merge_range(row, 1, row, 3, value, fmt)
+        row += 1
+
+    # ── Resolution Status breakdown ──────────────────────────────────────────
+    _status_col = ('Threat Status' if 'Threat Status' in filtered_df.columns
+                   else 'Status'   if 'Status'        in filtered_df.columns
+                   else None)
+    row += 1
+    if _status_col:
+        _res_mask   = filtered_df[_status_col].astype(str).str.strip().str.upper() == 'RESOLVED'
+        _unres_mask = ~_res_mask
+        _res_rows   = int(_res_mask.sum())
+        _unres_rows = int(_unres_mask.sum())
+        _tot_rows   = _res_rows + _unres_rows
+        _res_cves   = int(filtered_df.loc[_res_mask,   'Vulnerability Name'].nunique()) if 'Vulnerability Name' in filtered_df.columns else 0
+        _unres_cves = int(filtered_df.loc[_unres_mask, 'Vulnerability Name'].nunique()) if 'Vulnerability Name' in filtered_df.columns else 0
+
+        ws.merge_range(row, 0, row, 3, '  Resolution Status  (CVSS 9.0+, active devices only)', sect_fmt)
+        row += 1
+        ws.write(row, 0, 'Status',           hdr_fmt)
+        ws.write(row, 1, 'Detection Rows',   hdr_fmt)
+        ws.write(row, 2, '% of Total',       hdr_fmt)
+        ws.write(row, 3, 'Unique CVE Types', hdr_fmt)
+        row += 1
+        _res_pct   = _res_rows   / _tot_rows if _tot_rows else 0
+        _unres_pct = _unres_rows / _tot_rows if _tot_rows else 0
+        ws.write(row, 0, 'Resolved',   lbl_fmt); ws.write(row, 1, _res_rows,   grn_fmt); ws.write(row, 2, _res_pct,   val_pct); ws.write(row, 3, _res_cves,   grn_fmt); row += 1
+        ws.write(row, 0, 'Unresolved', lbl_fmt); ws.write(row, 1, _unres_rows, red_fmt); ws.write(row, 2, _unres_pct, val_pct); ws.write(row, 3, _unres_cves, red_fmt); row += 1
+        ws.write(row, 0, 'Total',      lbl_fmt); ws.write(row, 1, _tot_rows,   val_fmt); ws.write(row, 2, 1.0,        val_pct); ws.write(row, 3, (filtered_df['Vulnerability Name'].nunique() if 'Vulnerability Name' in filtered_df.columns else 0), val_fmt); row += 1
+        ws.merge_range(row, 0, row, 3,
+                       f'ℹ  CVSS 9.0+: {_res_rows:,} resolved  vs  {_unres_rows:,} unresolved'
+                       + (f'  |  {_res_cves:,} CVE types resolved  vs  {_unres_cves:,} unresolved' if _res_cves or _unres_cves else ''),
+                       note_fmt)
+        row += 1
+
+    # ── Excluded Detections breakdown ─────────────────────────────────────────
+    _stale_rows    = int(len(stale_excluded_df))  if stale_excluded_df  is not None and not stale_excluded_df.empty  else 0
+    _stale_devs    = int(stale_excluded_df['Name'].nunique()) if stale_excluded_df is not None and not stale_excluded_df.empty and 'Name' in stale_excluded_df.columns else 0
+    _stale_cves    = int(stale_excluded_df['Vulnerability Name'].nunique()) if stale_excluded_df is not None and not stale_excluded_df.empty and 'Vulnerability Name' in stale_excluded_df.columns else 0
+    _cutoff_label  = cutoff_date if cutoff_date else 'N/A (all dates included)'
+    _has_exclusions = _stale_rows > 0 or not_in_rmm_count > 0
+
+    if _has_exclusions:
+        row += 1
+        ws.merge_range(row, 0, row, 3, '  Excluded from Report', sect_fmt)
+        row += 1
+        ws.write(row, 0, 'Exclusion Reason',          hdr_fmt)
+        ws.write(row, 1, 'Devices',                   hdr_fmt)
+        ws.write(row, 2, 'CVE Detection Rows',        hdr_fmt)
+        ws.write(row, 3, 'Unique CVE Types',          hdr_fmt)
+        row += 1
+
+        _amber_fmt = workbook.add_format({'bg_color': '#FFF2CC', 'border': 1, 'align': 'right', 'num_format': '#,##0'})
+        _amber_lbl = workbook.add_format({'bg_color': '#FFF2CC', 'border': 1, 'bold': True})
+
+        if _stale_rows > 0:
+            _stale_label = f'Last Response before {_cutoff_label}'
+            ws.write(row, 0, _stale_label, _amber_lbl)
+            ws.write(row, 1, _stale_devs,  _amber_fmt)
+            ws.write(row, 2, _stale_rows,  _amber_fmt)
+            ws.write(row, 3, _stale_cves,  _amber_fmt)
+            row += 1
+
+        if not_in_rmm_count > 0:
+            ws.write(row, 0, 'Device not found in RMM inventory', _amber_lbl)
+            ws.write(row, 1, not_in_rmm_count,     _amber_fmt)
+            ws.write(row, 2, not_in_rmm_cve_count, _amber_fmt)
+            ws.write(row, 3, '',                    _amber_fmt)
+            row += 1
+
+        ws.merge_range(row, 0, row, 3,
+                       f'ℹ  Data filtered from {_cutoff_label}. '
+                       'Excluded devices are listed in the "Stale Excluded Devices" sheet.',
+                       note_fmt)
+        row += 1
+
+    # ── CVSS Score Split table ────────────────────────────────────────────────
+    row += 1
+    ws.merge_range(row, 0, row, 3, '  CVSS Score Split  (detection rows)', sect_fmt)
+    row += 1
+    ws.write(row, 0, 'CVSS Score', hdr_fmt)
+    ws.write(row, 1, 'Detection Rows', hdr_fmt)
+    ws.write(row, 2, '% of Total', hdr_fmt)
+    ws.write(row, 3, 'Unique CVEs', hdr_fmt)
+    row += 1
+
+    score_split_start = row   # remember for chart data range
+
+    if score_col:
+        score_groups = (
+            filtered_df.groupby(filtered_df[score_col].round(1))
+            .agg(rows=('Vulnerability Name', 'count'),
+                 cves=('Vulnerability Name', 'nunique'))
+            .sort_index(ascending=False)
+        )
+        score_split_data = []
+        for score_val, srow in score_groups.iterrows():
+            pct = srow['rows'] / total_rows if total_rows else 0
+            ws.write(row, 0, float(score_val), lbl_fmt)
+            ws.write(row, 1, int(srow['rows']),  val_fmt)
+            ws.write(row, 2, pct,                val_pct)
+            ws.write(row, 3, int(srow['cves']),  val_fmt)
+            score_split_data.append((float(score_val), int(srow['rows']), int(srow['cves'])))
+            row += 1
+    else:
+        score_split_data = []
+
+    score_split_end = row - 1  # last data row (inclusive)
+
+    # ── MoM Patching Progress table ───────────────────────────────────────────
+    mom_start_row = None
+    mom_data = []
+
+    if trend_data:
+        m = trend_data['metrics']
+        row += 1
+        ws.merge_range(row, 0, row, 3, '  Month-over-Month Patching Progress', sect_fmt)
+        row += 1
+        mom_start_row = row
+
+        mom_metrics = [
+            ('CVE types resolved / patched',     m.get('resolved_cve_count', 0),   True),
+            ('CVE types newly introduced',        m.get('new_cve_count', 0),        False),
+            ('CVE types persisting (unpatched)',  m.get('persisting_cve_count', 0), False),
+            ('Devices fully remediated',          m.get('remediated_devices', 0),   True),
+            ('New devices with CVEs',             m.get('new_devices', 0),          False),
+        ]
+
+        ws.write(row, 0, 'Metric', hdr_fmt)
+        ws.write(row, 1, 'Count', hdr_fmt)
+        ws.write(row, 2, 'Direction', hdr_fmt)
+        ws.write(row, 3, '', hdr_fmt)
+        row += 1
+
+        for label, value, good_if_nonzero in mom_metrics:
+            if good_if_nonzero:
+                v_fmt  = grn_fmt if value > 0 else val_fmt
+                d_str  = f'▼  {value:,}  (improvement)' if value > 0 else '—  no change'
+                d_fmt  = trend_up if value > 0 else trend_eq
+            else:
+                v_fmt  = red_fmt if value > 0 else val_fmt
+                d_str  = f'▲  {value:,}  (increase)' if value > 0 else '—  no change'
+                d_fmt  = trend_dn if value > 0 else trend_eq
+            ws.write(row, 0, label, lbl_fmt)
+            ws.write(row, 1, value, v_fmt)
+            ws.merge_range(row, 2, row, 3, d_str, d_fmt)
+            mom_data.append((label, value))
+            row += 1
+
+        mom_end_row = row - 1
+
+    # ── Note ──────────────────────────────────────────────────────────────────
+    row += 1
+    ws.write(row, 0,
+             'ℹ  All metrics exclude devices not found in RMM and devices outside the '
+             'active date window. CVSS 9.0+ detections are highlighted in red.',
+             note_fmt)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # CHARTS  (placed to the right of the data tables, starting col E)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    if score_split_data and len(score_split_data) >= 2:
+
+        # ── Chart 1: Vulnerability Distribution Pie ───────────────────────────
+        pie = workbook.add_chart({'type': 'pie'})
+        pie.add_series({
+            'name':       'Detection Rows',
+            'categories': ['Client Summary', score_split_start, 0, score_split_end, 0],
+            'values':     ['Client Summary', score_split_start, 1, score_split_end, 1],
+            'data_labels': {'percentage': True, 'category': True,
+                            'font': {'size': 9}},
+        })
+        pie.set_title({'name': 'Vulnerability Distribution by CVSS Score'})
+        pie.set_style(10)
+        pie.set_size({'width': 380, 'height': 260})
+        ws.insert_chart('F4', pie, {'x_offset': 5, 'y_offset': 5})
+
+        # ── Chart 2: Patching Effort Bar ─────────────────────────────────────
+        bar = workbook.add_chart({'type': 'bar'})
+        bar.add_series({
+            'name':       'Detection Rows',
+            'categories': ['Client Summary', score_split_start, 0, score_split_end, 0],
+            'values':     ['Client Summary', score_split_start, 1, score_split_end, 1],
+            'fill':       {'color': '#2E75B6'},
+            'data_labels': {'value': True, 'font': {'size': 9}},
+        })
+        bar.add_series({
+            'name':       'Unique CVEs',
+            'categories': ['Client Summary', score_split_start, 0, score_split_end, 0],
+            'values':     ['Client Summary', score_split_start, 3, score_split_end, 3],
+            'fill':       {'color': '#ED7D31'},
+            'data_labels': {'value': True, 'font': {'size': 9}},
+        })
+        bar.set_title({'name': 'Patching Effort by CVSS Score'})
+        bar.set_x_axis({'name': 'Count'})
+        bar.set_y_axis({'name': 'CVSS Score'})
+        bar.set_legend({'position': 'bottom'})
+        bar.set_style(10)
+        bar.set_size({'width': 380, 'height': 260})
+        ws.insert_chart('F20', bar, {'x_offset': 5, 'y_offset': 5})
+
+    # ── Chart 3: MoM Patching Progress Bar ───────────────────────────────────
+    if trend_data and mom_data and mom_start_row is not None:
+        mom_chart_start = mom_start_row + 1   # skip header row
+        mom_chart_end   = mom_chart_start + len(mom_data) - 1
+
+        mom_bar = workbook.add_chart({'type': 'bar'})
+        mom_bar.add_series({
+            'name':       'Count',
+            'categories': ['Client Summary', mom_chart_start, 0, mom_chart_end, 0],
+            'values':     ['Client Summary', mom_chart_start, 1, mom_chart_end, 1],
+            'fill':       {'color': '#375623'},
+            'data_labels': {'value': True, 'font': {'size': 9}},
+        })
+        mom_bar.set_title({'name': 'Month-over-Month Patching Progress'})
+        mom_bar.set_x_axis({'name': 'Count'})
+        mom_bar.set_legend({'none': True})
+        mom_bar.set_style(10)
+        mom_bar.set_size({'width': 380, 'height': 260})
+        ws.insert_chart('F36', mom_bar, {'x_offset': 5, 'y_offset': 5})
+
+    log.debug("Client Summary sheet written")
 
 
 def build_raw_data_sheet(writer, raw_df):
