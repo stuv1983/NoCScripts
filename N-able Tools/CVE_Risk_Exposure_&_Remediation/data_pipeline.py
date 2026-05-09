@@ -287,7 +287,9 @@ def _resolve_baseline(row) -> tuple[str, str]:
 
 
 def _classify_baseline_compliance(row) -> str:
-    status = str(row.get('Status', '')).strip()
+    # Use '_patch_status' — the patch report's install status column.
+    # 'Status' on the merged row is the CVE threat status (RESOLVED/UNRESOLVED).
+    status = str(row.get('_patch_status', '')).strip()
     if status not in INSTALLED_STATUSES:
         return 'Not installed'
     bl = str(row.get('Product Baseline', '')).strip()
@@ -303,7 +305,9 @@ def _classify_baseline_compliance(row) -> str:
 
 
 def _classify_version_check(row):
-    status = str(row.get('Status', '')).strip()
+    # Use '_patch_status' — the patch report's install status column.
+    # 'Status' on the merged row is the CVE threat status (RESOLVED/UNRESOLVED).
+    status = str(row.get('_patch_status', '')).strip()
     pv     = str(row.get('Matched Patch Version', '')).strip()
     fv     = str(row.get('Fixed Version Used', '')).strip()
     if status not in INSTALLED_STATUSES:
@@ -317,7 +321,9 @@ def _classify_version_check(row):
     return 'Version comparison failed'
 
 def _classify_resolution(row):
-    status = str(row.get('Status', '')).strip()
+    # Use '_patch_status' — the patch report's install status column.
+    # 'Status' on the merged row is the CVE threat status (RESOLVED/UNRESOLVED).
+    status = str(row.get('_patch_status', '')).strip()
     if status not in INSTALLED_STATUSES:
         return 'Unresolved'
 
@@ -727,9 +733,19 @@ def process_patch_match(patch_path, cve_df, min_score=9.0):
     patch['_dk']  = patch['Device'].map(_norm_compact)
     patch['_pk']  = patch['Patch'].map(_detect_product)
     patch['_pd']  = pd.to_datetime(patch['Discovered / Install Date'], errors='coerce')
-    patch['_sr']  = patch['Status'].map(STATUS_RANK).fillna(0)
     patch['_kbs'] = patch['Patch'].apply(_extract_kbs)
     patch['_pv']  = patch['Patch'].apply(_extract_best_version)
+
+    # Rename the patch report's 'Status' to '_patch_status' before the merge so it
+    # survives as a clean, unambiguous column name on every merged row.
+    # Without this, pandas merge suffixes=('', '_p') would produce 'Status_p' for
+    # the patch status — but _classify_version_check, _classify_resolution, and
+    # _classify_baseline_compliance all call row.get('Status', ''), which silently
+    # picks up the CVE Status column ('RESOLVED'/'UNRESOLVED') instead of the patch
+    # install status ('Installed'/'Pending'/etc.).  That bug caused every row to
+    # return 'Patch not yet installed' regardless of the actual patch state.
+    patch = patch.rename(columns={'Status': '_patch_status'})
+    patch['_sr'] = patch['_patch_status'].map(STATUS_RANK).fillna(0)
 
     patch_devices = set(zip(patch['_ck'], patch['_sk'], patch['_dk']))
 
@@ -746,7 +762,7 @@ def process_patch_match(patch_path, cve_df, min_score=9.0):
                 errors='coerce', utc=True).dt.tz_localize(None)
 
     merged = cve.merge(
-        patch[['_ck', '_sk', '_dk', '_pk', 'Status', 'Patch', '_pd', '_sr', '_kbs', '_pv']]
+        patch[['_ck', '_sk', '_dk', '_pk', '_patch_status', 'Patch', '_pd', '_sr', '_kbs', '_pv']]
               .rename(columns={'_ck': '_mck'}),
         left_on=['_ck', '_sk', '_dk', '_pk'],
         right_on=['_mck', '_sk', '_dk', '_pk'],
@@ -762,8 +778,8 @@ def process_patch_match(patch_path, cve_df, min_score=9.0):
             patch_arch = _get_arch(str(row.get('Patch', '')))
             if cve_arch and patch_arch and cve_arch != patch_arch:
                 return 'Device in patch report - product not found'
-            return STATUS_LABEL.get(str(row.get('Status', '')).strip(),
-                                     f"Matched - {str(row.get('Status', '')).lower()}")
+            return STATUS_LABEL.get(str(row.get('_patch_status', '')).strip(),
+                                     f"Matched - {str(row.get('_patch_status', '')).lower()}")
         if (row['_ck'], row['_sk'], row['_dk']) in patch_devices:
             return 'Device in patch report - product not found'
         return 'Not found in patch report'
@@ -784,7 +800,11 @@ def process_patch_match(patch_path, cve_df, min_score=9.0):
     best['Version Check Result']         = best.apply(_classify_version_check, axis=1)
     best['Baseline Compliance']          = best.apply(_classify_baseline_compliance, axis=1)
 
-    best = best.rename(columns={'Patch': 'Matched Patch', '_pd': 'Patch Install Date'})
+    best = best.rename(columns={
+        'Patch':          'Matched Patch',
+        '_pd':            'Patch Install Date',
+        '_patch_status':  'Status_p',    # restore the display name users see in Excel
+    })
     best['Patch Evidence Status'] = best.apply(_classify_resolution, axis=1)
 
     best = _apply_cascade_resolution(best)
@@ -899,16 +919,9 @@ def _active_trend_scope(df: pd.DataFrame, threshold: float,
     Applies the full pipeline in one place so every caller uses identical logic:
       • Score threshold
       • UNRESOLVED-only (status column named 'Threat Status' or 'Status')
-      • Not-in-RMM exclusion (devices with Last Response == 'Not Found in RMM'
-        have no confirmed identity in the managed estate and must not skew
-        New / Resolved / Persisting counts regardless of inventory_devices)
       • Inventory filter (decommissioned devices dropped)
       • Stale filter (stale devices dropped completely from trend comparison)
       • Deduplication on (_Name_Key, _CVE_Key, _Product_Key)
-
-    NOTE: normalize_device_name is applied to 'Name' before any set lookup, so
-    stale_names built in orchestrator.py must also use the same normaliser —
-    this is enforced there via .apply(normalize_device_name).
     """
     out = df.copy()
     out['_Name_Key']    = out['Name'].apply(normalize_device_name)
@@ -925,19 +938,6 @@ def _active_trend_scope(df: pd.DataFrame, threshold: float,
            else None)
     if _sc:
         out = out[out[_sc].astype(str).str.strip().str.upper().eq('UNRESOLVED')].copy()
-
-    # Exclude devices that were not matched in the RMM inventory.
-    # These rows carry no confirmed device identity and would produce phantom
-    # New / Resolved signals if carried into set arithmetic.
-    # Guard on column presence: older previous-report exports may predate this
-    # column — log a debug note so the absence is traceable, then skip the filter.
-    if 'Last Response' in out.columns:
-        out = out[out['Last Response'].astype(str).str.strip() != 'Not Found in RMM'].copy()
-    else:
-        log.debug(
-            "_active_trend_scope: 'Last Response' column absent in DataFrame — "
-            "skipping Not-in-RMM filter (older report format)"
-        )
 
     if inventory_devices:
         out = out[out['_Name_Key'].isin(inventory_devices)].copy()
