@@ -1111,15 +1111,26 @@ def build_stale_cves_sheet(writer, df, link_fmt) -> None:
     
     ws.write(len(out) + 2, 0, 'ℹ  These UNRESOLVED CVEs belong to devices that were excluded from the main report due to being stale.', writer.book.add_format({'italic': True, 'font_color': '#595959'}))
 
-def build_client_summary_sheet(workbook, filtered_df, trend_data=None, customer_name='',
+def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
+                               trend_data=None, customer_name='',
                                cutoff_date=None, stale_excluded_df=None,
                                not_in_rmm_count=0, not_in_rmm_cve_count=0,
                                not_in_rmm_unique_cves=0,
                                report_month=''):
+    """
+    Client Summary sheet.
+
+    filtered_df  — post-score-threshold rows INCLUDING not-in-RMM and stale devices.
+                   Used only for the waterfall "total" baseline.
+    triage_df    — active scope only (stale and not-in-RMM already removed).
+                   All Key Metrics and charts are built from this.
+    threshold    — CVSS floor used in this run; shown in the waterfall header.
+    """
     ws = workbook.add_worksheet('Client Summary')
     if not report_month:
         report_month = datetime.now().strftime("%B %Y")
 
+    # ── Formats ───────────────────────────────────────────────────────────────
     title_fmt  = workbook.add_format({'bold': True, 'font_size': 15,
                                        'bg_color': '#1F4E79', 'font_color': 'white',
                                        'border': 1, 'valign': 'vcenter'})
@@ -1136,48 +1147,61 @@ def build_client_summary_sheet(workbook, filtered_df, trend_data=None, customer_
     grn_fmt    = workbook.add_format({'bold': True, 'font_color': 'white',
                                        'bg_color': '#375623', 'border': 1,
                                        'align': 'right', 'num_format': '#,##0'})
-    note_fmt   = workbook.add_format({'italic': True, 'font_color': '#595959', 'font_size': 9})
+    note_fmt   = workbook.add_format({'italic': True, 'font_color': '#595959', 'font_size': 9,
+                                       'text_wrap': True})
     trend_up   = workbook.add_format({'bold': True, 'font_color': '#375623', 'border': 1,
                                        'align': 'right'})
     trend_dn   = workbook.add_format({'bold': True, 'font_color': '#C00000', 'border': 1,
                                        'align': 'right'})
     trend_eq   = workbook.add_format({'font_color': '#595959', 'border': 1, 'align': 'right'})
+    # Waterfall-specific formats
+    wf_plus    = workbook.add_format({'bold': True, 'bg_color': '#F2F2F2', 'border': 1})
+    wf_minus   = workbook.add_format({'bold': True, 'bg_color': '#FFF2CC', 'border': 1})
+    wf_minus_v = workbook.add_format({'font_color': '#C00000', 'bg_color': '#FFF2CC',
+                                       'border': 1, 'align': 'right', 'num_format': '#,##0'})
+    wf_eq_lbl  = workbook.add_format({'bold': True, 'bg_color': '#D6E4F0', 'border': 1})
+    wf_eq_val  = workbook.add_format({'bold': True, 'bg_color': '#D6E4F0', 'border': 1,
+                                       'align': 'right', 'num_format': '#,##0'})
 
-    ws.set_column('A:A', 38)
-    ws.set_column('B:C', 18)
-    ws.set_column('D:D', 14)
+    ws.set_column('A:A', 44)
+    ws.set_column('B:B', 18)
+    ws.set_column('C:C', 18)
+    ws.set_column('D:D', 18)
 
+    # ── Title ─────────────────────────────────────────────────────────────────
     title_text = (f'{customer_name}  —  ' if customer_name else '') + 'CVE Risk Exposure Summary'
     ws.merge_range('A1:D1', title_text, title_fmt)
     ws.set_row(0, 28)
-    ws.write('A2', f'Report Month: {report_month}  |  Generated: {datetime.now().strftime("%d %b %Y")}', workbook.add_format({'italic': True, 'font_color': '#595959', 'font_size': 9}))
+    date_fmt = workbook.add_format({'italic': True, 'font_color': '#595959', 'font_size': 9})
+    ws.write('A2', f'Report Month: {report_month}  |  Generated: {datetime.now().strftime("%d %b %Y")}', date_fmt)
 
-    total_rows      = len(filtered_df)
-    unique_cves     = int(filtered_df['Vulnerability Name'].nunique()) if 'Vulnerability Name' in filtered_df.columns else 0
-    unique_devices  = int(filtered_df['Name'].nunique()) if 'Name' in filtered_df.columns else 0
+    # ── Active-scope metrics (all sourced from triage_df) ─────────────────────
+    total_rows     = len(triage_df)
+    unique_cves    = int(triage_df['Vulnerability Name'].nunique()) if 'Vulnerability Name' in triage_df.columns else 0
+    unique_devices = int(triage_df['Name'].nunique())              if 'Name'                in triage_df.columns else 0
 
-    score_col = 'Vulnerability Score' if 'Vulnerability Score' in filtered_df.columns else None
-    crit_mask = filtered_df[score_col] >= 9.0 if score_col else pd.Series([True] * len(filtered_df))
-    crit_rows = int(crit_mask.sum())
-    crit_cves = int(filtered_df.loc[crit_mask, 'Vulnerability Name'].nunique()) if score_col and 'Vulnerability Name' in filtered_df.columns else unique_cves
+    score_col  = 'Vulnerability Score' if 'Vulnerability Score' in triage_df.columns else None
+    crit_mask  = triage_df[score_col] >= 9.0 if score_col else pd.Series([True] * len(triage_df))
+    crit_rows  = int(crit_mask.sum())
+    crit_cves  = int(triage_df.loc[crit_mask, 'Vulnerability Name'].nunique()) if score_col and 'Vulnerability Name' in triage_df.columns else unique_cves
 
-    exploit_col = 'Has Known Exploit' if 'Has Known Exploit' in filtered_df.columns else None
-    exploit_count = int((filtered_df[exploit_col] == True).sum()) if exploit_col else 0
+    exploit_col   = 'Has Known Exploit' if 'Has Known Exploit' in triage_df.columns else None
+    exploit_count = int((triage_df[exploit_col] == True).sum()) if exploit_col else 0
 
-    kev_col = 'CISA KEV' if 'CISA KEV' in filtered_df.columns else None
-    kev_count = int((filtered_df[kev_col] == True).sum()) if kev_col else 0
+    kev_col   = 'CISA KEV' if 'CISA KEV' in triage_df.columns else None
+    kev_count = int((triage_df[kev_col] == True).sum()) if kev_col else 0
 
-    device_type_col = 'Device Type' if 'Device Type' in filtered_df.columns else None
     server_count = 0
-    if device_type_col:
-        server_mask = filtered_df[device_type_col].astype(str).str.lower().str.contains('server', na=False)
-        server_count = int(filtered_df.loc[server_mask, 'Name'].nunique()) if 'Name' in filtered_df.columns else 0
+    if 'Device Type' in triage_df.columns and 'Name' in triage_df.columns:
+        srv_mask     = triage_df['Device Type'].astype(str).str.lower().str.contains('server', na=False)
+        server_count = int(triage_df.loc[srv_mask, 'Name'].nunique())
 
     row = 3
-    ws.merge_range(row, 0, row, 3, '  Key Metrics  (active devices only — excludes stale / not in RMM)', sect_fmt)
+    ws.merge_range(row, 0, row, 3,
+                   '  Key Metrics  (active devices only — excludes stale / not in RMM)', sect_fmt)
     row += 1
 
-    metrics = [
+    for label, value, fmt in [
         ('Total CVE detection rows',          total_rows,     val_fmt),
         ('Unique CVE types detected',          unique_cves,    val_fmt),
         ('Unique devices affected',            unique_devices, val_fmt),
@@ -1186,26 +1210,26 @@ def build_client_summary_sheet(workbook, filtered_df, trend_data=None, customer_
         ('Detections with known exploit',      exploit_count,  red_fmt if exploit_count else val_fmt),
         ('Detections on CISA KEV list',        kev_count,      red_fmt if kev_count else val_fmt),
         ('Servers with CVE detections',        server_count,   val_fmt),
-    ]
-    for label, value, fmt in metrics:
+    ]:
         ws.write(row, 0, label, lbl_fmt)
         ws.merge_range(row, 1, row, 3, value, fmt)
         row += 1
 
-    _status_col = ('Threat Status' if 'Threat Status' in filtered_df.columns
-                   else 'Status'   if 'Status'        in filtered_df.columns
+    # ── Resolution Status ─────────────────────────────────────────────────────
+    _status_col = ('Threat Status' if 'Threat Status' in triage_df.columns
+                   else 'Status'   if 'Status'        in triage_df.columns
                    else None)
     row += 1
     if _status_col:
-        _res_mask   = filtered_df[_status_col].astype(str).str.strip().str.upper() == 'RESOLVED'
+        _res_mask   = triage_df[_status_col].astype(str).str.strip().str.upper() == 'RESOLVED'
         _unres_mask = ~_res_mask
         _res_rows   = int(_res_mask.sum())
         _unres_rows = int(_unres_mask.sum())
         _tot_rows   = _res_rows + _unres_rows
-        _res_cves   = int(filtered_df.loc[_res_mask,   'Vulnerability Name'].nunique()) if 'Vulnerability Name' in filtered_df.columns else 0
-        _unres_cves = int(filtered_df.loc[_unres_mask, 'Vulnerability Name'].nunique()) if 'Vulnerability Name' in filtered_df.columns else 0
+        _res_cves   = int(triage_df.loc[_res_mask,   'Vulnerability Name'].nunique()) if 'Vulnerability Name' in triage_df.columns else 0
+        _unres_cves = int(triage_df.loc[_unres_mask, 'Vulnerability Name'].nunique()) if 'Vulnerability Name' in triage_df.columns else 0
 
-        ws.merge_range(row, 0, row, 3, '  Resolution Status  (CVSS 9.0+, active devices only)', sect_fmt)
+        ws.merge_range(row, 0, row, 3, '  Resolution Status  (active devices only)', sect_fmt)
         row += 1
         ws.write(row, 0, 'Status',           hdr_fmt)
         ws.write(row, 1, 'Detection Rows',   hdr_fmt)
@@ -1216,87 +1240,124 @@ def build_client_summary_sheet(workbook, filtered_df, trend_data=None, customer_
         _unres_pct = _unres_rows / _tot_rows if _tot_rows else 0
         ws.write(row, 0, 'Resolved',   lbl_fmt); ws.write(row, 1, _res_rows,   grn_fmt); ws.write(row, 2, _res_pct,   val_pct); ws.write(row, 3, _res_cves,   grn_fmt); row += 1
         ws.write(row, 0, 'Unresolved', lbl_fmt); ws.write(row, 1, _unres_rows, red_fmt); ws.write(row, 2, _unres_pct, val_pct); ws.write(row, 3, _unres_cves, red_fmt); row += 1
-        ws.write(row, 0, 'Total',      lbl_fmt); ws.write(row, 1, _tot_rows,   val_fmt); ws.write(row, 2, 1.0,        val_pct); ws.write(row, 3, (filtered_df['Vulnerability Name'].nunique() if 'Vulnerability Name' in filtered_df.columns else 0), val_fmt); row += 1
+        ws.write(row, 0, 'Total',      lbl_fmt)
+        ws.write(row, 1, _tot_rows,    val_fmt)
+        ws.write(row, 2, 1.0,          val_pct)
+        ws.write(row, 3, triage_df['Vulnerability Name'].nunique() if 'Vulnerability Name' in triage_df.columns else 0, val_fmt)
+        row += 1
         ws.merge_range(row, 0, row, 3,
                        f'ℹ  CVSS 9.0+: {_res_rows:,} resolved  vs  {_unres_rows:,} unresolved'
-                       + (f'  |  {_res_cves:,} CVE types resolved  vs  {_unres_cves:,} unresolved' if _res_cves or _unres_cves else ''),
+                       + (f'  |  {_res_cves:,} CVE types resolved  vs  {_unres_cves:,} unresolved'
+                          if _res_cves or _unres_cves else ''),
                        note_fmt)
         row += 1
 
-    _stale_rows    = int(len(stale_excluded_df))  if stale_excluded_df  is not None and not stale_excluded_df.empty  else 0
-    _stale_devs    = int(stale_excluded_df['Name'].nunique()) if stale_excluded_df is not None and not stale_excluded_df.empty and 'Name' in stale_excluded_df.columns else 0
-    _stale_cves    = int(stale_excluded_df['Vulnerability Name'].nunique()) if stale_excluded_df is not None and not stale_excluded_df.empty and 'Vulnerability Name' in stale_excluded_df.columns else 0
-    _cutoff_label  = cutoff_date if cutoff_date else 'N/A (all dates included)'
-    _has_exclusions = _stale_rows > 0 or not_in_rmm_count > 0
+    # ── Data Filtering Reconciliation (Waterfall) ─────────────────────────────
+    # Compute stale-device counts from stale_excluded_df
+    _stale_rows = int(len(stale_excluded_df)) if stale_excluded_df is not None and not stale_excluded_df.empty else 0
+    _stale_devs = (int(stale_excluded_df['Name'].nunique())
+                   if stale_excluded_df is not None and not stale_excluded_df.empty
+                   and 'Name' in stale_excluded_df.columns else 0)
+    _stale_cves = (int(stale_excluded_df['Vulnerability Name'].nunique())
+                   if stale_excluded_df is not None and not stale_excluded_df.empty
+                   and 'Vulnerability Name' in stale_excluded_df.columns else 0)
+    _cutoff_label = cutoff_date if cutoff_date else 'N/A (all dates included)'
 
-    if _has_exclusions:
-        row += 1
-        ws.merge_range(row, 0, row, 3, '  Excluded from Report', sect_fmt)
-        row += 1
-        ws.write(row, 0, 'Exclusion Reason',          hdr_fmt)
-        ws.write(row, 1, 'Devices',                   hdr_fmt)
-        ws.write(row, 2, 'CVE Detection Rows',        hdr_fmt)
-        ws.write(row, 3, 'Unique CVE Types',          hdr_fmt)
-        row += 1
-
-        _amber_fmt = workbook.add_format({'bg_color': '#FFF2CC', 'border': 1, 'align': 'right', 'num_format': '#,##0'})
-        _amber_lbl = workbook.add_format({'bg_color': '#FFF2CC', 'border': 1, 'bold': True})
-
-        if _stale_rows > 0:
-            _stale_label = f'Last Response before {_cutoff_label}'
-            ws.write(row, 0, _stale_label, _amber_lbl)
-            ws.write(row, 1, _stale_devs,  _amber_fmt)
-            ws.write(row, 2, _stale_rows,  _amber_fmt)
-            ws.write(row, 3, _stale_cves,  _amber_fmt)
-            row += 1
-
-        if not_in_rmm_count > 0:
-            ws.write(row, 0, 'Device in Detections but no longer in RMM', _amber_lbl)
-            ws.write(row, 1, not_in_rmm_count,       _amber_fmt)
-            ws.write(row, 2, not_in_rmm_cve_count,   _amber_fmt)
-            ws.write(row, 3, not_in_rmm_unique_cves, _amber_fmt) # <--- Fixed! Now injects the correct unique CVE count
-            row += 1
-
-        ws.merge_range(row, 0, row, 3,
-                       f'ℹ  Data filtered from {_cutoff_label}. '
-                       'Excluded devices are listed in the "Stale Excluded Devices" sheet.',
-                       note_fmt)
-        row += 1
+    # "Total" baseline = filtered_df (score-filtered, includes stale + not-in-RMM)
+    # plus stale_excluded_df (rows removed BEFORE score filter in the pipeline).
+    # Together they represent every row in the raw N-able export above the threshold.
+    _combined = pd.concat(
+        [df for df in (filtered_df, stale_excluded_df) if df is not None and not df.empty],
+        ignore_index=True,
+    )
+    _total_rows = len(_combined)
+    _total_devs = int(_combined['Name'].nunique())              if 'Name'                in _combined.columns else 0
+    _total_cves = int(_combined['Vulnerability Name'].nunique()) if 'Vulnerability Name' in _combined.columns else 0
 
     row += 1
-    ws.merge_range(row, 0, row, 3, '  CVSS Score Split  (detection rows)', sect_fmt)
+    ws.merge_range(row, 0, row, 3,
+                   f'  Data Filtering Reconciliation  (CVSS ≥ {threshold})', sect_fmt)
     row += 1
-    ws.write(row, 0, 'CVSS Score', hdr_fmt)
+    ws.write(row, 0, 'Filter Step',        hdr_fmt)
+    ws.write(row, 1, 'Unique Devices',     hdr_fmt)
+    ws.write(row, 2, 'Detection Rows',     hdr_fmt)
+    ws.write(row, 3, 'Unique CVE Types',   hdr_fmt)
+    row += 1
+
+    # [+] Total
+    ws.write(row, 0, '[+]  Total raw detections (all devices, CVSS ≥ threshold)', wf_plus)
+    ws.write(row, 1, _total_devs, val_fmt)
+    ws.write(row, 2, _total_rows, val_fmt)
+    ws.write(row, 3, _total_cves, val_fmt)
+    row += 1
+
+    # [-] Stale devices
+    if _stale_rows > 0:
+        ws.write(row, 0, f'[-]  Excluded: stale devices  (Last Response before {_cutoff_label})', wf_minus)
+        ws.write(row, 1, _stale_devs, wf_minus_v)
+        ws.write(row, 2, _stale_rows, wf_minus_v)
+        ws.write(row, 3, _stale_cves, wf_minus_v)
+        row += 1
+
+    # [-] Not in RMM
+    if not_in_rmm_count > 0:
+        ws.write(row, 0, '[-]  Excluded: device not found in RMM', wf_minus)
+        ws.write(row, 1, not_in_rmm_count,       wf_minus_v)
+        ws.write(row, 2, not_in_rmm_cve_count,   wf_minus_v)
+        ws.write(row, 3, not_in_rmm_unique_cves, wf_minus_v)
+        row += 1
+
+    # [=] Active tracked scope
+    ws.write(row, 0, '[=]  Active tracked scope  (Key Metrics above)', wf_eq_lbl)
+    ws.write(row, 1, unique_devices, wf_eq_val)
+    ws.write(row, 2, total_rows,     wf_eq_val)
+    ws.write(row, 3, unique_cves,    wf_eq_val)
+    row += 1
+
+    ws.merge_range(row, 0, row, 3,
+                   'ℹ  Row counts subtract precisely. Unique Device and Unique CVE Type counts '
+                   'may not subtract perfectly — a CVE type that appears on both an excluded '
+                   'and an active device is counted in both groups, so the difference is '
+                   'smaller than a simple subtraction implies. '
+                   'Stale devices are listed in the "Stale Excluded Devices" sheet.',
+                   note_fmt)
+    ws.set_row(row, 42)   # extra height for the wrapped note
+    row += 1
+
+    # ── CVSS Score Split ──────────────────────────────────────────────────────
+    row += 1
+    ws.merge_range(row, 0, row, 3, '  CVSS Score Split  (active detection rows)', sect_fmt)
+    row += 1
+    ws.write(row, 0, 'CVSS Score',     hdr_fmt)
     ws.write(row, 1, 'Detection Rows', hdr_fmt)
-    ws.write(row, 2, '% of Total', hdr_fmt)
-    ws.write(row, 3, 'Unique CVEs', hdr_fmt)
+    ws.write(row, 2, '% of Total',     hdr_fmt)
+    ws.write(row, 3, 'Unique CVEs',    hdr_fmt)
     row += 1
 
     score_split_start = row
+    score_split_data  = []
 
     if score_col:
         score_groups = (
-            filtered_df.groupby(filtered_df[score_col].round(1))
+            triage_df.groupby(triage_df[score_col].round(1))
             .agg(rows=('Vulnerability Name', 'count'),
                  cves=('Vulnerability Name', 'nunique'))
             .sort_index(ascending=False)
         )
-        score_split_data = []
         for score_val, srow in score_groups.iterrows():
             pct = srow['rows'] / total_rows if total_rows else 0
-            ws.write(row, 0, float(score_val), lbl_fmt)
-            ws.write(row, 1, int(srow['rows']),  val_fmt)
-            ws.write(row, 2, pct,                val_pct)
-            ws.write(row, 3, int(srow['cves']),  val_fmt)
+            ws.write(row, 0, float(score_val),  lbl_fmt)
+            ws.write(row, 1, int(srow['rows']), val_fmt)
+            ws.write(row, 2, pct,               val_pct)
+            ws.write(row, 3, int(srow['cves']), val_fmt)
             score_split_data.append((float(score_val), int(srow['rows']), int(srow['cves'])))
             row += 1
-    else:
-        score_split_data = []
 
     score_split_end = row - 1
 
+    # ── Month-over-Month Patching Progress ────────────────────────────────────
     mom_start_row = None
-    mom_data = []
+    mom_data      = []
 
     if trend_data:
         m = trend_data['metrics']
@@ -1305,52 +1366,47 @@ def build_client_summary_sheet(workbook, filtered_df, trend_data=None, customer_
         row += 1
         mom_start_row = row
 
-        mom_metrics = [
+        ws.write(row, 0, 'Metric',    hdr_fmt)
+        ws.write(row, 1, 'Count',     hdr_fmt)
+        ws.write(row, 2, 'Direction', hdr_fmt)
+        ws.write(row, 3, '',          hdr_fmt)
+        row += 1
+
+        for label, value, good_if_nonzero in [
             ('CVE types resolved / patched',     m.get('resolved_cve_count', 0),   True),
             ('CVE types newly introduced',        m.get('new_cve_count', 0),        False),
             ('CVE types persisting (unpatched)',  m.get('persisting_cve_count', 0), False),
             ('Devices fully remediated',          m.get('remediated_devices', 0),   True),
             ('New devices with CVEs',             m.get('new_devices', 0),          False),
-        ]
-
-        ws.write(row, 0, 'Metric', hdr_fmt)
-        ws.write(row, 1, 'Count', hdr_fmt)
-        ws.write(row, 2, 'Direction', hdr_fmt)
-        ws.write(row, 3, '', hdr_fmt)
-        row += 1
-
-        for label, value, good_if_nonzero in mom_metrics:
+        ]:
             if good_if_nonzero:
-                v_fmt  = grn_fmt if value > 0 else val_fmt
-                d_str  = f'▼  {value:,}  (improvement)' if value > 0 else '—  no change'
-                d_fmt  = trend_up if value > 0 else trend_eq
+                v_fmt = grn_fmt if value > 0 else val_fmt
+                d_str = f'▼  {value:,}  (improvement)' if value > 0 else '—  no change'
+                d_fmt = trend_up if value > 0 else trend_eq
             else:
-                v_fmt  = red_fmt if value > 0 else val_fmt
-                d_str  = f'▲  {value:,}  (increase)' if value > 0 else '—  no change'
-                d_fmt  = trend_dn if value > 0 else trend_eq
+                v_fmt = red_fmt if value > 0 else val_fmt
+                d_str = f'▲  {value:,}  (increase)' if value > 0 else '—  no change'
+                d_fmt = trend_dn if value > 0 else trend_eq
             ws.write(row, 0, label, lbl_fmt)
             ws.write(row, 1, value, v_fmt)
             ws.merge_range(row, 2, row, 3, d_str, d_fmt)
             mom_data.append((label, value))
             row += 1
 
-        mom_end_row = row - 1
-
     row += 1
     ws.write(row, 0,
-             'ℹ  All metrics exclude devices not found in RMM and devices outside the '
-             'active date window. CVSS 9.0+ detections are highlighted in red.',
+             'ℹ  All Key Metrics exclude stale devices and devices not found in RMM. '
+             'See the reconciliation table above for the full filtering breakdown.',
              note_fmt)
 
+    # ── Charts ────────────────────────────────────────────────────────────────
     if score_split_data and len(score_split_data) >= 2:
-
         pie = workbook.add_chart({'type': 'pie'})
         pie.add_series({
             'name':       'Detection Rows',
             'categories': ['Client Summary', score_split_start, 0, score_split_end, 0],
             'values':     ['Client Summary', score_split_start, 1, score_split_end, 1],
-            'data_labels': {'percentage': True, 'category': True,
-                            'font': {'size': 9}},
+            'data_labels': {'percentage': True, 'category': True, 'font': {'size': 9}},
         })
         pie.set_title({'name': 'Vulnerability Distribution by CVSS Score'})
         pie.set_style(10)
@@ -1381,9 +1437,8 @@ def build_client_summary_sheet(workbook, filtered_df, trend_data=None, customer_
         ws.insert_chart('F20', bar, {'x_offset': 5, 'y_offset': 5})
 
     if trend_data and mom_data and mom_start_row is not None:
-        mom_chart_start = mom_start_row + 1   
+        mom_chart_start = mom_start_row + 1
         mom_chart_end   = mom_chart_start + len(mom_data) - 1
-
         mom_bar = workbook.add_chart({'type': 'bar'})
         mom_bar.add_series({
             'name':       'Count',

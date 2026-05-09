@@ -940,30 +940,19 @@ def load_previous_report(file_path):
         except Exception:
             continue
 
-    if resolved_pairs:
-        df['_Checkbox_Resolved'] = df.apply(
-            lambda r: (r['_Name_Key'], r['_CVE_Key']) in resolved_pairs, axis=1
-        )
-    else:
-        df['_Checkbox_Resolved'] = False
+    # ── IMPORTANT: Raw Data is the single source of truth ──────────────────────
+    # We deliberately do NOT attach _Checkbox_Resolved to df itself.
+    # Attaching it here would allow the column to flow into _active_trend_scope,
+    # where any filter on it would silently hide manually-ticked CVEs from the
+    # Persisting set — exactly the "ghost ticket" bug we fixed.
+    #
+    # Instead, we return resolved_pairs as a standalone set alongside df.
+    # compute_trends uses it ONLY for re-detection tracking (identifying CVEs
+    # that were ticked resolved last month but have re-appeared in raw data),
+    # never to exclude rows from the New / Resolved / Persisting arithmetic.
+    return df, resolved_pairs
 
-    return df
 
-# The _active_trend_scope function takes a DataFrame of vulnerability data and applies filters based on score thresholds, unresolved status, inventory presence, and staleness to produce a clean DataFrame that can be used for accurate trend arithmetic. It first creates normalized keys for device names, CVE identifiers, and affected products to ensure consistent comparison. It then filters the DataFrame to include only rows that meet the specified vulnerability score threshold and have an unresolved status. If inventory devices or stale devices are provided, it further filters the DataFrame to include only those devices that are present in the inventory and not marked as stale. Finally, it deduplicates the DataFrame based on the combination of device name, CVE identifier, and product key to ensure that each unique vulnerability instance is represented only once in the trend comparison. This function is essential for enabling month-over-month comparisons in the CVE dashboard, allowing users to identify new vulnerabilities, resolved issues, and overall trends in their vulnerability landscape over time based on a consistent and clean dataset.  
-# The function is designed to handle the complexities of preparing vulnerability data for trend comparison, including normalizing key identifiers, applying consistent filtering logic, and ensuring that the resulting DataFrame is suitable for accurate
-# trend arithmetic. By using this function in the trend comparison process, we can ensure that users have access to accurate and actionable insights about how their vulnerability exposure is changing month-over-month, which can inform their prioritization and remediation strategies effectively. Note: The _active_trend_scope function assumes that the input DataFrame contains specific columns such as 'Name', 'Vulnerability Name', 'Affected Products', 'Vulnerability Score', etc., and that the data in these columns is formatted in a way that can be processed by the function. In a production environment, it would be advisable to add error handling to provide more informative feedback to the user in case of issues with the input data or unexpected formats. Additionally, while the function includes logic to handle common scenarios regarding preparing data for trend comparison, there may still be edge cases that require additional handling as they are encountered in real-world data. It is important to ensure that the input data is compatible with the expectations of this function, and additional error handling or validation may be necessary to handle unexpected input formats or edge cases effectively. By carefully implementing and using this function, we can improve the overall quality and usefulness of the CVE dashboard for users to understand their vulnerability landscape and prioritize remediation efforts effectively based on month-over-month trends.   
-# Note: The _active_trend_scope function assumes that the input DataFrame contains specific columns such as 'Name', 'Vulnerability Name', 'Affected Products', 'Vulnerability Score', etc., and that the data in these columns is formatted in a way that can be processed by the function. In a production environment, it would be advisable to add error handling to provide more informative feedback to the user in case of issues with the input data or unexpected formats. Additionally, while the function includes logic to handle common scenarios regarding preparing data for trend comparison, there may still be edge cases that require additional handling as they are encountered in real-world data. It is important to ensure that the input data is compatible with the expectations of this function, and additional error handling or validation may be necessary to handle unexpected input formats or edge cases effectively. By carefully implementing and using this function, we can improve the overall quality and usefulness of the CVE dashboard for users to understand their vulnerability landscape and prioritize remediation efforts effectively based on month-over-month trends. 
-# The _active_trend_scope function takes a DataFrame of vulnerability data and applies filters based on score thresholds, unresolved status, inventory presence, and staleness to produce a clean DataFrame that can be used for accurate trend arithmetic. It first creates normalized keys for device names, CVE identifiers, and affected products to ensure consistent comparison. It then filters the DataFrame to include only rows that meet the specified vulnerability score threshold and have an unresolved status. If inventory devices or stale devices are provided, it further filters the DataFrame to include only those devices that are present in the inventory and not marked as stale. Finally, it deduplicates the DataFrame based on the combination of device name, CVE identifier, and product key to ensure that each unique vulnerability instance is represented only once in the trend comparison. This function is essential for enabling month-over-month comparisons in the CVE dashboard, allowing users to identify new vulnerabilities, resolved issues, and overall trends in their vulnerability landscape over time based on a consistent and clean dataset.  
-# The function is designed to handle the complexities of preparing vulnerability data for trend comparison, including normalizing key identifiers, applying consistent filtering logic, and ensuring that the resulting DataFrame is suitable for accurate
-# trend arithmetic. By using this function in the trend comparison process, we can ensure that users have access to accurate and actionable insights about how their vulnerability exposure is changing month-over-month, which can inform their prioritization and remediation strategies effectively. Note: The _active_trend_scope function assumes that the input DataFrame contains specific columns such as 'Name', 'Vulnerability Name', 'Affected Products', 'Vulnerability Score', etc., and that the data in these columns is formatted in a way that can be processed by the function. In a production environment, it would be advisable to add error handling to provide more informative feedback to the user in case of issues with the input data or unexpected formats. Additionally, while the function includes logic to handle common scenarios regarding preparing data for trend comparison, there may still be edge cases that require additional handling as they are encountered in real-world data. It is important to ensure that the input data is compatible with the expectations of this function, and additional error handling or validation may be necessary to handle unexpected input formats or edge cases effectively. By carefully implementing and using this function, we can improve the overall quality and usefulness of the CVE dashboard for users to understand their vulnerability landscape and prioritize remediation efforts effectively based on month-over-month trends.   
-# Note: The _active_trend_scope function assumes that the input DataFrame contains specific columns such as 'Name', 'Vulnerability Name', 'Affected Products', 'Vulnerability Score', etc., and that the data in these columns is formatted in a way that can be processed by the function. In a production environment, it would be advisable to add error handling to provide more informative feedback to the user in case of issues with the input data or unexpected formats. Additionally, while the function includes logic to handle common scenarios regarding preparing data for trend comparison, there may still be edge cases that require additional handling as they are encountered in real-world data. It is important to ensure that the input data is compatible with the expectations of this function, and additional error handling or validation may be necessary to handle unexpected input formats or edge cases effectively. By carefully implementing and using this function, we can improve the overall quality and usefulness of the CVE dashboard for users to understand their vulnerability landscape and prioritize remediation efforts effectively based on month-over-month trends. 
-# The compute_trends function compares current and previous reports at or above the score threshold, using the raw data as the single source of truth for active vulnerabilities. It first prepares the current and previous DataFrames by creating normalized keys for device names and CVE identifiers. It then applies the _active_trend_scope function to both DataFrames to filter and clean the data according to the specified criteria. The function calculates various summary statistics such as the number of unique CVEs, devices, KEV items, known exploits, and servers for both the current and previous periods. It also identifies common products between the two periods and any new products that have appeared in the current period. Finally, it prepares data for checkbox triage to track re-detection of vulnerabilities based on user input in the previous report. This function is crucial for enabling month-over-month comparisons in the CVE dashboard, allowing users to identify new vulnerabilities, resolved issues, and overall trends in their vulnerability landscape over time based on a consistent and clean dataset.  
-# The function is designed to handle the complexities of comparing vulnerability data across different time periods, including normalizing key identifiers, applying consistent filtering logic, and accurately calculating summary statistics to inform users about trends
-# in their vulnerability landscape. By using this function in the trend comparison process, we can ensure that users have access to accurate and actionable insights about how their vulnerability exposure is changing month-over-month, which can inform their prioritization and remediation strategies effectively. Note: The compute_trends function assumes that the input DataFrames contain specific columns such as 'Name', 'Vulnerability Name', 'Affected Products', 'Vulnerability Score', etc., and that the data in these columns is formatted in a way that can be processed by the function. In a production environment, it would be advisable to add error handling to provide more informative feedback to the user in case of issues with the input data or unexpected formats. Additionally, while the function includes logic to handle common scenarios regarding comparing vulnerability data across time periods, there may still be edge cases that require additional handling as they are encountered in real-world data. It is important to ensure that the input data is compatible with the expectations of this function, and additional error handling or validation may be necessary to handle unexpected input formats or edge cases effectively. By carefully implementing and using this function, we can improve the overall quality and usefulness of the CVE dashboard for users to understand their vulnerability landscape and prioritize remediation efforts effectively based on month-over-month trends.   
-# Note: The compute_trends function assumes that the input DataFrames contain specific columns such as 'Name', 'Vulnerability Name', 'Affected Products', 'Vulnerability Score', etc., and
-# that the data in these columns is formatted in a way that can be processed by the function. In a production environment, it would be advisable to add error handling to provide more informative feedback to the user in case of issues with the input data or unexpected formats. Additionally, while the function includes logic to handle common scenarios regarding comparing vulnerability data across time periods, there may still be edge cases that require additional handling as they are encountered in real-world data. It is important to ensure that the input data is compatible with the expectations of this function, and additional error handling or validation may be necessary to handle unexpected input formats or edge cases effectively. By carefully implementing and using this function, we can improve the overall quality and usefulness of the CVE dashboard for users to understand their vulnerability landscape and prioritize remediation efforts effectively based on month-over-month trends.  
-# The compute_trends function compares current and previous reports at or above the score threshold, using the raw data as the single source of truth for active vulnerabilities. It first prepares the current and previous DataFrames by creating normalized keys for device names and CVE identifiers. It then applies the _active_trend_scope function to both DataFrames to filter and clean the data according to the specified criteria. The function calculates various summary statistics such as the number of unique CVEs, devices, KEV items, known exploits, and servers for both the current and previous periods. It also identifies common products between the two periods and any new products that have appeared in the current period. Finally, it prepares data for checkbox triage to track re-detection of vulnerabilities based on user input in the previous report. This function is crucial for enabling month-over-month comparisons in the CVE dashboard, allowing users to identify new vulnerabilities, resolved issues, and overall trends in their vulnerability landscape over time based on a consistent and clean dataset.  
-# The function is designed to handle the complexities of comparing vulnerability data across different time periods, including normalizing key identifiers, applying consistent filtering logic, and accurately calculating summary statistics to inform users about trends
 def _active_trend_scope(df: pd.DataFrame, threshold: float,
                         inventory_devices=None,
                         stale_devices=None) -> pd.DataFrame:
@@ -993,6 +982,19 @@ def _active_trend_scope(df: pd.DataFrame, threshold: float,
     if _sc:
         out = out[out[_sc].astype(str).str.strip().str.upper().eq('UNRESOLVED')].copy()
 
+    # Exclude devices not present in RMM — they have no confirmed identity in the
+    # managed estate and must not skew New / Resolved / Persisting counts regardless
+    # of whether an inventory set was supplied.
+    # Guard on column presence: previous-report exports pre-dating this column are
+    # silently skipped with a debug note so the absence is traceable.
+    if 'Last Response' in out.columns:
+        out = out[out['Last Response'].astype(str).str.strip() != 'Not Found in RMM'].copy()
+    else:
+        log.debug(
+            "_active_trend_scope: 'Last Response' column absent — "
+            "skipping Not-in-RMM filter (older report format)"
+        )
+
     if inventory_devices:
         out = out[out['_Name_Key'].isin(inventory_devices)].copy()
 
@@ -1012,10 +1014,15 @@ def _active_trend_scope(df: pd.DataFrame, threshold: float,
 
 def compute_trends(current_df, previous_df, threshold,
                    inventory_devices: set = None,
-                   stale_devices: set = None):
+                   stale_devices: set = None,
+                   prev_resolved_pairs: set = None):
     """
     Compare current and previous reports at or above the score threshold.
     Raw Data is strictly honored as the single source of truth for active vulnerabilities.
+
+    prev_resolved_pairs: the set of (normalised_device, cve_id) tuples returned by
+        load_previous_report alongside the previous DataFrame.  Used only for
+        re-detection tracking — never to exclude rows from trend arithmetic.
     """
     cur  = current_df.copy()
     cur['_Name_Key'] = cur['Name'].apply(normalize_device_name)
@@ -1066,17 +1073,14 @@ def compute_trends(current_df, previous_df, threshold,
         log.info("Trend: %d product(s) new this period (not in previous report): %s",
                  len(new_products), sorted(new_products))
 
-    # ── Checkbox Triage Data (For Re-detection tracking ONLY) ──
-    checkbox_resolved = set()
-    if '_Checkbox_Resolved' in prev_t.columns:
-        checkbox_resolved = set(
-            zip(prev_t.loc[prev_t['_Checkbox_Resolved'], '_Name_Key'],
-                prev_t.loc[prev_t['_Checkbox_Resolved'], '_CVE_Key'])
-        )
-    
+    # ── Re-detection tracking (checkbox triage data ONLY) ─────────────────────
+    # prev_resolved_pairs comes directly from load_previous_report's second return
+    # value — it never touches the DataFrames that fed _active_trend_scope, so it
+    # cannot influence the New / Resolved / Persisting set arithmetic.
+    checkbox_resolved   = prev_resolved_pairs or set()
     cur_active_pairs_2d = set(zip(cur_t['_Name_Key'], cur_t['_CVE_Key']))
-    redetected_pairs = checkbox_resolved & cur_active_pairs_2d
-    redetected_count = len(redetected_pairs)
+    redetected_pairs    = checkbox_resolved & cur_active_pairs_2d
+    redetected_count    = len(redetected_pairs)
 
     # ── Set Arithmetic ──
     # NOTE: We strictly DO NOT filter cur_scoped based on previous manual checkboxes. 

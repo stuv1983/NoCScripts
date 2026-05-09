@@ -322,17 +322,19 @@ def run(request: DashboardRequest) -> DashboardResult:
         redetected_count = 0
         if request.include_trend and request.prev_report_path:
             log.info("Loading previous report for trend: %s", request.prev_report_path)
-            prev_df          = load_previous_report(request.prev_report_path)
+            # load_previous_report returns (df, resolved_pairs) — unpack both.
+            prev_df, prev_resolved_pairs = load_previous_report(request.prev_report_path)
             prev_report_name = Path(request.prev_report_path).name
             inventory_set    = (set(df_rmm['Device_Join'].unique())
                                 if df_rmm is not None else None)
-                                
+
             # Capture the names of all stale excluded devices to purge them from the previous report
             stale_names = set(stale_excluded['Name'].apply(normalize_device_name)) if not stale_excluded.empty else set()
-            
+
             trend_data       = compute_trends(merged_df, prev_df, request.threshold,
                                               inventory_devices=inventory_set,
-                                              stale_devices=stale_names)
+                                              stale_devices=stale_names,
+                                              prev_resolved_pairs=prev_resolved_pairs)
             m = trend_data['metrics']
             log.info(
                 "Trend: %d new CVEs, %d resolved, %d persisting (common-product scope)",
@@ -465,7 +467,7 @@ def run(request: DashboardRequest) -> DashboardResult:
 #The not-in-RMM counts are important for the client summary sheet to provide context on how many high-risk vulnerabilities are not being tracked in RMM, which can inform remediation prioritization and risk assessment. By including these counts in the summary sheet, we can give users a clearer picture of their vulnerability landscape and highlight potential gaps in their RMM coverage.
 #Overall, this section of the code is focused on preparing the data and metrics that will be displayed in the client summary sheet of the dashboard, ensuring that users have a comprehensive overview of their vulnerability status, including any high-risk vulnerabilities that may not be tracked in RMM.
             build_client_summary_sheet(
-                wb, triage_df,
+                wb, filtered_df, triage_df, request.threshold,
                 trend_data=trend_data,
                 customer_name=customer_name,
                 cutoff_date=request.cutoff_date if not request.show_all_dates else None,
@@ -600,7 +602,6 @@ def run(request: DashboardRequest) -> DashboardResult:
             unique_devices    = int(filtered_df['Name'].nunique()),
             trend_metrics     = trend_data['metrics'] if trend_data else None,
             root_cause_summary= rc_summary or None,
-            report_month      = report_month_val,
         )
 
         trend_summary = None
