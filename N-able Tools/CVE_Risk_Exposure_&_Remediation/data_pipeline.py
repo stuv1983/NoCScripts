@@ -287,9 +287,7 @@ def _resolve_baseline(row) -> tuple[str, str]:
 
 
 def _classify_baseline_compliance(row) -> str:
-    # Use '_patch_status' — the patch report's install status column.
-    # 'Status' on the merged row is the CVE threat status (RESOLVED/UNRESOLVED).
-    status = str(row.get('_patch_status', '')).strip()
+    status = str(row.get('Status', '')).strip()
     if status not in INSTALLED_STATUSES:
         return 'Not installed'
     bl = str(row.get('Product Baseline', '')).strip()
@@ -305,9 +303,7 @@ def _classify_baseline_compliance(row) -> str:
 
 
 def _classify_version_check(row):
-    # Use '_patch_status' — the patch report's install status column.
-    # 'Status' on the merged row is the CVE threat status (RESOLVED/UNRESOLVED).
-    status = str(row.get('_patch_status', '')).strip()
+    status = str(row.get('Status', '')).strip()
     pv     = str(row.get('Matched Patch Version', '')).strip()
     fv     = str(row.get('Fixed Version Used', '')).strip()
     if status not in INSTALLED_STATUSES:
@@ -321,9 +317,7 @@ def _classify_version_check(row):
     return 'Version comparison failed'
 
 def _classify_resolution(row):
-    # Use '_patch_status' — the patch report's install status column.
-    # 'Status' on the merged row is the CVE threat status (RESOLVED/UNRESOLVED).
-    status = str(row.get('_patch_status', '')).strip()
+    status = str(row.get('Status', '')).strip()
     if status not in INSTALLED_STATUSES:
         return 'Unresolved'
 
@@ -362,14 +356,8 @@ def _classify_resolution(row):
 
 # ==============================================================================
 # DATA PIPELINE: CVE + RMM
-# This section includes functions for loading and normalizing vulnerability data and RMM inventory data. The load_vulnerability_data function reads vulnerability data from a specified file path, which can be in CSV or Excel format. It normalizes column names to a standard set of expected names, fills in default values for missing columns, and creates additional columns for normalized device names and base product names. The load_rmm_data function reads RMM inventory data, identifies the relevant columns for device names and last response times, normalizes device names, and creates a column for normalized device names to facilitate merging with vulnerability data. These functions are essential for preparing the raw data for analysis and ensuring that it is in a consistent format for merging and processing in the dashboard generation. By normalizing device names and product names, we can improve the accuracy of merges between vulnerability data and RMM inventory data, which is crucial for correctly associating vulnerabilities with the devices they affect in the dashboard.
-# The functions are designed to be flexible and handle a variety of input formats, which is important given the often messy nature of vulnerability and inventory data. By implementing these loading and normalization functions, we can ensure that our data is consistent and ready for analysis, which enhances the insights provided in the CVE dashboard for users to understand their vulnerability landscape and prioritize remediation efforts effectively.
-# Note: The functions in this section assume that the input data may have varying formats and column names, and they include logic to handle common variations. However, there may still be edge cases that require additional handling as they are encountered in real-world data. It is important to ensure that the input data is compatible with the expectations of these functions, and additional error handling or validation may be necessary in a production environment to handle unexpected input formats or edge cases. By carefully implementing and using these loading and normalization functions, we can improve the overall quality and usefulness of the CVE dashboard for users to understand their vulnerability landscape and prioritize remediation efforts effectively.
 # ==============================================================================
 
-# The load_vulnerability_data function is responsible for loading vulnerability data from a specified file path, which can be in either CSV or Excel format. It reads the data into a pandas DataFrame and then normalizes the column names to a standard set of expected names, such as 'Name', 'Vulnerability Name', 'Affected Products', etc. The function also fills in default values for any missing columns to ensure that the DataFrame has a consistent structure. Additionally, it creates new columns for normalized device names (used for merging with RMM inventory data) and base product names (used for patch matching). By normalizing the column names and preparing the data in this way, we can ensure that it is ready for analysis and merging with other data sources in the dashboard generation process.
-# The function is designed to be flexible and handle a variety of input formats, which is important given the often inconsistent nature of vulnerability data. By implementing this loading and normalization function, we can improve the accuracy of merges between vulnerability data and RMM inventory data, which is crucial for correctly associating vulnerabilities with the devices they affect in the dashboard. This ultimately enhances the insights provided in the CVE dashboard for users to understand their vulnerability landscape and prioritize remediation efforts effectively.
-# Note: The load_vulnerability_data function assumes that the input file is well-formed and does not include error handling for cases such as missing files, unsupported formats, or malformed data. In a production environment, it would be advisable to add error handling to provide more informative feedback to the user in case of issues with the input file. Additionally, while the function includes logic to handle common variations in column names, there may still be edge cases that require additional handling as they are encountered in real-world data. It is important to ensure that the input data is compatible with the expectations of this function, and additional error handling or validation may be necessary to handle unexpected input formats or edge cases effectively.
 def load_vulnerability_data(file_path: str) -> pd.DataFrame:
     if str(file_path).lower().endswith(('.xlsx', '.xls')):
         xl = pd.ExcelFile(file_path)
@@ -430,10 +418,7 @@ def load_vulnerability_data(file_path: str) -> pd.DataFrame:
     df['Base Product']       = df['Affected Products'].apply(get_base_product)
 
     return df
-# The load_rmm_data function is responsible for loading RMM inventory data from a specified file path, which can be in either CSV or Excel format. It reads the data into a pandas DataFrame and then identifies the relevant columns for device names and last response times based on common column name variations. The function normalizes device names to create a 'Device_Join' column that can be used for merging with vulnerability data. It also attempts to determine the device type (Server, Workstation, or Unknown) based on either a specific device type column or the OS version column. By normalizing device names and creating consistent columns for merging, this function prepares the RMM inventory data for analysis and merging with vulnerability data in the dashboard generation process.
-# The function is designed to be flexible and handle a variety of input formats, which is important given the often inconsistent nature of RMM inventory data. By implementing this loading and normalization function, we
-# can improve the accuracy of merges between vulnerability data and RMM inventory data, which is crucial for correctly associating vulnerabilities with the devices they affect in the dashboard. This ultimately enhances the insights provided in the CVE dashboard for users to understand their vulnerability landscape and prioritize remediation efforts effectively.
-# Note: The load_rmm_data function assumes that the input file is well-formed and
+
 def load_rmm_data(file_path):
     df        = load_data(file_path)
     col_lower = {c.lower(): c for c in df.columns}
@@ -481,9 +466,7 @@ def load_rmm_data(file_path):
         df['Device Type'] = 'Unknown'
 
     return df.drop_duplicates(subset=['Device_Join'], keep='first')
-# The merge_data function takes the vulnerability DataFrame and the RMM inventory DataFrame and merges them based on the normalized device names. It checks for the presence of 'Last Response' and 'Device Type' columns in the vulnerability DataFrame and decides whether to pull this information from the RMM DataFrame or to fill in default values. The function also handles cases where devices in the vulnerability data may not be present in the RMM inventory, allowing for either exclusion of those rows or filling in default values for missing RMM data. Additionally, it attempts to infer device types from the 'Operating System Role' or 'OS' columns if they are present and if the device type is still unknown after merging. Finally, it calculates a sortable timestamp for 'Last Response' and computes a 'Days Since Last Response' column for further analysis. This function is crucial for combining vulnerability data with device inventory data to provide a comprehensive view of vulnerabilities across devices in the dashboard.
-# The function is designed to be flexible and handle various scenarios regarding the presence of RMM data and the structure of the vulnerability data. By implementing this merging logic, we can ensure that the resulting DataFrame contains as much relevant information as possible for analysis in the dashboard, while also providing options for how to handle cases where RMM data may be missing for certain devices. This ultimately enhances the insights provided in the CVE dashboard for users to understand their vulnerability landscape and prioritize remediation efforts effectively.
-# Note: The merge_data function assumes that the input DataFrames are properly formatted and that the 'Name_Join' and 'Device_Join' columns have been created correctly in the vulnerability and RMM DataFrames, respectively. It also assumes that the 'Last Response' values can be parsed into timestamps using the parse_last_response function. In a production environment, it would be advisable to add error handling to provide more informative feedback to the user in case of issues with the input data or unexpected formats. Additionally, while the function includes logic to handle common scenarios regarding missing RMM data, there may still be edge cases that require additional handling as they are encountered in real-world data. It is important to ensure that the input data is compatible with the expectations of this function, and additional error handling or validation may be necessary to handle unexpected input formats or edge cases effectively.
+
 def merge_data(df_vuln, df_rmm, skip_rmm, exclude_missing_rmm=True):
     vuln_has_lr = 'Last Response' in df_vuln.columns
     vuln_has_dt = 'Device Type'   in df_vuln.columns
@@ -585,10 +568,6 @@ def merge_data(df_vuln, df_rmm, skip_rmm, exclude_missing_rmm=True):
                     break
                     
     now_ts = pd.Timestamp.now()
-    # For devices with valid 'Last Response' timestamps, calculate days since last response.
-    # For devices with invalid or missing 'Last Response', return '—'.
-    # This provides a more informative view of the data, allowing users to quickly identify devices that may not have recent check-ins without cluttering the dashboard with unhelpful or misleading information.
-    # Note: The function assumes that the 'Last Response' values can be parsed into timestamps using the parse_last_response function. If there are issues with parsing these values, additional error handling may be necessary to ensure that the function behaves as expected in all cases.
     def _calc_days_from_lr(val):
         if str(val).strip() in ('Not Found in RMM', 'N/A', ''):
             return '—'
@@ -614,13 +593,8 @@ def merge_data(df_vuln, df_rmm, skip_rmm, exclude_missing_rmm=True):
 
 # ==============================================================================
 # DATA PIPELINE: PATCH MATCH
-# This section includes functions for applying cascade resolution based on installed patch versions, processing patch match data by merging it with vulnerability data and applying classification logic to determine the resolution status of vulnerabilities based on patch evidence. The _apply_cascade_resolution function takes a DataFrame containing patch match results and applies logic to resolve additional vulnerabilities based on the versions of patches that are confirmed to be installed. The process_patch_match function takes the path to a patch match report and the merged vulnerability DataFrame, processes the patch match data, and merges it with the vulnerability data to classify the resolution status of each vulnerability based on the patch evidence. These functions are essential for accurately determining which vulnerabilities have been resolved based on the presence of installed patches and their versions, which enhances the insights provided in the CVE dashboard for users to understand their vulnerability landscape and prioritize remediation efforts effectively.
-# The functions in this section are designed to handle the complexities of patch matching and classification, including the often messy nature of vulnerability and patch data. By using these functions in the patch matching process, we can ensure that we are accurately identifying which patches correspond to which vulnerabilities and providing meaningful classifications of compliance and resolution status for users to act upon in the dashboard. Note: The functions in this section are intended to be used as part of the patch matching and classification process, and they may rely on specific formats or conventions in the input data. It is important to ensure that the data being processed is compatible with the expectations of these functions, and additional error handling or validation may be necessary in a production environment to handle unexpected input formats or edge cases. By carefully implementing and using these helper functions, we can improve the overall quality and usefulness of the CVE dashboard for users to understand their vulnerability landscape and prioritize remediation efforts effectively.
 # ==============================================================================
 
-# The _apply_cascade_resolution function is responsible for applying cascade resolution logic to a DataFrame containing patch match results. It identifies devices that have confirmed installed patches with known versions and uses this information to resolve additional vulnerabilities that may be associated with the same device and product, even if those vulnerabilities do not have direct patch evidence. The function works by first identifying the best installed patch version for each device and product combination, then checking this against known fixed version rules to determine which CVEs can be considered resolved based on the installed patch version. Finally, it updates the 'Patch Evidence Status' for any vulnerabilities that can be resolved through this cascade logic. This function is crucial for accurately determining which vulnerabilities can be considered resolved based on the presence of installed patches and their versions, which enhances the insights provided in the CVE dashboard for users to understand their vulnerability landscape and prioritize remediation efforts effectively. 
-# The function is designed to handle the complexities of patch matching and classification, including the often messy nature of vulnerability and patch data. By using this function in the patch matching process, we can ensure that we are accurately identifying which patches correspond to which vulnerabilities and providing meaningful classifications of compliance and resolution status for users to act upon in the dashboard. Note: The _apply_cascade_resolution function assumes that the input DataFrame contains specific columns such as 'Name', 'Affected Products', 'Patch Match Result', 'Matched Patch Version', etc., and that the data in these columns is formatted in a way that can be processed by the function. In a production environment, it would be advisable to add error handling to provide more informative feedback to the user in case of issues with the input data or unexpected formats. Additionally, while the function includes logic to handle common scenarios regarding patch matching and version comparison, there may still be edge cases that require additional handling as they are encountered in real-world data. It is important to ensure that the input data is compatible with the expectations of this function, and additional error handling or validation may be necessary to handle unexpected input formats or edge cases effectively.  By carefully implementing and using this function, we can improve the overall quality and usefulness of the CVE dashboard for users to understand their vulnerability landscape and prioritize remediation efforts effectively.
-# Note: The _apply_cascade_resolution function assumes that the input DataFrame contains specific columns such as 'Name', 'Affected Products', 'Patch Match Result', 'Matched Patch Version', etc., and that the data in these columns is formatted in a way that can be processed by the function. In a production environment, it would be advisable to add error handling to provide more informative feedback to the user in case of issues with the input data or unexpected formats. Additionally, while the function includes logic to handle common scenarios regarding patch matching and version comparison, there may still be edge cases that require additional handling as they are encountered in real-world data. It is important to ensure that the input data is compatible with the expectations of this function, and additional error handling or validation may be necessary to handle unexpected input formats or edge cases effectively.  By carefully implementing and using this function, we can improve the overall quality and usefulness of the CVE dashboard for users to understand their vulnerability landscape and prioritize remediation efforts effectively.
 def _apply_cascade_resolution(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or 'Matched Patch Version' not in df.columns:
         return df
@@ -726,10 +700,6 @@ def _apply_cascade_resolution(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-# The process_patch_match function is responsible for processing patch match data by merging it with vulnerability data and applying classification logic to determine the resolution status of vulnerabilities based on patch evidence. It takes the path to a patch match report and the merged vulnerability DataFrame, loads and normalizes the patch match data, and then merges it with the vulnerability data based on normalized keys for customer, site, device, and product. The function then classifies the patch match results for each vulnerability based on the presence of matching patches, their installation status, and version compliance. It also applies cascade resolution logic to resolve additional vulnerabilities based on installed patch versions. This function is crucial for accurately determining which vulnerabilities have been resolved based on the presence of installed patches and their versions, which enhances the insights provided in the CVE dashboard for users to understand their vulnerability landscape and prioritize remediation efforts effectively.
-# The function is designed to handle the complexities of patch matching and classification, including the often messy nature of vulnerability and patch data. By using this function in the patch matching process, we can ensure that we are accurately identifying which patches correspond to which vulnerabilities and providing meaningful classifications of compliance and resolution status
-# for users to act upon in the dashboard. Note: The process_patch_match function assumes that the input patch match report contains specific columns such as 'Client', 'Site', 'Device', 'Status', 'Patch', 'Discovered / Install Date', etc., and that the vulnerability DataFrame contains specific columns such as 'Vulnerability Name', 'Name', 'Affected Products', etc. It also assumes that the data in these columns is formatted in a way that can be processed by the function. In a production environment, it would be advisable to add error handling to provide more informative feedback to the user in case of issues with the input data or unexpected formats. Additionally, while the function includes logic to handle common scenarios regarding patch matching and classification, there may still be edge cases that require additional handling as they are encountered in real-world data. It is important to ensure that the input data is compatible with the expectations of this function, and additional error handling or validation may be necessary to handle unexpected input formats or edge cases effectively. By carefully implementing and using this function, we can improve the overall quality and usefulness of the CVE dashboard for users to understand their vulnerability landscape and prioritize remediation efforts effectively.  
-# Note: The process_patch_match function assumes that the input patch match report contains specific columns such as 'Client', 'Site', 'Device', 'Status', 'Patch', 'Discovered / Install Date', etc., and that the vulnerability DataFrame contains specific columns such as 'Vulnerability Name', 'Name', 'Affected Products', etc. It also assumes that the data in these columns is formatted in a way that can be processed by the function. In a production environment, it would be advisable to add error handling to provide more informative feedback to the user in case of issues with the input data or unexpected formats. Additionally, while the function includes logic to handle common scenarios regarding patch matching and classification, there may still be edge cases that require additional handling as they are encountered in real-world data. It is important to ensure that the input data is compatible with the expectations of this function, and additional error handling or validation may be necessary to handle unexpected input formats or edge cases effectively. By carefully implementing and using this function, we can improve the overall quality and usefulness of the CVE dashboard for users to understand their vulnerability landscape and prioritize remediation efforts effectively.  
 
 def process_patch_match(patch_path, cve_df, min_score=9.0):
     patch  = load_data(patch_path)
@@ -757,19 +727,9 @@ def process_patch_match(patch_path, cve_df, min_score=9.0):
     patch['_dk']  = patch['Device'].map(_norm_compact)
     patch['_pk']  = patch['Patch'].map(_detect_product)
     patch['_pd']  = pd.to_datetime(patch['Discovered / Install Date'], errors='coerce')
+    patch['_sr']  = patch['Status'].map(STATUS_RANK).fillna(0)
     patch['_kbs'] = patch['Patch'].apply(_extract_kbs)
     patch['_pv']  = patch['Patch'].apply(_extract_best_version)
-
-    # Rename the patch report's 'Status' to '_patch_status' before the merge so it
-    # survives as a clean, unambiguous column name on every merged row.
-    # Without this, pandas merge suffixes=('', '_p') would produce 'Status_p' for
-    # the patch status — but _classify_version_check, _classify_resolution, and
-    # _classify_baseline_compliance all call row.get('Status', ''), which silently
-    # picks up the CVE Status column ('RESOLVED'/'UNRESOLVED') instead of the patch
-    # install status ('Installed'/'Pending'/etc.).  That bug caused every row to
-    # return 'Patch not yet installed' regardless of the actual patch state.
-    patch = patch.rename(columns={'Status': '_patch_status'})
-    patch['_sr'] = patch['_patch_status'].map(STATUS_RANK).fillna(0)
 
     patch_devices = set(zip(patch['_ck'], patch['_sk'], patch['_dk']))
 
@@ -786,7 +746,7 @@ def process_patch_match(patch_path, cve_df, min_score=9.0):
                 errors='coerce', utc=True).dt.tz_localize(None)
 
     merged = cve.merge(
-        patch[['_ck', '_sk', '_dk', '_pk', '_patch_status', 'Patch', '_pd', '_sr', '_kbs', '_pv']]
+        patch[['_ck', '_sk', '_dk', '_pk', 'Status', 'Patch', '_pd', '_sr', '_kbs', '_pv']]
               .rename(columns={'_ck': '_mck'}),
         left_on=['_ck', '_sk', '_dk', '_pk'],
         right_on=['_mck', '_sk', '_dk', '_pk'],
@@ -795,17 +755,15 @@ def process_patch_match(patch_path, cve_df, min_score=9.0):
     merged = merged.sort_values(['_sr', '_pd'], ascending=[False, False], na_position='last')
     gcols  = [c for c in cve.columns if not c.startswith('_')]
     best   = merged.groupby(gcols, dropna=False, as_index=False).first()
-# The _classify_match function determines the patch match result for each row in the merged DataFrame. It checks if there is a non-null 'Patch' value, and if so, it compares the architecture of the CVE's affected products with the architecture of the patch. If there is a mismatch in architecture, it classifies the result as 'Device in patch report - product not found'. Otherwise, it uses the '_patch_status' to classify the match result. If there is no 'Patch' value but the device is found in the patch report, it also classifies it as 'Device in patch report - product not found'. If neither condition is met, it classifies it as 'Not found in patch report'. This classification helps to determine whether a vulnerability has a corresponding patch match and whether that match is relevant based on product and architecture information.    
-# The function is designed to handle the complexities of patch matching and classification, including the often messy nature of vulnerability and patch data. By using this function in the patch matching process, we can ensure that we are accurately identifying which patches correspond to which vulnerabilities and providing meaningful classifications of compliance and resolution status for users to act upon in the dashboard. Note: The _classify_match function assumes that the input DataFrame contains specific columns such as 'Patch', '_patch_status', 'Affected Products', etc., and that the data in these columns is formatted in a way that can be processed by the function. In a production environment, it would be advisable to add error handling to provide more informative feedback to the user in case of issues with the input data or unexpected formats. Additionally, while the function includes logic to handle common scenarios regarding patch matching and classification, there may still be edge cases that require additional handling as they are encountered in real-world data. It is important to ensure that the input data is compatible with the expectations of this function, and additional error handling or validation may be necessary to handle unexpected input formats or edge cases effectively. By carefully implementing and using this function, we can improve the overall quality and usefulness of the CVE dashboard for users to understand their vulnerability landscape and prioritize remediation efforts effectively. 
-# Note: The _classify_match function assumes that the input DataFrame contains specific columns such as 'Patch', '_patch_status', 'Affected Products', etc., and that the data in these columns is formatted in a way that can be processed by the function. In a production environment, it would be advisable to add error handling to provide more informative feedback to the user in case of issues with the input data or unexpected formats. Additionally, while the function includes logic to handle common scenarios regarding patch matching and classification, there may still be edge cases that require additional handling as they are encountered in real-world data. It is important to ensure that the input data is compatible with the expectations of this function, and additional error handling or validation may be necessary to handle unexpected input formats or edge cases effectively. By carefully implementing and using this function, we can improve the overall quality and usefulness of the CVE dashboard for users to understand their vulnerability landscape and prioritize remediation efforts effectively.   
+
     def _classify_match(row):
         if not pd.isna(row.get('Patch')):
             cve_arch   = _get_arch(str(row.get('Affected Products', '')))
             patch_arch = _get_arch(str(row.get('Patch', '')))
             if cve_arch and patch_arch and cve_arch != patch_arch:
                 return 'Device in patch report - product not found'
-            return STATUS_LABEL.get(str(row.get('_patch_status', '')).strip(),
-                                     f"Matched - {str(row.get('_patch_status', '')).lower()}")
+            return STATUS_LABEL.get(str(row.get('Status', '')).strip(),
+                                     f"Matched - {str(row.get('Status', '')).lower()}")
         if (row['_ck'], row['_sk'], row['_dk']) in patch_devices:
             return 'Device in patch report - product not found'
         return 'Not found in patch report'
@@ -826,11 +784,7 @@ def process_patch_match(patch_path, cve_df, min_score=9.0):
     best['Version Check Result']         = best.apply(_classify_version_check, axis=1)
     best['Baseline Compliance']          = best.apply(_classify_baseline_compliance, axis=1)
 
-    best = best.rename(columns={
-        'Patch':          'Matched Patch',
-        '_pd':            'Patch Install Date',
-        '_patch_status':  'Status_p',    # restore the display name users see in Excel
-    })
+    best = best.rename(columns={'Patch': 'Matched Patch', '_pd': 'Patch Install Date'})
     best['Patch Evidence Status'] = best.apply(_classify_resolution, axis=1)
 
     best = _apply_cascade_resolution(best)
@@ -848,22 +802,8 @@ def process_patch_match(patch_path, cve_df, min_score=9.0):
 
 # ==============================================================================
 # DATA PIPELINE: TREND / MONTH-OVER-MONTH COMPARISON
-# This section includes functions for preparing and comparing vulnerability data across different time periods to identify trends and changes in the vulnerability landscape. The load_previous_report function is responsible for loading a previously generated dashboard report, validating its structure, and preparing the data for trend comparison by normalizing device names and CVE identifiers, and identifying resolved vulnerabilities based on checkbox indicators. The _active_trend_scope function takes a DataFrame of vulnerability data and applies filters based on score thresholds, unresolved status, inventory presence, and staleness to produce a clean DataFrame that can be used for accurate trend arithmetic. These functions are essential for enabling month-over-month comparisons in the CVE dashboard, allowing users to identify new vulnerabilities, resolved issues, and overall trends in their vulnerability landscape over time. By carefully implementing these functions, we can ensure that the trend comparison features of the dashboard provide meaningful insights to users about how their vulnerability exposure is evolving and where they should focus their remediation efforts.   
-# The functions in this section are designed to handle the complexities of trend comparison, including the need to normalize and clean data from previous reports, apply consistent filtering logic, and accurately identify changes in the vulnerability landscape over time. By using these functions in the trend comparison process, we can ensure that users have access to accurate and actionable insights about how their vulnerability exposure is changing month-over-month, which can inform their prioritization and remediation strategies effectively. Note: The functions in this section assume that the input data is formatted in a way that can be processed by the functions, and that specific columns are present for identifying devices, CVEs, scores, statuses, etc. In a production environment, it would be advisable to add error handling to provide more informative feedback to the user in case of issues with the input data or unexpected formats. Additionally, while the functions include logic to handle common scenarios regarding trend comparison, there may still be edge cases that require additional handling as they are encountered in real-world data. It is important to ensure that the input data is compatible with the expectations of these functions, and additional error handling or validation may be necessary to handle unexpected input formats or edge cases effectively. By carefully implementing and using these functions, we can improve the overall quality and usefulness of the CVE dashboard for users to understand their vulnerability landscape and prioritize remediation efforts effectively based on month-over-month trends.  
-# Note: The functions in this section assume that the input data is formatted in a way that can be processed by the functions, and that specific columns are present for identifying devices, CVEs, scores, statuses, etc. In a production environment, it would be advisable to add error handling to provide more informative feedback to the user in case of issues with the input data or unexpected formats. Additionally, while the functions include logic to handle common scenarios regarding trend comparison, there may still be edge cases that require additional handling as they are encountered in real-world data. It is important to ensure that the input data is compatible with the expectations of these functions, and additional error handling or validation may be necessary to handle unexpected input formats or edge cases effectively. By carefully implementing and using these functions, we can improve the overall quality and usefulness of the CVE dashboard for users to understand their vulnerability landscape and prioritize remediation efforts effectively based on month-over-month trends. 
 # ==============================================================================
-# The load_previous_report function is responsible for loading a previously generated dashboard report, validating its structure, and preparing the data for trend comparison by normalizing device names and CVE identifiers, and identifying resolved vulnerabilities based on checkbox indicators. It first attempts to load the specified Excel file and checks for the presence of expected sheets that indicate it is a valid dashboard report. It then parses the relevant sheet to extract vulnerability data and checks for required columns. The function normalizes device names and CVE identifiers to create consistent keys for comparison, and it also looks for any sheets that contain resolution checkboxes to identify which vulnerabilities were marked as resolved in the previous report. This prepared DataFrame can then be used for accurate trend comparison against current vulnerability data to identify new vulnerabilities, resolved issues, and overall trends in the vulnerability landscape over time. This function is crucial for enabling month-over-month comparisons in the CVE dashboard, allowing users to track how their vulnerability exposure is evolving and where they should focus their remediation efforts effectively.   
-# The function is designed to handle the complexities of loading and preparing previous report data for trend comparison, including validating the structure of the input file, normalizing key identifiers, and accurately identifying resolved vulnerabilities based on user input in the previous report. By using this function in the trend comparison process, we can ensure that users have access to accurate and actionable insights about how their vulnerability exposure is changing month-over-month, which can inform their prioritization and remediation strategies effectively. Note: The load_previous_report function assumes that the input Excel file is formatted in a way that can be processed by the function, and that specific sheets and columns are present for identifying devices, CVEs, scores, statuses, etc. In a production environment, it would be advisable to add error handling to provide more informative feedback to the user in case of issues with the input file or unexpected formats. Additionally, while the function includes logic to handle common scenarios regarding loading previous reports, there may still be edge cases that require additional handling as they are encountered in real-world data. It is important to ensure that the input file is compatible with the expectations of this function, and additional error handling or validation may be necessary to handle unexpected formats or edge cases effectively. By carefully implementing and using this function, we can improve the overall quality and usefulness of the CVE dashboard for users to understand their vulnerability landscape and prioritize remediation efforts effectively based on month-over-month trends.  
-# Note: The load_previous_report function assumes that the input Excel file is formatted in a way that can be processed by the function, and that specific sheets and columns are present for identifying devices, CVEs, scores, statuses, etc. In a production environment, it would be advisable to add
-# error handling to provide more informative feedback to the user in case of issues with the input file or unexpected formats. Additionally, while the function includes logic to handle common scenarios regarding loading previous reports, there may still be edge cases that require additional handling as they are encountered in real-world data. It is important to ensure that the input file is compatible with the expectations of this function, and additional error handling or validation may be necessary to handle unexpected formats or edge cases effectively. By carefully implementing and using this function, we can improve the overall quality and usefulness of the CVE dashboard for users to understand their vulnerability landscape and prioritize remediation efforts effectively based on month-over-month trends.  
-# The load_previous_report function is responsible for loading a previously generated dashboard report, validating its structure, and preparing the data for trend comparison by normalizing device names and CVE identifiers, and identifying resolved vulnerabilities based on checkbox indicators. It first attempts to load the specified Excel file and checks for the presence of expected sheets that indicate it is a valid dashboard report. It then parses the relevant sheet to extract vulnerability data and checks for required columns. The function normalizes device names and CVE identifiers to create consistent keys for comparison, and it also looks for any sheets that contain resolution checkboxes to identify which vulnerabilities were marked as resolved in the previous report. This prepared DataFrame can then be used for accurate trend comparison against current vulnerability data to identify new vulnerabilities, resolved issues, and overall trends in the vulnerability landscape over time. This function is crucial for enabling month-over-month comparisons in the CVE dashboard, allowing users to track how their vulnerability exposure is evolving and where they should focus their remediation efforts effectively.  
-# The function is designed to handle the complexities of loading and preparing previous report data for trend comparison, including validating the structure of the input file, normalizing key identifiers, and accurately identifying resolved vulnerabilities
-# based on user input in the previous report. By using this function in the trend comparison process, we can ensure that users have access to accurate and actionable insights about how their vulnerability exposure is changing month-over-month, which can inform their prioritization and remediation strategies effectively. Note: The load_previous_report function assumes that the input Excel file is formatted in a way that can be processed by the function, and that specific sheets and columns are present for identifying devices, CVEs, scores, statuses, etc. In a production environment, it would be advisable to add error handling to provide more informative feedback to the user in case of issues with the input file or unexpected formats. Additionally, while the function includes logic to handle common scenarios regarding loading previous reports, there may still be edge cases that require additional handling as they are encountered in real-world data. It is important to ensure that the input file is compatible with the expectations of this function, and additional error handling or validation may be necessary to handle unexpected formats or edge cases effectively. By carefully implementing and using this function, we can improve the overall quality and usefulness of the CVE dashboard for users to understand their vulnerability landscape and prioritize remediation efforts effectively based on month-over-month trends.  
-# Note: The load_previous_report function assumes that the input Excel file is formatted in a way that can be processed by the function, and that specific sheets and columns are present for identifying devices, CVEs, scores, statuses, etc. In a production environment, it would be advisable to add error handling to provide more informative feedback to the user in case of issues with the input file or unexpected formats. Additionally, while the function includes logic to handle common scenarios regarding loading previous reports, there may still be edge cases that require additional handling as they are encountered in real-world data. It is important to ensure that the input file is compatible with the expectations of this function, and additional error handling or validation may be necessary to handle unexpected formats or edge cases effectively. By carefully implementing and using this function, we can improve the overall quality and usefulness of the CVE dashboard for users to understand their vulnerability landscape and prioritize remediation efforts effectively based on month-over-month trends.  
-# The load_previous_report function is responsible for loading a previously generated dashboard report, validating its structure, and preparing the data for trend comparison by normalizing device names and CVE identifiers, and identifying resolved vulnerabilities based on checkbox indicators. It first attempts to load the specified Excel file and checks for the presence of expected sheets that indicate it is a valid dashboard report. It then parses the relevant sheet to extract vulnerability data and checks for required columns. The function normalizes device names and CVE identifiers to create consistent keys for comparison, and it also looks for any sheets that contain resolution checkboxes to identify which vulnerabilities were marked as resolved in the previous report. This prepared DataFrame can then be used for accurate trend comparison against current vulnerability data to identify new vulnerabilities, resolved issues, and overall trends in the vulnerability landscape over time. This function is crucial for enabling month-over-month comparisons in the CVE dashboard, allowing users to track how their vulnerability exposure is evolving and where they should focus their remediation efforts effectively.  
-# The function is designed to handle the complexities of loading and preparing previous report data for trend comparison, including validating the structure of the input file, normalizing key identifiers, and accurately identifying resolved vulnerabilities
-# based on user input in the previous report. By using this function in the trend comparison process, we can ensure that users have access to accurate and actionable insights about how their vulnerability exposure is changing month-over-month, which can inform their prioritization and remediation strategies effectively. Note: The load_previous_report function assumes that the input Excel file is formatted in a way that can be processed by the function, and that specific sheets and columns are present for identifying devices, CVEs, scores, statuses, etc. In a production environment, it would be advisable to add error handling to provide more informative feedback to the user in case of issues with the input file or unexpected formats. Additionally, while the function includes logic to handle common scenarios regarding loading previous reports, there may still be edge cases that require additional handling as they are encountered in real-world data. It is important to ensure that the input file is compatible with the expectations of this function, and additional error handling or validation may be necessary to handle unexpected formats or edge cases effectively. By carefully implementing and using this function, we can improve the overall quality and usefulness of the CVE dashboard for users to understand their vulnerability landscape and prioritize remediation efforts effectively based on month-over-month trends.  
-# Note: The load_previous_report function assumes that the input Excel file is formatted in a way that can be processed by the function, and that specific sheets and columns are present for identifying devices,
+
 def load_previous_report(file_path):
     try:
         xl = pd.ExcelFile(file_path)
@@ -940,16 +880,11 @@ def load_previous_report(file_path):
         except Exception:
             continue
 
-    # ── IMPORTANT: Raw Data is the single source of truth ──────────────────────
-    # We deliberately do NOT attach _Checkbox_Resolved to df itself.
-    # Attaching it here would allow the column to flow into _active_trend_scope,
-    # where any filter on it would silently hide manually-ticked CVEs from the
-    # Persisting set — exactly the "ghost ticket" bug we fixed.
-    #
-    # Instead, we return resolved_pairs as a standalone set alongside df.
-    # compute_trends uses it ONLY for re-detection tracking (identifying CVEs
-    # that were ticked resolved last month but have re-appeared in raw data),
-    # never to exclude rows from the New / Resolved / Persisting arithmetic.
+    # ── Raw Data is the single source of truth ─────────────────────────────────
+    # Do NOT attach _Checkbox_Resolved to df. Attaching it would let the column
+    # flow into _active_trend_scope and silently hide CVEs from the Persisting set.
+    # Return resolved_pairs as a standalone set so compute_trends can use it only
+    # for re-detection tracking without it ever touching trend arithmetic.
     return df, resolved_pairs
 
 
@@ -982,19 +917,6 @@ def _active_trend_scope(df: pd.DataFrame, threshold: float,
     if _sc:
         out = out[out[_sc].astype(str).str.strip().str.upper().eq('UNRESOLVED')].copy()
 
-    # Exclude devices not present in RMM — they have no confirmed identity in the
-    # managed estate and must not skew New / Resolved / Persisting counts regardless
-    # of whether an inventory set was supplied.
-    # Guard on column presence: previous-report exports pre-dating this column are
-    # silently skipped with a debug note so the absence is traceable.
-    if 'Last Response' in out.columns:
-        out = out[out['Last Response'].astype(str).str.strip() != 'Not Found in RMM'].copy()
-    else:
-        log.debug(
-            "_active_trend_scope: 'Last Response' column absent — "
-            "skipping Not-in-RMM filter (older report format)"
-        )
-
     if inventory_devices:
         out = out[out['_Name_Key'].isin(inventory_devices)].copy()
 
@@ -1020,9 +942,9 @@ def compute_trends(current_df, previous_df, threshold,
     Compare current and previous reports at or above the score threshold.
     Raw Data is strictly honored as the single source of truth for active vulnerabilities.
 
-    prev_resolved_pairs: the set of (normalised_device, cve_id) tuples returned by
-        load_previous_report alongside the previous DataFrame.  Used only for
-        re-detection tracking — never to exclude rows from trend arithmetic.
+    prev_resolved_pairs: set of (normalised_device, cve_id) tuples returned by
+        load_previous_report alongside the DataFrame. Used ONLY for re-detection
+        tracking — never to exclude rows from trend arithmetic.
     """
     cur  = current_df.copy()
     cur['_Name_Key'] = cur['Name'].apply(normalize_device_name)
@@ -1074,9 +996,9 @@ def compute_trends(current_df, previous_df, threshold,
                  len(new_products), sorted(new_products))
 
     # ── Re-detection tracking (checkbox triage data ONLY) ─────────────────────
-    # prev_resolved_pairs comes directly from load_previous_report's second return
-    # value — it never touches the DataFrames that fed _active_trend_scope, so it
-    # cannot influence the New / Resolved / Persisting set arithmetic.
+    # prev_resolved_pairs arrives directly from load_previous_report's second
+    # return value so it never touches the DataFrames feeding _active_trend_scope
+    # and cannot influence New / Resolved / Persisting counts.
     checkbox_resolved   = prev_resolved_pairs or set()
     cur_active_pairs_2d = set(zip(cur_t['_Name_Key'], cur_t['_CVE_Key']))
     redetected_pairs    = checkbox_resolved & cur_active_pairs_2d

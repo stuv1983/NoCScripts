@@ -283,7 +283,10 @@ def run(request: DashboardRequest) -> DashboardResult:
         filtered_df = merged_df[merged_df['Vulnerability Score'] >= request.threshold].copy()
         triage_df   = filtered_df[filtered_df['Last Response'] != 'Not Found in RMM'].copy()
 
-        not_in_rmm = filtered_df[filtered_df['Last Response'] == 'Not Found in RMM']['Name'].nunique()
+        # Build a dedicated DataFrame for not-in-RMM devices so we can pass rows
+        # (not just a count) into the stale sheet builders for audit tracking.
+        not_in_rmm_df   = filtered_df[filtered_df['Last Response'] == 'Not Found in RMM'].copy()
+        not_in_rmm      = int(not_in_rmm_df['Name'].nunique())
         if not_in_rmm:
             w = f"{not_in_rmm} device(s) with score ≥ {request.threshold} not found in RMM — excluded from triage sheets"
             log.warning(w)
@@ -322,7 +325,6 @@ def run(request: DashboardRequest) -> DashboardResult:
         redetected_count = 0
         if request.include_trend and request.prev_report_path:
             log.info("Loading previous report for trend: %s", request.prev_report_path)
-            # load_previous_report returns (df, resolved_pairs) — unpack both.
             prev_df, prev_resolved_pairs = load_previous_report(request.prev_report_path)
             prev_report_name = Path(request.prev_report_path).name
             inventory_set    = (set(df_rmm['Device_Join'].unique())
@@ -477,7 +479,6 @@ def run(request: DashboardRequest) -> DashboardResult:
                 not_in_rmm_unique_cves=_not_in_rmm_unique_cves,
                 report_month=report_month_val,
             )
-
             if trend_data:
                 build_trend_summary_sheet(wb, trend_data, request.threshold,
                                           prev_report_name, header_fmt,
@@ -510,22 +511,35 @@ def run(request: DashboardRequest) -> DashboardResult:
                                   patch_resolved_pairs=patch_resolved_pairs,
                                   patch_gap_pairs=patch_gap_pairs)
 
-            if not stale_excluded.empty:
-                build_stale_excluded_sheet(writer, stale_excluded)
-                
-                # Fetch unresolved CVEs for these stale devices natively from RAW DATA
-                stale_device_names = stale_excluded['Name'].unique()
-                stale_raw_rows = raw_df[raw_df['Name'].isin(stale_device_names)].copy()
-                
+            if not stale_excluded.empty or not not_in_rmm_df.empty:
+                build_stale_excluded_sheet(writer, stale_excluded,
+                                           not_in_rmm_df=not_in_rmm_df if not not_in_rmm_df.empty else None)
+
+                # Fetch unresolved CVEs for stale-date devices from RAW DATA
+                stale_device_names  = stale_excluded['Name'].unique() if not stale_excluded.empty else []
+                stale_raw_rows      = raw_df[raw_df['Name'].isin(stale_device_names)].copy()
+
                 _status_col_stale = ('Threat Status' if 'Threat Status' in stale_raw_rows.columns
                                      else 'Status'   if 'Status'        in stale_raw_rows.columns
                                      else None)
-                if _status_col_stale:
+                if _status_col_stale and not stale_raw_rows.empty:
                     stale_unresolved_cves = stale_raw_rows[stale_raw_rows[_status_col_stale].astype(str).str.strip().str.upper() == 'UNRESOLVED'].copy()
                 else:
                     stale_unresolved_cves = stale_raw_rows.copy()
-                
-                build_stale_cves_sheet(writer, stale_unresolved_cves, link_fmt)
+
+                # Fetch unresolved CVEs for not-in-RMM devices from RAW DATA
+                not_in_rmm_names   = not_in_rmm_df['Name'].unique() if not not_in_rmm_df.empty else []
+                not_in_rmm_raw     = raw_df[raw_df['Name'].isin(not_in_rmm_names)].copy()
+                _status_col_nirm   = ('Threat Status' if 'Threat Status' in not_in_rmm_raw.columns
+                                      else 'Status'   if 'Status'        in not_in_rmm_raw.columns
+                                      else None)
+                if _status_col_nirm and not not_in_rmm_raw.empty:
+                    not_in_rmm_cves = not_in_rmm_raw[not_in_rmm_raw[_status_col_nirm].astype(str).str.strip().str.upper() == 'UNRESOLVED'].copy()
+                else:
+                    not_in_rmm_cves = not_in_rmm_raw.copy()
+
+                build_stale_cves_sheet(writer, stale_unresolved_cves, link_fmt,
+                                       not_in_rmm_cves_df=not_in_rmm_cves if not not_in_rmm_cves.empty else None)
 
             _status_col_wb = ('Threat Status' if 'Threat Status' in merged_df.columns
                               else 'Status'   if 'Status'        in merged_df.columns
