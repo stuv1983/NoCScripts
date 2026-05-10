@@ -481,7 +481,7 @@ def build_overview_sheet(workbook, merged_df, filtered_df, triage_df, threshold,
         p += 1
 
     ws.write(row_t, 4, f'Devices by Type (Score {threshold}+)', header_fmt)
-    dt_counts = filtered_df.groupby('Device Type')['Name'].nunique()
+    dt_counts = filtered_df.groupby('Device Type', observed=True)['Name'].nunique()
     r2 = row_t + 1
     for dt, cnt in dt_counts.items():
         ws.write(r2, 4, str(dt)); ws.write(r2, 5, cnt); r2 += 1

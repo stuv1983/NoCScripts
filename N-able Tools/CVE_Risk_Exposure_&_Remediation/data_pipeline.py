@@ -45,15 +45,12 @@ _EMPTY_PAREN = re.compile(r'\s*\(\s*\)')
 _TRAILING_VER= re.compile(r'\s+v?\d[\d.+]*\s*$')
 _SHEET_CHARS = re.compile(r'[\[\]\:\*\?\/\\\'\000]')
 
-# Low-cardinality columns that benefit from category dtype.
-# Category stores each unique value once and uses integers for all rows,
-# cutting per-column RAM by ~90%.
 _CAT_COLS_VULN = ['Vulnerability Severity', 'Threat Status', 'Has Known Exploit', 'CISA KEV']
 _CAT_COLS_RMM  = ['Device Type']
 
 
 def _downcast_low_cardinality(df, cols):
-    """Cast low-cardinality string columns to category dtype in-place (skips if already categorical)."""
+    """Cast low-cardinality string columns to category dtype in-place."""
     for col in cols:
         if col in df.columns and not hasattr(df[col], 'cat'):
             df[col] = df[col].astype('category')
@@ -382,8 +379,6 @@ def load_vulnerability_data(file_path: str) -> pd.DataFrame:
         else:
             df = xl.parse(xl.sheet_names[0])
     else:
-        # PyArrow-backed strings cut string-column RAM vs Python-object backend.
-        # Falls back silently if pyarrow isn't installed or pandas < 2.0.
         try:
             df = pd.read_csv(file_path, dtype_backend='pyarrow')
         except TypeError:
@@ -506,11 +501,7 @@ def merge_data(df_vuln, df_rmm, skip_rmm, exclude_missing_rmm=True):
             merged = pd.merge(df_vuln, df_rmm[rmm_pull],
                               left_on='Name_Join', right_on='Device_Join', how=join_how)
 
-            # Device Type and Last Response come from df_rmm as category dtype.
-            # Widen to object immediately after the merge so that every subsequent
-            # .loc write in this function (missing_mask, OS-role, OS inference)
-            # can assign arbitrary string values without raising TypeError.
-            # Re-downcast to category happens at the end of merge_data.
+            # Widen category columns to object before any .loc writes.
             for _cat_col in ('Device Type', 'Last Response'):
                 if _cat_col in merged.columns and hasattr(merged[_cat_col], 'cat'):
                     merged[_cat_col] = merged[_cat_col].astype(object)
@@ -581,11 +572,27 @@ def merge_data(df_vuln, df_rmm, skip_rmm, exclude_missing_rmm=True):
 
     merged['Vulnerability Score'] = pd.to_numeric(merged['Vulnerability Score'], errors='coerce')
 
-    merged['_Sort_Time'] = merged['Last Response'].apply(parse_last_response)
+    # ── Vectorised _Sort_Time + Days Since Last Response ─────────────────────
+    # Replaces two row-by-row .apply(parse_last_response) loops with bulk
+    # pd.to_datetime calls.  format='mixed' silences the inference warning and
+    # handles the mix of date formats N-able exports produce.
+    _epoch         = pd.to_datetime('1900-01-01')
+    _lr_str        = merged['Last Response'].astype(str).str.strip()
+    _sentinel_mask = _lr_str.isin(['Not Found in RMM', 'N/A', ''])
 
-    _epoch = pd.to_datetime('1900-01-01')
+    _sort_time = pd.to_datetime(
+        _lr_str.where(~_sentinel_mask, other=pd.NaT),
+        errors='coerce',
+        format='mixed',
+        dayfirst=False,
+    )
+    if hasattr(_sort_time, 'dt') and _sort_time.dt.tz is not None:
+        _sort_time = _sort_time.dt.tz_localize(None)
+    _sort_time = _sort_time.fillna(_epoch)
+    merged['_Sort_Time'] = _sort_time
+
+    # Fallback: rows still at epoch → try publication/detection date columns
     _stale_mask = merged['_Sort_Time'] <= _epoch
-
     if _stale_mask.any():
         for _date_col in ('Last updated', 'First detected', 'Date Published'):
             if _date_col in merged.columns:
@@ -594,26 +601,18 @@ def merge_data(df_vuln, df_rmm, skip_rmm, exclude_missing_rmm=True):
                     errors='coerce',
                     utc=True,
                 ).dt.tz_localize(None)
-                merged.loc[_stale_mask & _parsed.notna(), '_Sort_Time'] = (
-                    _parsed[_stale_mask & _parsed.notna()]
-                )
+                _update_mask = _stale_mask & _parsed.notna()
+                merged.loc[_update_mask, '_Sort_Time'] = _parsed[_update_mask]
                 _stale_mask = merged['_Sort_Time'] <= _epoch
                 if not _stale_mask.any():
                     break
-                    
-    now_ts = pd.Timestamp.now()
-    def _calc_days_from_lr(val):
-        if str(val).strip() in ('Not Found in RMM', 'N/A', ''):
-            return '—'
-        dt = parse_last_response(val)
-        if pd.isna(dt) or dt <= pd.to_datetime('1900-01-01'):
-            return '—'
-        if dt.tzinfo is not None:
-            dt = dt.tz_localize(None)
-        days = (now_ts - dt).days
-        return days if days >= 0 else 0
 
-    merged['Days Since Last Response'] = merged['Last Response'].apply(_calc_days_from_lr)
+    # Days Since Last Response — reuse already-parsed series, no second parse
+    _now      = pd.Timestamp.now()
+    _no_data  = _sentinel_mask | (merged['_Sort_Time'] <= _epoch)
+    _days_num = (_now - merged['_Sort_Time']).dt.days.clip(lower=0).astype(object)
+    _days_num[_no_data] = '—'
+    merged['Days Since Last Response'] = _days_num
     
     cols = merged.columns.tolist()
     if 'Days Since Last Response' in cols:
@@ -622,7 +621,6 @@ def merge_data(df_vuln, df_rmm, skip_rmm, exclude_missing_rmm=True):
         cols.insert(lr_idx + 1, 'Days Since Last Response')
         merged = merged[cols]
 
-    # Re-apply category dtype now that all conditional .loc writes are done.
     _downcast_low_cardinality(merged, _CAT_COLS_VULN + _CAT_COLS_RMM)
 
     return merged
