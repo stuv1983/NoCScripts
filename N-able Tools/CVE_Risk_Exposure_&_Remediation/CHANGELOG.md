@@ -377,6 +377,97 @@ Reviewed `main.py` — all cross-thread UI updates already use `root.after(0, ca
 
 ---
 
+### v0.15 — GUI Modernisation: CustomTkinter
+
+**Files:** `main.py`
+
+Replaced the standard `tkinter` widget set with `customtkinter` (CTk 5.2.2). Dark mode enabled by default via `ctk.set_appearance_mode("dark")`.
+
+Every visual widget converted: `ctk.CTkLabel`, `ctk.CTkEntry`, `ctk.CTkButton`, `ctk.CTkCheckBox`, `ctk.CTkFrame`, `ctk.CTkToplevel`, `ctk.CTkProgressBar`, `ctk.CTkScrollableFrame`. Three widget types intentionally kept as plain tkinter: `tk.StringVar` / `tk.BooleanVar` (CTk uses these unchanged), `tk.Menu` (no CTk equivalent — native menu bar is correct), `filedialog` and `messagebox` (system dialogs, no CTk replacement).
+
+Main window content wrapped in `CTkScrollableFrame` — on small screens the old layout clipped the bottom widgets; scroll frame ensures everything is reachable at any window height.
+
+All toggle helpers updated from `tk.NORMAL` / `tk.DISABLED` constants to `"normal"` / `"disabled"` strings (CTk requirement).
+
+`requirements.txt` — added `customtkinter>=5.2`.
+
+---
+
+### v0.16 — Username Column: RMM → All Worksheets
+
+**Files:** `data_pipeline.py`, `excel_builder.py`
+
+`data_pipeline.py` — `load_rmm_data`: added Username column detection across seven aliases (`username`, `user name`, `logged-on user`, `logged on user`, `current user`, `user`, positional header). Standardised to `'Username'`. Missing column filled with empty string so downstream code never guards for absence.
+
+`data_pipeline.py` — `merge_data`: `'Username'` added to `rmm_pull` conditionally (only when present in `df_rmm` and absent from `df_vuln`). Post-merge guard fills any remaining NaN values.
+
+`excel_builder.py` — `Username` column added immediately after `Device Name` in: All Detections, product sheets (`cols_order`), trend detail sheets (`detail_cols`), Resolved (Patch Confirmed), Raw Data, and all stale / not-in-RMM sheets.
+
+---
+
+### v0.17 — Top At-Risk Devices Table
+
+**Files:** `excel_builder.py`
+
+Added a **Top At-Risk Devices** table to the Client Summary sheet, positioned between the Data Filtering waterfall and the CVSS Score Split.
+
+Priority rules (in order): every Server with at least one unresolved CVE always appears regardless of count; every device with a CVE flagged `Has Known Exploit = Yes` always appears; remaining slots filled to a maximum of 10 by highest unresolved CVE count.
+
+Columns: 💻 Device Name, 👤 Username, ⚠️ Unresolved CVEs, 💣 Has Exploit, 🖥️ Device Type.
+
+Row highlighting: amber = server, red-tint = exploit device (exploit takes priority if both apply).
+
+Only unresolved CVEs count — resolved detections excluded from aggregation. Status column detected from either `Threat Status` or `Status` column names.
+
+Aggregation uses `itertuples` on the aggregated frame (no spaces in column names at that stage) — safe from the itertuples space-in-column-name bug.
+
+---
+
+### v0.18 — Worksheet Restructure: 4 Dedicated Stale / Not-in-RMM Sheets
+
+**Files:** `excel_builder.py`, `orchestrator.py`
+
+Replaced the old two-section layout (stale + not-in-RMM rows merged into one sheet with section headers) with four dedicated single-table filterable sheets:
+
+- 🕑 Stale Excluded Devices — devices excluded because Last Response predates the cutoff
+- 🚫 Devices Not in RMM — devices absent from the RMM inventory (audit record)
+- 🕑 CVEs on Stale Devices — CVE-level detail for stale devices with NVD links
+- 🚫 CVEs on Devices Not in RMM — CVE-level detail for not-in-RMM devices with NVD links
+
+Each sheet is a flat table with autofilter on all columns. Not-in-RMM rows highlighted red.
+
+Added two shared helper functions (`_write_device_table`, `_write_cve_table`) and two prep functions (`_device_prep`, `_cve_prep`) that use `iterrows` for the write loop — avoiding the `itertuples` space-in-column-name bug where `'Device Name'` (space) would be silently renamed to `_0` by `itertuples`, causing all device names to write as blank.
+
+`excel_builder.py` — `build_stale_excluded_sheet` and `build_stale_cves_sheet` signatures unchanged so orchestrator required no call-site changes.
+
+`orchestrator.py` — updated sheet name references for trend sheets renamed with emoji prefixes (🆕 New This Month, ⏳ Persisting CVEs).
+
+Added `'Device Name'` header rename and `Username` column to all sheets. Added emoji prefixes to Client Summary section headers (📊 Key Metrics, ✅ Resolution Status, 🔍 Data Filtering, 📈 CVSS Score Split, 📅 Month-over-Month, 🚨 Top At-Risk Devices).
+
+---
+
+### v0.19 — Resolution Status: Consistent Metric Across Both Sheets
+
+**Files:** `excel_builder.py`, `orchestrator.py`
+
+**Problem:** The April Detections overview sheet "Resolution Status" tile showed `Unresolved: −1,682` and reported a fundamentally different metric from the Client Summary, making the two figures incomparable.
+
+**Root cause 1 — negative unresolved:** `patch_confirmed_count` was computed as the size of the intersection of `patch_resolved_pairs` (3-tuples: `device, cve, product`) with `triage_keys` (also 3-tuples). The same `(device, cve)` pair matching multiple products (e.g. Chrome AND Edge both resolving CVE-2024-X) counted as two separate entries, inflating the resolved count above `n_total` (which was a 2-tuple unique pair count) and producing a negative unresolved value.
+
+Fix in `orchestrator.py`: after taking the 3-tuple intersection, deduplicate to `(device, cve)` 2-tuples before counting:
+```python
+_confirmed_3tuples = patch_resolved_pairs & triage_keys
+patch_confirmed_count = len({(d, v) for d, v, _ in _confirmed_3tuples})
+```
+
+**Root cause 2 — metric mismatch:** The overview tile used `patch_confirmed_count` (patch tool confirmation) while Client Summary used N-able's `Status` column. These measure different things and will never produce comparable numbers.
+
+Fix in `excel_builder.py`: the overview tile now uses the same source as Client Summary — N-able's `Status` column — counting unique `(device, CVE)` pairs per status. Resolved + Unresolved can exceed Total when the same CVE is resolved on some devices and unresolved on others; an overlap count is shown with an explanatory note.
+
+**Resolution Status footnote** also updated: changed `"296 CVE types resolved vs 108 unresolved"` to `"{rows} detection rows resolved vs {rows} unresolved ({pct}% remediated). {n} CVE type(s) still present on at least one active device."` — the old wording implied full remediation of 296 CVE types when it actually meant 296 appeared in at least one resolved detection row.
+
+---
+
 ## Known Architecture Decisions
 
 - **`not_in_rmm_df` excluded from trend arithmetic** — Not-in-RMM rows are excluded from `_active_trend_scope` via the `Last Response != 'Not Found in RMM'` filter regardless of whether an RMM inventory was provided. This is intentional: devices with no confirmed identity in the managed estate must not generate phantom New/Resolved/Persisting signals.
@@ -404,3 +495,8 @@ Reviewed `main.py` — all cross-thread UI updates already use `root.after(0, ca
 | v0.12 | — | ✓ | ✓ | — | — | — | — |
 | v0.13 | — | — | ✓ | ✓ | — | — | — |
 | v0.14 | — | ✓ | ✓ | — | ✓ | — | — |
+| v0.15 | ✓ | — | — | — | — | — | — |
+| v0.16 | — | — | ✓ | ✓ | — | — | — |
+| v0.17 | — | — | — | ✓ | — | — | — |
+| v0.18 | — | ✓ | — | ✓ | — | — | — |
+| v0.19 | — | ✓ | — | ✓ | — | — | — |
