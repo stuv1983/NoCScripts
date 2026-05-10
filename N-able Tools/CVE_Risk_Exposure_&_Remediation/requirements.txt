@@ -8,5 +8,8 @@
 pandas>=2.0
 xlsxwriter>=3.1
 openpyxl>=3.1       # pandas needs this engine to read .xlsx files
+pyarrow>=14         # optional but recommended: cuts string-column RAM in CSV loads
+                    # (dtype_backend='pyarrow' in load_vulnerability_data)
 
 requests>=2.31      # HTTP client with connection pooling, retry, and backoff
+loguru>=0.7        # Structured logging with automatic file rotation and retention

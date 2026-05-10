@@ -45,6 +45,21 @@ _EMPTY_PAREN = re.compile(r'\s*\(\s*\)')
 _TRAILING_VER= re.compile(r'\s+v?\d[\d.+]*\s*$')
 _SHEET_CHARS = re.compile(r'[\[\]\:\*\?\/\\\'\000]')
 
+# Low-cardinality columns that benefit from category dtype.
+# Category stores each unique value once and uses integers for all rows,
+# cutting per-column RAM by ~90%.
+_CAT_COLS_VULN = ['Vulnerability Severity', 'Threat Status', 'Has Known Exploit', 'CISA KEV']
+_CAT_COLS_RMM  = ['Device Type']
+
+
+def _downcast_low_cardinality(df, cols):
+    """Cast low-cardinality string columns to category dtype in-place (skips if already categorical)."""
+    for col in cols:
+        if col in df.columns and not hasattr(df[col], 'cat'):
+            df[col] = df[col].astype('category')
+    return df
+
+
 # RMM inventory column config (updateable via config.json)
 _RMM_CFG = _CONFIG.get('rmm_inventory_columns', {})
 _RMM_POSITIONAL = _RMM_CFG.get('positional_headers',
@@ -367,7 +382,12 @@ def load_vulnerability_data(file_path: str) -> pd.DataFrame:
         else:
             df = xl.parse(xl.sheet_names[0])
     else:
-        df = pd.read_csv(file_path)
+        # PyArrow-backed strings cut string-column RAM vs Python-object backend.
+        # Falls back silently if pyarrow isn't installed or pandas < 2.0.
+        try:
+            df = pd.read_csv(file_path, dtype_backend='pyarrow')
+        except TypeError:
+            df = pd.read_csv(file_path)
 
     rename = {}
     for col in df.columns:
@@ -417,6 +437,8 @@ def load_vulnerability_data(file_path: str) -> pd.DataFrame:
     df['Affected Products']  = df['Affected Products'].fillna('Unknown Product')
     df['Base Product']       = df['Affected Products'].apply(get_base_product)
 
+    _downcast_low_cardinality(df, _CAT_COLS_VULN)
+
     return df
 
 def load_rmm_data(file_path):
@@ -465,6 +487,8 @@ def load_rmm_data(file_path):
     else:
         df['Device Type'] = 'Unknown'
 
+    _downcast_low_cardinality(df, _CAT_COLS_RMM)
+
     return df.drop_duplicates(subset=['Device_Join'], keep='first')
 
 def merge_data(df_vuln, df_rmm, skip_rmm, exclude_missing_rmm=True):
@@ -481,6 +505,16 @@ def merge_data(df_vuln, df_rmm, skip_rmm, exclude_missing_rmm=True):
             join_how = 'inner' if exclude_missing_rmm else 'left'
             merged = pd.merge(df_vuln, df_rmm[rmm_pull],
                               left_on='Name_Join', right_on='Device_Join', how=join_how)
+
+            # Device Type and Last Response come from df_rmm as category dtype.
+            # Widen to object immediately after the merge so that every subsequent
+            # .loc write in this function (missing_mask, OS-role, OS inference)
+            # can assign arbitrary string values without raising TypeError.
+            # Re-downcast to category happens at the end of merge_data.
+            for _cat_col in ('Device Type', 'Last Response'):
+                if _cat_col in merged.columns and hasattr(merged[_cat_col], 'cat'):
+                    merged[_cat_col] = merged[_cat_col].astype(object)
+
             dropped = before - len(merged)
             if dropped and exclude_missing_rmm:
                 decom_names = (
@@ -587,6 +621,9 @@ def merge_data(df_vuln, df_rmm, skip_rmm, exclude_missing_rmm=True):
         lr_idx = cols.index('Last Response') if 'Last Response' in cols else len(cols)
         cols.insert(lr_idx + 1, 'Days Since Last Response')
         merged = merged[cols]
+
+    # Re-apply category dtype now that all conditional .loc writes are done.
+    _downcast_low_cardinality(merged, _CAT_COLS_VULN + _CAT_COLS_RMM)
 
     return merged
 

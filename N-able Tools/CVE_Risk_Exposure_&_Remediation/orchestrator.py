@@ -235,12 +235,15 @@ def run(request: DashboardRequest) -> DashboardResult:
             log.warning(msg)
             return DashboardResult(success=False, message=msg)
 
-        filtered_df = merged_df[merged_df['Vulnerability Score'] >= request.threshold].copy()
-        triage_df   = filtered_df[filtered_df['Last Response'] != 'Not Found in RMM'].copy()
+        # These are views — confirmed by audit that excel_builder.py only reads
+        # from them via .loc[mask, col] (nunique/count), never writes.
+        # Adding a write to any of these later will raise SettingWithCopyWarning.
+        filtered_df = merged_df[merged_df['Vulnerability Score'] >= request.threshold]
+        triage_df   = filtered_df[filtered_df['Last Response'] != 'Not Found in RMM']
 
         # Build a dedicated DataFrame for not-in-RMM devices so we can pass rows
         # (not just a count) into the stale sheet builders for audit tracking.
-        not_in_rmm_df   = filtered_df[filtered_df['Last Response'] == 'Not Found in RMM'].copy()
+        not_in_rmm_df   = filtered_df[filtered_df['Last Response'] == 'Not Found in RMM']
         not_in_rmm      = int(not_in_rmm_df['Name'].nunique())
         if not_in_rmm:
             w = f"{not_in_rmm} device(s) with score ≥ {request.threshold} not found in RMM — excluded from triage sheets"
