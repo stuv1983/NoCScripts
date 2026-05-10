@@ -369,7 +369,7 @@ def open_advanced_dialog():
 
 root = ctk.CTk()
 root.title("N-able CVE Dashboard & Triage Tool")
-root.geometry("600x750")
+root.geometry("600x680")
 root.resizable(True, True)
 root.minsize(520, 600)
 root.state("zoomed")
@@ -527,7 +527,7 @@ generate_btn = ctk.CTkButton(
     hover_color=_GREEN_HOVER,
     font=ctk.CTkFont(size=14, weight="bold"),
     height=44,
-    corner_radius=8,
+    corner_radius=18,
 )
 generate_btn.pack(padx=16, pady=14, fill="x")
 
