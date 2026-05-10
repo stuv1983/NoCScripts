@@ -45,7 +45,13 @@ from excel_builder import (
 log = logging.getLogger(__name__)
 
 
-def _try_sync_baselines() -> None:
+def _try_sync_baselines(rules: dict) -> dict:
+    """Sync baselines and return an updated rules dict.
+
+    Returns the original dict unchanged if the sync fails or finds no updates.
+    Never mutates the module-level FIXED_VERSION_RULES — callers get an
+    explicit new dict, making concurrent runs safe.
+    """
     try:
         from version_sync import sync_baselines
         updated = sync_baselines()
@@ -54,14 +60,14 @@ def _try_sync_baselines() -> None:
             cfg_path = str(Path(__file__).parent / 'config.json')
             with open(cfg_path, encoding='utf-8') as _fh:
                 _fresh = _json.load(_fh).get('fixed_version_rules', {})
-            FIXED_VERSION_RULES.clear()
-            FIXED_VERSION_RULES.update(_fresh)
             log.info("Baselines refreshed: %s",
                      ', '.join(f'{k}={v}' for k, v in updated.items()))
+            return _fresh
         else:
             log.debug("Baseline sync: no updates (network unavailable or all current)")
     except Exception as exc:
         log.debug("Baseline sync skipped: %s", exc)
+    return rules
 
 @dataclass
 class DashboardRequest:
@@ -173,8 +179,18 @@ def run(request: DashboardRequest) -> DashboardResult:
             log.warning("Config health check failed: %s", _e)
             config_issues = []
 
+        # Load version rules into a local dict so this run is isolated from any
+        # concurrent run that might trigger a baseline sync. The module-level
+        # FIXED_VERSION_RULES is never mutated during a run.
+        import json as _json_rules
+        try:
+            with open(Path(__file__).parent / 'config.json', encoding='utf-8') as _fh_r:
+                _rules: dict = _json_rules.load(_fh_r).get('fixed_version_rules', {})
+        except Exception:
+            _rules = dict(FIXED_VERSION_RULES)  # fallback to module-level copy
+
         if request.sync_baselines:
-            _try_sync_baselines()
+            _rules = _try_sync_baselines(_rules)
 
         log.info("Loading vulnerability data: %s", request.vuln_path)
         df_vuln = load_vulnerability_data(request.vuln_path)
@@ -187,9 +203,7 @@ def run(request: DashboardRequest) -> DashboardResult:
                 import json as _json
                 cfg_path = str(Path(__file__).parent / 'config.json')
                 with open(cfg_path, encoding='utf-8') as _fh:
-                    _fresh = _json.load(_fh).get('fixed_version_rules', {})
-                FIXED_VERSION_RULES.clear()
-                FIXED_VERSION_RULES.update(_fresh)
+                    _rules = _json.load(_fh).get('fixed_version_rules', {})
                 log.info("CVE lookup: %d CVE(s) enriched and version rules updated", enriched)
         except Exception as _e:
             log.debug("CVE lookup auto-enrich skipped: %s", _e)
@@ -274,7 +288,8 @@ def run(request: DashboardRequest) -> DashboardResult:
         if request.include_patch and request.patch_path:
             log.info("Running patch match: %s", request.patch_path)
             p_ov, p_full, p_raw, tot_r, filt_r = process_patch_match(
-                request.patch_path, merged_df.copy(), min_score=request.threshold)
+                request.patch_path, merged_df.copy(),
+                min_score=request.threshold, fixed_rules=_rules)
             patch_data = (p_ov, p_full, p_raw, tot_r, filt_r)
             log.info("  Patch match: %d total rows, %d above threshold", tot_r, filt_r)
 
@@ -342,8 +357,8 @@ def run(request: DashboardRequest) -> DashboardResult:
                 log.info("Patch-confirmed resolved pairs: %d", len(patch_resolved_pairs))
 
             p_full['_root_cause'] = p_full.apply(classify_root_cause, axis=1)
-            for row in p_full[p_full['_root_cause'].notna()].itertuples(index=False):
-                patch_gap_pairs[(row._nk, row._ck)] = row._root_cause
+            for _, row in p_full[p_full['_root_cause'].notna()].iterrows():
+                patch_gap_pairs[(row['_nk'], row['_ck'])] = row['_root_cause']
 
             cause_counts: dict[str, int] = {}
             for c in patch_gap_pairs.values():
@@ -353,9 +368,8 @@ def run(request: DashboardRequest) -> DashboardResult:
                 log.warning(w)
                 warnings.append(w)
 
-            product_rules = FIXED_VERSION_RULES
             diagnostics = compute_patch_diagnostics(
-                patch_data[1], product_rules,
+                patch_data[1], _rules,
                 resolved_pairs=patch_resolved_pairs,
             )
 

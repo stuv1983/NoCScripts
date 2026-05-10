@@ -1230,7 +1230,7 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     wf_eq_val = workbook.add_format({'bold': True, 'bg_color': '#D6E4F0', 'border': 1,
                                       'align': 'right', 'num_format': '#,##0'})
 
-    ws.set_column('A:A', 44); ws.set_column('B:D', 18)
+    ws.set_column('A:A', 44); ws.set_column('B:B', 22); ws.set_column('C:E', 18)
     title_text = (f'{customer_name}  \u2014  ' if customer_name else '') + 'CVE Risk Exposure Summary'
     ws.merge_range('A1:D1', title_text, title_fmt); ws.set_row(0, 28)
     ws.write('A2', f'Report Month: {report_month}  |  Generated: {datetime.now().strftime("%d %b %Y")}',
@@ -1319,6 +1319,105 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
                    'perfectly \u2014 a CVE type on both an excluded and an active device is counted in both groups. '
                    'Stale devices are listed in the "Stale Excluded Devices" sheet.',note_fmt)
     ws.set_row(row,42); row+=1
+
+    # ── Top At-Risk Devices ──────────────────────────────────────────────────
+    # Rules:
+    #  1. Every Server with at least 1 UNRESOLVED CVE always appears
+    #  2. Any device with an UNRESOLVED CVE with known exploit always appears
+    #  3. Fill remaining slots (up to 10 total) with highest unresolved CVE count
+    # Only unresolved CVEs count — resolved detections are excluded entirely.
+    row += 1
+    ws.merge_range(row, 0, row, 4, '  Top At-Risk Devices  (unresolved CVEs only)', sect_fmt)
+    row += 1
+
+    _has_uname   = 'Username'          in triage_df.columns
+    _has_exploit = 'Has Known Exploit'  in triage_df.columns
+    _has_dt      = 'Device Type'        in triage_df.columns
+
+    _th  = workbook.add_format({'bold': True, 'bg_color': '#2E75B6', 'font_color': 'white',
+                                 'border': 1, 'align': 'center'})
+    _td  = workbook.add_format({'border': 1})
+    _td_r= workbook.add_format({'border': 1, 'align': 'right', 'num_format': '#,##0'})
+    _td_srv  = workbook.add_format({'border': 1, 'bg_color': '#FFF2CC'})
+    _td_srv_r= workbook.add_format({'border': 1, 'bg_color': '#FFF2CC', 'align': 'right', 'num_format': '#,##0'})
+    _td_exp  = workbook.add_format({'border': 1, 'bg_color': '#FCE4D6'})
+    _td_exp_r= workbook.add_format({'border': 1, 'bg_color': '#FCE4D6', 'align': 'right', 'num_format': '#,##0'})
+
+    ws.write(row, 0, 'Device Name',      _th)
+    ws.write(row, 1, 'Username',          _th)
+    ws.write(row, 2, 'Unresolved CVEs',   _th)
+    ws.write(row, 3, 'Has Known Exploit', _th)
+    ws.write(row, 4, 'Device Type',       _th)
+    row += 1
+
+    if not triage_df.empty and 'Name' in triage_df.columns:
+        # ── Filter to UNRESOLVED only ─────────────────────────────────────────
+        _sc = ('Threat Status' if 'Threat Status' in triage_df.columns
+               else 'Status'   if 'Status'        in triage_df.columns
+               else None)
+        _unr_df = (
+            triage_df[triage_df[_sc].astype(str).str.strip().str.upper() == 'UNRESOLVED'].copy()
+            if _sc else triage_df.copy()
+        )
+
+        if _unr_df.empty:
+            ws.merge_range(row, 0, row, 4, 'No unresolved CVE data available.', note_fmt); row += 1
+        else:
+            # ── Per-device aggregation ────────────────────────────────────────
+            _agg = _unr_df.groupby('Name', as_index=False).agg(
+                cve_count  =('Vulnerability Name', 'nunique'),
+                username   =('Username',
+                             lambda s: next((v for v in s.astype(str) if v.strip() and v != 'nan'), ''))
+                             if _has_uname else ('Name', lambda s: ''),
+                has_exploit=('Has Known Exploit',
+                             lambda s: 'Yes' if s.astype(str).str.strip().str.lower()
+                             .isin(['yes','true','1','y']).any() else 'No')
+                             if _has_exploit else ('Name', lambda s: 'No'),
+                device_type=('Device Type', 'first') if _has_dt else ('Name', lambda s: 'Unknown'),
+            )
+
+            _is_server = _agg['device_type'].astype(str).str.lower().str.contains('server', na=False)
+            _is_exp    = _agg['has_exploit'].astype(str).str.strip().str.lower() == 'yes'
+            _priority  = set(_agg.loc[_is_server | _is_exp, 'Name'].tolist())
+
+            _sorted  = _agg.sort_values('cve_count', ascending=False)
+            _ordered = (
+                list(_sorted.loc[_sorted['Name'].isin(_priority)].itertuples(index=False))
+                + list(_sorted.loc[~_sorted['Name'].isin(_priority)].itertuples(index=False))
+            )
+
+            _seen: set = set()
+            _top:  list = []
+            for _r in _ordered:
+                if _r.Name not in _seen:
+                    _seen.add(_r.Name)
+                    _top.append(_r)
+                if len(_top) >= 10:
+                    break
+
+            for _r in _top:
+                _srv = 'server' in str(_r.device_type).lower()
+                _exp = str(_r.has_exploit).strip().lower() == 'yes'
+                _bf  = _td_exp   if _exp else (_td_srv   if _srv else _td)
+                _nf  = _td_exp_r if _exp else (_td_srv_r if _srv else _td_r)
+                ws.write(row, 0, _r.Name,        _bf)
+                ws.write(row, 1, _r.username,    _bf)
+                ws.write(row, 2, _r.cve_count,   _nf)
+                ws.write(row, 3, _r.has_exploit, _bf)
+                ws.write(row, 4, _r.device_type, _bf)
+                row += 1
+
+            ws.merge_range(row, 0, row, 4,
+                'ℹ  Amber = Server (always listed if it has unresolved CVEs).  '
+                'Red = device has CVEs with a known exploit.  '
+                'Up to 10 devices shown. CVE counts are unresolved detections only.',
+                note_fmt)
+            ws.set_row(row, 36); row += 1
+    else:
+        ws.merge_range(row, 0, row, 4, 'No active device data available.', note_fmt); row += 1
+
+    ws.set_column('A:A', 44); ws.set_column('B:B', 22); ws.set_column('C:E', 18)
+
 
     # CVSS Score Split
     row+=1
