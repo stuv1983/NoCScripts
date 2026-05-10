@@ -184,9 +184,7 @@ The script uses registry-based OS/build detection and treats Update Build Revisi
 
 Path:
 
-```text
-N-able Tools/CVE_Risk_Exposure_&_Remediation/
-```
+`N-able Tools/CVE_Risk_Exposure_&_Remediation/`
 
 ### Overview
 
@@ -198,45 +196,56 @@ This tool is intended to answer:
 
 > Are devices actually remediated, or is the patch/vulnerability tooling giving conflicting evidence?
 
-### Production Dependencies
+### Dependencies
 
+#### Production Dependencies
 Install from the included requirements file:
 
-```bash
-pip install -r requirements.txt
-```
+`pip install -r requirements.txt`
 
 Production dependencies include:
-
 - `pandas`
 - `xlsxwriter`
 - `openpyxl`
 - `tkcalendar`
+- `pyarrow` (>=14) — *Optional but highly recommended for memory footprint reduction during large dataset merges.*
+
+#### Development Dependencies
+For development, testing, and linting, install the dev requirements:
+
+`pip install -r requirements-dev.txt`
+
+Includes `pytest`, `pytest-cov`, `ruff`, `mypy`, and `pandas-stubs`.
 
 ### Architecture
 
-| File | Purpose |
+The tool consists of strictly scoped modules that work together in a centralized pipeline:
+
+| Module | Role |
 |---|---|
-| `main.py` | Tkinter GUI entrypoint |
+| `main.py` | Tkinter GUI — collects inputs, spawns background thread |
 | `run_dashboard.py` | CLI/headless entrypoint |
-| `orchestrator.py` | Coordinates the pipeline |
-| `data_pipeline.py` | Loads, normalises, merges, filters, and matches report data |
-| `diagnostics.py` | Root-cause and patch evidence classification |
-| `excel_builder.py` | Excel workbook/sheet rendering |
-| `snapshot.py` | Local JSON snapshot history for trend tracking |
-| `version_sync.py` | Syncs product baselines from vendor APIs |
-| `config.json` | Product mapping, fixed-version rules, remediation rules |
+| `orchestrator.py` | Controller — coordinates all modules, owns execution flow |
+| `data_pipeline.py` | Data engine — load, merge, patch-match, trend arithmetic |
+| `diagnostics.py` | Root-cause classification — patch lag, version drift, mismatches |
+| `excel_builder.py` | Report writer — all Excel sheet construction and formatting |
+| `snapshot.py` | History — lightweight JSON snapshots for trend tracking |
+| `cve_lookup.py` | CVE enrichment — automated NVD / CVE.org / OSV lookups |
+| `version_sync.py` | Baseline sync — fetches rolling baselines from vendor APIs |
+| `config.py` | Configuration — loads `config.json` and exposes shared constants |
+| `config.json` | Single source of truth for product mappings and version rules |
 
 ### Main Capabilities
 
-- Vulnerability/RMM inventory merge
+- Vulnerability/RMM inventory merge (vectorized for speed)
+- Automated CVE baseline enrichment via public APIs (NVD, CVE.org, OSV)
 - Optional patch report matching
 - Optional patch failure report integration
-- Month-over-month trend comparison
-- Stale device exclusion
-- CVSS threshold filtering
+- Month-over-month trend comparison (with ghost ticket resolution)
+- Stale device and Not-in-RMM exclusion tracking
+- CVSS threshold filtering (Default: 9.0)
 - Product-level triage tabs
-- Patch diagnostics and evidence notes
+- Patch diagnostics and root-cause evidence notes
 - Health score and recommended actions
 - Snapshot storage for historical tracking
 - CLI mode for scheduled or headless execution
@@ -258,51 +267,33 @@ The dashboard separates findings into operationally useful categories:
 
 Minimal run, skipping RMM merge:
 
-```bash
-python run_dashboard.py ^
-  --input reports/april_cve.xlsx ^
-  --output output/April_Dashboard.xlsx ^
-  --skip-rmm
-```
+`python run_dashboard.py --input reports/april_cve.xlsx --output output/April_Dashboard.xlsx --skip-rmm`
 
-With RMM inventory and patch matching:
+With RMM inventory, patch matching, and specific date formats:
 
-```bash
-python run_dashboard.py ^
-  --input reports/april_cve.xlsx ^
-  --rmm reports/device_inventory.xlsx ^
-  --patch reports/patch_report.csv ^
-  --output output/April_Dashboard.xlsx ^
-  --threshold 9.0 ^
-  --since 2026-04-01
-```
+`python run_dashboard.py --input reports/april_cve.xlsx --rmm reports/device_inventory.xlsx --patch reports/patch_report.csv --output output/April_Dashboard.xlsx --threshold 9.0 --since 01/04/2026`
 
-With previous dashboard comparison:
+With previous dashboard comparison and explicit report month label:
 
-```bash
-python run_dashboard.py ^
-  --input reports/april_cve.xlsx ^
-  --rmm reports/device_inventory.xlsx ^
-  --output output/April_Dashboard.xlsx ^
-  --previous output/March_Dashboard.xlsx
-```
+`python run_dashboard.py --input reports/april_cve.xlsx --rmm reports/device_inventory.xlsx --output output/April_Dashboard.xlsx --previous output/March_Dashboard.xlsx --report-month "April 2026"`
 
 ### Output Sheets
 
 | Sheet | Purpose |
 |---|---|
+| Client Summary | Executive overview, risk summary, and data filtering waterfall |
 | Trend Summary | Month-over-month high-level movement |
 | New This Month | New CVE types compared to previous report |
-| Resolved | CVEs no longer detected |
+| Resolved (Patch Confirmed) | CVEs no longer detected or explicitly confirmed patched |
 | Persisting CVEs | CVEs still present from the previous report |
-| Monthly Detections | Executive overview and risk summary |
-| All Detections | Full filtered detection set |
+| All Detections | Full filtered detection set (active triage scope) |
 | Product tabs | Per-product triage sheets |
 | Patch Match Overview | Patch evidence roll-up |
 | Patch Match Full Data | Detailed patch matching output |
 | Patch Report (Full) | Raw patch report evidence |
 | Diagnostics | Patch evidence/root-cause diagnostics |
-| Stale Excluded Devices | Devices excluded by last-response cutoff |
+| Stale Excluded Devices | Devices excluded by last-response cutoff or missing from RMM |
+| Stale CVEs | Vulnerabilities tied to stale or missing-in-RMM devices |
 | Raw Data | Unmodified merged dataset |
 
 ---
