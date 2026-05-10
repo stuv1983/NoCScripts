@@ -395,7 +395,14 @@ def run(request: DashboardRequest) -> DashboardResult:
                 triage_df['Vulnerability Name'].apply(extract_cve_id),
                 triage_df['Affected Products'].astype(str).apply(_dp_detect),
             ))
-            patch_confirmed_count = len(patch_resolved_pairs & triage_keys)
+            # Count UNIQUE (device, cve) pairs confirmed — not 3-tuples.
+            # patch_resolved_pairs uses (device, cve, product) 3-tuples so the
+            # same device+CVE pair can appear multiple times (once per product
+            # that matches it, e.g. Chrome AND Edge both resolving CVE-2024-X).
+            # Counting 3-tuples produces a number larger than n_total (which is
+            # 2-tuple unique pairs), causing Unresolved = Total - Resolved < 0.
+            _confirmed_3tuples = patch_resolved_pairs & triage_keys
+            patch_confirmed_count = len({(d, v) for d, v, _ in _confirmed_3tuples})
 
         failure_df     = None
         failure_lookup = {}
@@ -456,7 +463,7 @@ def run(request: DashboardRequest) -> DashboardResult:
 
             if trend_data:
                 build_trend_detail_sheets(writer, wb, trend_data, link_fmt,
-                                          sheets_subset={'🆕  New This Month', '⏳  Persisting CVEs'})
+                                          sheets_subset={'New This Month', 'Persisting CVEs'})
 
             build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
                                   patch_resolved_pairs=patch_resolved_pairs,

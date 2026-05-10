@@ -205,14 +205,14 @@ def build_trend_detail_sheets(writer, workbook, trend, link_fmt, sheets_subset=N
     new_bg  = workbook.add_format({'bg_color': '#FCE4D6'})  
     per_bg  = workbook.add_format({'bg_color': '#FFF2CC'}) 
 
-    detail_cols = ['Name', 'Username', 'Device Type', 'Vulnerability Name', 'Vulnerability Score',
+    detail_cols = ['Name', 'Device Type', 'Vulnerability Name', 'Vulnerability Score',
                    'Vulnerability Severity', 'Affected Products',
                    'Has Known Exploit', 'CISA KEV', 'Last Response', 'Days Since Last Response']
 
     all_sheets = [
-        ('\U0001f195  New This Month',  trend['new_df'],        new_bg,
+        ('New This Month',  trend['new_df'],        new_bg,
          'New CVEs not seen in the previous report — investigate and prioritise.'),
-        ('\u23f3  Persisting CVEs', trend['persisting_df'], per_bg,
+        ('Persisting CVEs', trend['persisting_df'], per_bg,
          'CVEs carried over from the previous report — still unresolved.'),
     ]
 
@@ -234,11 +234,7 @@ def build_trend_detail_sheets(writer, workbook, trend, link_fmt, sheets_subset=N
         ws.autofilter(0, 0, len(df), len(df.columns) - 1)
 
         cl = df.columns.tolist()
-        if 'Name'               in cl:
-            ws.set_column(cl.index('Name'), cl.index('Name'), 28)
-            _dn_fmt = workbook.add_format({'bold': True, 'bg_color': '#2E75B6', 'font_color': 'white', 'border': 1})
-            ws.write(0, cl.index('Name'), '\U0001f4bb Device Name', _dn_fmt)
-        if 'Username'           in cl: ws.set_column(cl.index('Username'), cl.index('Username'), 22)
+        if 'Name'               in cl: ws.set_column(cl.index('Name'),               cl.index('Name'),               25)
         if 'Device Type'        in cl: ws.set_column(cl.index('Device Type'),        cl.index('Device Type'),        15)
         if 'Affected Products'  in cl: ws.set_column(cl.index('Affected Products'),  cl.index('Affected Products'),  30)
         if 'Vulnerability Name' in cl:
@@ -494,14 +490,29 @@ def build_overview_sheet(workbook, merged_df, filtered_df, triage_df, threshold,
     ws.write(row_r, 4, f'Resolution Status (Score {threshold}+)', header_fmt)
     sub_grey = workbook.add_format({'font_color': '#595959', 'indent': 1})
     note_fmt_small = workbook.add_format({'font_color': '#595959', 'italic': True, 'font_size': 9})
-    from data_pipeline import normalize_device_name, extract_cve_id
-    triage_pairs_set = set(zip(
-        triage_df['Name'].apply(normalize_device_name),
-        triage_df['Vulnerability Name'].apply(extract_cve_id),
-    ))
-    n_total    = len(triage_pairs_set)
-    n_resolved = patch_confirmed_count
-    n_unres    = n_total - n_resolved
+    grn_tile = workbook.add_format({'font_color': '#375623', 'bold': True})
+    red_tile = workbook.add_format({'font_color': '#C00000', 'bold': True})
+
+    # Use N-able Status column as source of truth — same as Client Summary.
+    # Count unique (device, cve) pairs per status so these figures are
+    # comparable to Client Summary rows but deduplicated across products.
+    _ov_sc = ('Threat Status' if 'Threat Status' in triage_df.columns
+              else 'Status'   if 'Status'        in triage_df.columns
+              else None)
+    if _ov_sc:
+        _ov_res_rows = triage_df[triage_df[_ov_sc].astype(str).str.strip().str.upper() == 'RESOLVED']
+        _ov_unr_rows = triage_df[triage_df[_ov_sc].astype(str).str.strip().str.upper() == 'UNRESOLVED']
+        _ov_res_pairs = set(zip(_ov_res_rows['Name'], _ov_res_rows['Vulnerability Name']))
+        _ov_unr_pairs = set(zip(_ov_unr_rows['Name'], _ov_unr_rows['Vulnerability Name']))
+        _ov_all_pairs = set(zip(triage_df['Name'],    triage_df['Vulnerability Name']))
+        n_res_pairs  = len(_ov_res_pairs)
+        n_unr_pairs  = len(_ov_unr_pairs)
+        n_total      = len(_ov_all_pairs)
+        n_overlap    = len(_ov_res_pairs & _ov_unr_pairs)
+    else:
+        _ov_all_pairs = set(zip(triage_df['Name'], triage_df['Vulnerability Name']))
+        n_res_pairs = n_unr_pairs = n_overlap = 0
+        n_total = len(_ov_all_pairs)
 
     if product_to_sheet:
         f_res   = ' + '.join([f"COUNTIF('{s}'!A:A, \"☑\")" for s in product_to_sheet.values()])
@@ -509,33 +520,38 @@ def build_overview_sheet(workbook, merged_df, filtered_df, triage_df, threshold,
     else:
         f_res, f_unres = '0', '0'
 
-    ws.write(row_r + 1, 4, 'Resolved (☑)');
-    ws.write(row_r + 1, 5, n_resolved)
-    ws.write(row_r + 1, 6, 'patch-confirmed unique device × CVE pairs', note_fmt_small)
-    ws.write(row_r + 2, 4, 'Unresolved (☐)');
-    ws.write(row_r + 2, 5, n_unres)
-    ws.write(row_r + 3, 4, 'Total (device × CVE pairs)');
+    ws.write(row_r + 1, 4, 'Resolved')
+    ws.write(row_r + 1, 5, n_res_pairs, grn_tile)
+    ws.write(row_r + 1, 6, 'unique device × CVE pairs with Status = RESOLVED in N-able', note_fmt_small)
+    ws.write(row_r + 2, 4, 'Unresolved')
+    ws.write(row_r + 2, 5, n_unr_pairs, red_tile)
+    ws.write(row_r + 2, 6, 'unique device × CVE pairs still showing UNRESOLVED in N-able', note_fmt_small)
+    ws.write(row_r + 3, 4, 'Total unique pairs')
     ws.write(row_r + 3, 5, n_total)
-    ws.write(row_r + 3, 6, f'— {triage_df["Name"].nunique()} unique devices,  '
-                            f'{triage_df["Vulnerability Name"].nunique()} unique CVE types', note_fmt_small)
-    if product_to_sheet:
-        ws.write(row_r + 4, 4, '   ☑ ticked in sheets', sub_grey)
-        ws.write_formula(row_r + 4, 5, f'={f_res}')
-        ws.write(row_r + 4, 6, 'incl. cross-product duplicates — use Total above for reporting', note_fmt_small)
+    ws.write(row_r + 3, 6, f'— {triage_df["Name"].nunique()} devices, '
+                            f'{triage_df["Vulnerability Name"].nunique()} CVE types', note_fmt_small)
+    if n_overlap > 0:
+        ws.write(row_r + 4, 4, f'  ↕ {n_overlap:,} pair(s) in both', sub_grey)
+        ws.write(row_r + 4, 6,
+                 'same CVE resolved on some devices, unresolved on others — resolved + unresolved > total is expected',
+                 note_fmt_small)
 
     extra_rows = 4
     if patch_confirmed_count > 0:
-        ws.write(row_r + 5, 4, '── Resolved breakdown ──', sub_grey)
-        ws.write(row_r + 6, 4, '  Patch via RMM', sub_grey)
+        ws.write(row_r + 5, 4, '── Patch tool breakdown ──', sub_grey)
+        ws.write(row_r + 6, 4, '  Patch-confirmed (☑ pre-filled)', sub_grey)
         ws.write(row_r + 6, 5, patch_confirmed_count)
-        ws.write(row_r + 6, 6, 'pre-filled ☑ by patch report', note_fmt_small)
+        ws.write(row_r + 6, 6, 'unique device × CVE pairs confirmed via patch report', note_fmt_small)
         extra_rows = 6
 
         if has_prev_report:
-            ws.write(row_r + 7, 4, '  Manually Marked', sub_grey)
-            ws.write_formula(row_r + 7, 5, f'={f_res} - {patch_confirmed_count}')
-            ws.write(row_r + 7, 6, 'user-checked ☑', note_fmt_small)
-            extra_rows = 7
+            ws.write(row_r + 7, 4, '  ☑ ticked in sheets', sub_grey)
+            ws.write_formula(row_r + 7, 5, f'={f_res}')
+            ws.write(row_r + 7, 6, 'incl. cross-product duplicates — for reference only', note_fmt_small)
+            ws.write(row_r + 8, 4, '  Manually marked', sub_grey)
+            ws.write_formula(row_r + 8, 5, f'={f_res} - {patch_confirmed_count}')
+            ws.write(row_r + 8, 6, 'user-checked ☑', note_fmt_small)
+            extra_rows = 8
 
     if redetected_count > 0:
         rr = row_r + extra_rows + 1
@@ -592,17 +608,11 @@ def build_all_detections_sheet(writer, merged_df, link_fmt, missing_row_fmt):
     df['NVD'] = ''
 
     cols = df.columns.tolist()
-    if 'Username' in cols and 'Name' in cols:
-        cols.remove('Username')
-        cols.insert(cols.index('Name') + 1, 'Username')
     if 'Device Type' in cols and 'Name' in cols:
-        uname_offset = 2 if 'Username' in cols else 1
-        cols.remove('Device Type')
-        cols.insert(cols.index('Name') + uname_offset, 'Device Type')
-    df = df[cols]
+        cols.insert(cols.index('Name') + 1, cols.pop(cols.index('Device Type')))
+        df = df[cols]
 
     df = df.sort_values(by=['Vulnerability Score', 'Name'], ascending=[False, True])
-    df = df.rename(columns={'Name': 'Device Name'})
     df.to_excel(writer, sheet_name='All Detections', index=False)
 
     ws = writer.sheets['All Detections']
@@ -617,10 +627,8 @@ def build_all_detections_sheet(writer, merged_df, link_fmt, missing_row_fmt):
         nvd_idx = cl.index('NVD')
         ws.set_column(nvd_idx, nvd_idx, 10, link_fmt)
         _write_nvd_links(ws, df['Vulnerability Name'], nvd_idx, link_fmt)
-    if 'Device Name' in cl:
-        ws.set_column(cl.index('Device Name'), cl.index('Device Name'), 28)
-    if 'Username' in cl:
-        ws.set_column(cl.index('Username'), cl.index('Username'), 22)
+    if 'Name' in cl:
+        ws.set_column(cl.index('Name'), cl.index('Name'), 25)
     if 'Last Response' in cl:
         lr = get_col_letter(cl.index('Last Response'))
         ws.conditional_format(1, 0, len(df), len(cl) - 1, {
@@ -636,7 +644,7 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
     if patch_gap_pairs is None:
         patch_gap_pairs = {}
 
-    cols_order = ['Resolved', 'Vulnerability Name', 'Name', 'Username', 'Device Type',
+    cols_order = ['Resolved', 'Vulnerability Name', 'Name', 'Device Type',
                   'Vulnerability Severity', 'Vulnerability Score', 'Risk Severity Index',
                   'Has Known Exploit', 'CISA KEV', 'Last Response', 'Days Since Last Response', 'Affected Products',
                   'Baseline Compliance', 'NVD']
@@ -724,11 +732,7 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
             nvd_idx = cl.index('NVD')
             ws.set_column(nvd_idx, nvd_idx, 10, link_fmt)
             _write_nvd_links(ws, group['Vulnerability Name'], nvd_idx, link_fmt)
-        if 'Name'               in cl:
-            ws.set_column(cl.index('Name'), cl.index('Name'), 28)
-            _dn_fmt2 = wb_.add_format({'bold': True, 'bg_color': '#2E75B6', 'font_color': 'white', 'border': 1})
-            ws.write(0, cl.index('Name'), '\U0001f4bb Device Name', _dn_fmt2)
-        if 'Username'           in cl: ws.set_column(cl.index('Username'), cl.index('Username'), 22)
+        if 'Name'               in cl: ws.set_column(cl.index('Name'),               cl.index('Name'),               25)
         if 'Device Type'        in cl: ws.set_column(cl.index('Device Type'),        cl.index('Device Type'),        15)
         if 'Baseline Compliance' in cl: ws.set_column(cl.index('Baseline Compliance'), cl.index('Baseline Compliance'), 22)
 
@@ -866,7 +870,7 @@ def build_patch_resolved_sheet(writer, patch_full_df: 'pd.DataFrame') -> None:
         resolved['Lag (days)'] = ''
 
     cols = [c for c in [
-        'Name', 'Username', 'Vulnerability Name', 'Affected Products',
+        'Name', 'Vulnerability Name', 'Affected Products',
         'Vulnerability Score', 'Matched Patch Version',
         'Patch Install Date', 'First detected', 'Lag (days)',
         'Product Baseline', 'Baseline Compliance',
@@ -877,7 +881,6 @@ def build_patch_resolved_sheet(writer, patch_full_df: 'pd.DataFrame') -> None:
            .sort_values(['Affected Products', 'Vulnerability Score'],
                         ascending=[True, False])
            .reset_index(drop=True))
-    out = out.rename(columns={'Name': 'Device Name'})
 
     out.to_excel(writer, sheet_name='Resolved (Patch Confirmed)', index=False)
     ws = writer.sheets['Resolved (Patch Confirmed)']
@@ -899,7 +902,7 @@ def build_patch_resolved_sheet(writer, patch_full_df: 'pd.DataFrame') -> None:
 
     note_row = len(out) + 2
     unique_cves     = out['Vulnerability Name'].nunique()
-    unique_devices  = out['Device Name'].nunique() if 'Device Name' in out.columns else out.iloc[:,0].nunique()
+    unique_devices  = out['Name'].nunique()
     ws.write(note_row, 0,
              f'{unique_cves} CVE type(s) resolved across {unique_devices} device(s) '
              f'via patch report. Install date confirmed after first detection date.',
@@ -1067,222 +1070,143 @@ def build_patch_failure_sheet(writer, failure_df: 'pd.DataFrame',
                   'Resolving the patch delivery issue (see Patch Failures sheet) '
                   'should also clear these CVEs.', note_fmt)
 
-
-# ── Shared helpers ────────────────────────────────────────────────────────────
-
-def _write_device_table(ws, wb, df, headers, src_col_name,
-                        row_nirm_col=None, start_row=0):
-    """
-    Write a flat filterable table. Rows where src_col_name value starts with
-    'Not Found in RMM' or 'Not in RMM' are highlighted red.
-    Returns the row index after the last data row.
-
-    Uses iterrows (not itertuples) to safely handle column names with spaces.
-    """
-    hdr_fmt  = wb.add_format({'bold': True, 'bg_color': '#2E75B6',
-                               'font_color': 'white', 'border': 1})
-    row_norm = wb.add_format({'border': 1})
-    row_nirm = wb.add_format({'border': 1, 'bg_color': '#FFEBEE',
-                               'font_color': '#C00000'})
-
-    row = start_row
-    for ci, h in enumerate(headers):
-        ws.write(row, ci, h, hdr_fmt)
-    row += 1
-
-    for _, r in df.iterrows():
-        src_val = str(r.get(src_col_name, ''))
-        is_nirm = src_val.startswith('Not Found') or src_val.startswith('Not in RMM')
-        fmt = row_nirm if is_nirm else row_norm
-        for ci, h in enumerate(headers):
-            # Map display header → DataFrame column
-            col = h
-            val = r.get(col, '')
-            if val is None or (isinstance(val, float) and __import__('pandas').isna(val)):
-                val = ''
-            ws.write(row, ci, str(val) if val != '' else '', fmt)
-        row += 1
-
-    return row
-
-
-def _write_cve_table(ws, wb, df, headers, src_col_name,
-                     link_fmt, start_row=0):
-    """
-    Write a CVE table with NVD hyperlinks. Not-in-RMM rows highlighted red.
-    Uses iterrows to avoid the itertuples space-in-column-name bug.
-    """
-    from data_pipeline import extract_cve_id as _ecve
-    hdr_fmt  = wb.add_format({'bold': True, 'bg_color': '#2E75B6',
-                               'font_color': 'white', 'border': 1})
-    row_norm = wb.add_format({'border': 1})
-    row_nirm = wb.add_format({'border': 1, 'bg_color': '#FFEBEE',
-                               'font_color': '#C00000'})
-    lnk_norm = wb.add_format({'border': 1, 'font_color': '#0563C1', 'underline': True})
-    lnk_nirm = wb.add_format({'border': 1, 'bg_color': '#FFEBEE',
-                               'font_color': '#0563C1', 'underline': True})
-
-    row = start_row
-    for ci, h in enumerate(headers):
-        ws.write(row, ci, h, hdr_fmt)
-    row += 1
-
-    for _, r in df.iterrows():
-        src_val = str(r.get(src_col_name, ''))
-        is_nirm = src_val.startswith('Not Found') or src_val.startswith('Not in RMM')
-        dfmt = row_nirm if is_nirm else row_norm
-        lfmt = lnk_nirm if is_nirm else lnk_norm
-        for ci, h in enumerate(headers):
-            val = r.get(h, '')
-            if val is None or (isinstance(val, float) and __import__('pandas').isna(val)):
-                val = ''
-            if h == 'Vulnerability Name':
-                cve_id = _ecve(str(val))
-                url = f'https://nvd.nist.gov/vuln/detail/{cve_id}' if cve_id else ''
-                if url: ws.write_url(row, ci, url, lfmt, str(val))
-                else:   ws.write(row, ci, str(val), dfmt)
-            elif h == 'NVD':
-                vn = r.get('Vulnerability Name', '')
-                cve_id = _ecve(str(vn))
-                url = f'https://nvd.nist.gov/vuln/detail/{cve_id}' if cve_id else ''
-                if url: ws.write_url(row, ci, url, lfmt, 'NVD \u2197')
-                else:   ws.write(row, ci, '', dfmt)
-            else:
-                ws.write(row, ci, str(val) if val != '' else '', dfmt)
-        row += 1
-
-    return row
-
-
-def _device_prep(df_in, src_label):
-    """Prepare a device-level DataFrame: deduplicate on Name, add Source col."""
-    if df_in is None or df_in.empty:
-        return None
-    import pandas as _pd
-    keep = [c for c in ['Name', 'Username', 'Last Response',
-                         'Days Since Last Response', 'Device Type']
-            if c in df_in.columns]
-    out = df_in[keep].drop_duplicates(subset=['Name']).copy()
-    out['Source'] = src_label
-    out = out.rename(columns={'Name': 'Device Name'})
-    return out.sort_values('Device Name')
-
-
-def _cve_prep(df_in, src_label):
-    """Prepare a CVE-level DataFrame: add Source col, add NVD placeholder."""
-    if df_in is None or df_in.empty:
-        return None
-    import pandas as _pd
-    keep = [c for c in ['Name', 'Username', 'Device Type',
-                         'Vulnerability Name', 'Vulnerability Score',
-                         'Vulnerability Severity', 'Affected Products',
-                         'Has Known Exploit', 'CISA KEV',
-                         'Last Response', 'Days Since Last Response']
-            if c in df_in.columns]
-    out = df_in[keep].copy()
-    out['NVD']    = ''
-    out['Source'] = src_label
-    out = out.rename(columns={'Name': 'Device Name'})
-    return out.sort_values(['Device Name',
-                             'Vulnerability Score' if 'Vulnerability Score' in out.columns
-                             else 'Device Name'],
-                            ascending=[True, False])
-
-
-# ── 4 dedicated stale / not-in-RMM sheets ─────────────────────────────────────
-
-_DEV_HEADERS = ['Device Name', 'Username', 'Last Response',
-                'Days Since Last Response', 'Device Type']
-_DEV_WIDTHS  = [30, 24, 22, 24, 16]
-
-_CVE_HEADERS = ['Device Name', 'Username', 'Device Type',
-                'Vulnerability Name', 'Vulnerability Score',
-                'Vulnerability Severity', 'Affected Products',
-                'Has Known Exploit', 'CISA KEV',
-                'Last Response', 'Days Since Last Response', 'NVD']
-_CVE_WIDTHS  = [30, 24, 15, 26, 16, 20, 32, 16, 12, 20, 22, 10]
-
-
 def build_stale_excluded_sheet(writer, stale_df, not_in_rmm_df=None) -> None:
     """
-    Sheet 1: \U0001f551 Stale Excluded Devices
-    Sheet 2: \U0001f6ab Devices Not in RMM
-
-    Each is a clean single-table filterable sheet.
+    'Stale Excluded Devices' worksheet — two sections:
+      1. Date-Stale (amber): Last Response before cutoff.
+      2. Not-Found-in-RMM (red): audit record for devices absent from inventory.
     """
-    import pandas as _pd
+    has_stale = stale_df is not None and not stale_df.empty
+    has_nirm  = not_in_rmm_df is not None and not not_in_rmm_df.empty
+    if not has_stale and not has_nirm:
+        return
+
+    cols_to_keep = ['Name', 'Username', 'Last Response', 'Days Since Last Response', 'Device Type']
     wb = writer.book
-    note_fmt = wb.add_format({'italic': True, 'font_color': '#595959', 'font_size': 9})
+    ws = wb.add_worksheet('Stale Excluded Devices')
 
-    # Sheet 1 — Stale devices
-    if stale_df is not None and not stale_df.empty:
-        out = _device_prep(stale_df, 'Date-Stale')
-        if out is not None and not out.empty:
-            ws = wb.add_worksheet('\U0001f551 Stale Excluded Devices')
-            for ci, (h, w) in enumerate(zip(_DEV_HEADERS, _DEV_WIDTHS)):
-                ws.set_column(ci, ci, w)
-            end_row = _write_device_table(ws, wb, out, _DEV_HEADERS, 'Source')
-            ws.autofilter(0, 0, end_row - 1, len(_DEV_HEADERS) - 1)
-            ws.write(end_row + 1, 0,
-                     '\u2139  \U0001f551 Devices excluded because Last Response predates '
-                     'the stale cutoff date. They may still be live \u2014 verify before decommissioning.',
-                     note_fmt)
+    hdr_fmt    = wb.add_format({'bold': True, 'bg_color': '#2E75B6', 'font_color': 'white', 'border': 1})
+    sect_stale = wb.add_format({'bold': True, 'bg_color': '#FFF2CC', 'border': 1, 'font_size': 10})
+    sect_nirm  = wb.add_format({'bold': True, 'bg_color': '#C00000', 'font_color': 'white', 'border': 1, 'font_size': 10})
+    row_stale  = wb.add_format({'bg_color': '#FFFDE7', 'border': 1})
+    row_nirm   = wb.add_format({'bg_color': '#FFEBEE', 'border': 1})
+    note_fmt   = wb.add_format({'italic': True, 'font_color': '#595959', 'font_size': 9})
 
-    # Sheet 2 — Not in RMM
-    if not_in_rmm_df is not None and not not_in_rmm_df.empty:
-        out = _device_prep(not_in_rmm_df, 'Not Found in RMM')
-        if out is not None and not out.empty:
-            ws = wb.add_worksheet('\U0001f6ab Devices Not in RMM')
-            for ci, (h, w) in enumerate(zip(_DEV_HEADERS, _DEV_WIDTHS)):
-                ws.set_column(ci, ci, w)
-            end_row = _write_device_table(ws, wb, out, _DEV_HEADERS, 'Source',
-                                          row_nirm_col='Source')
-            ws.autofilter(0, 0, end_row - 1, len(_DEV_HEADERS) - 1)
-            ws.write(end_row + 1, 0,
-                     '\u2139  \U0001f6ab N-able reports CVEs for these devices but they are '
-                     'absent from the RMM inventory. Verify decommission status \u2014 '
-                     'may be shadow IT or an orphaned agent.',
-                     note_fmt)
+    ws.set_column('A:A', 35); ws.set_column('B:B', 25); ws.set_column('C:C', 25)
+    ws.set_column('D:D', 25); ws.set_column('E:E', 20)
+    headers = ['Device Name', 'Username', 'Last Response', 'Days Since Last Response', 'Device Type']
+    cur = 0
+
+    def _write_sect(df_in, sect_fmt, data_fmt, label):
+        nonlocal cur
+        if df_in is None or df_in.empty: return
+        ws.merge_range(cur, 0, cur, len(headers)-1, label, sect_fmt); cur += 1
+        for ci, h in enumerate(headers): ws.write(cur, ci, h, hdr_fmt)
+        cur += 1
+        cols_p = [c for c in cols_to_keep if c in df_in.columns]
+        df_w = df_in[cols_p].drop_duplicates(subset=['Name']).copy()
+        df_w = df_w.sort_values('Last Response' if 'Last Response' in df_w.columns else df_w.columns[0])
+        df_w = df_w.rename(columns={'Name': 'Device Name'})
+        for _, r in df_w.iterrows():
+            for ci, h in enumerate(headers): ws.write(cur, ci, str(r.get(h, '')), data_fmt)
+            cur += 1
+        cur += 1
+
+    _write_sect(stale_df if has_stale else None, sect_stale, row_stale,
+                '\u23f1  Date-Stale Devices  (Last Response before cutoff date)')
+    _write_sect(not_in_rmm_df if has_nirm else None, sect_nirm, row_nirm,
+                '\U0001f6ab  Not Found in RMM  (device absent from inventory \u2014 audit record)')
+
+    ws.write(cur, 0,
+             '\u2139  Date-Stale: last seen before the cutoff \u2014 may still be live. '
+             'Not-in-RMM: N-able reports CVEs for a device absent from the RMM inventory \u2014 '
+             'verify decommission status (shadow IT / orphaned agent).', note_fmt)
+    ws.set_row(cur, 30)
 
 
 def build_stale_cves_sheet(writer, df, link_fmt, not_in_rmm_cves_df=None) -> None:
     """
-    Sheet 3: \U0001f551 CVEs on Stale Devices
-    Sheet 4: \U0001f6ab CVEs on Devices Not in RMM
-
-    Each is a clean single-table filterable sheet with NVD links.
+    'CVEs on Stale Devices' worksheet — two sections:
+      1. CVEs on date-stale devices  (light-grey rows)
+      2. CVEs on not-found-in-RMM devices  (red rows) — audit record
     """
-    import pandas as _pd
+    has_stale = df is not None and not df.empty
+    has_nirm  = not_in_rmm_cves_df is not None and not not_in_rmm_cves_df.empty
+    if not has_stale and not has_nirm:
+        return
+
+    cols_to_keep = ['Name', 'Username', 'Device Type', 'Vulnerability Name', 'Vulnerability Score',
+                    'Vulnerability Severity', 'Affected Products',
+                    'Has Known Exploit', 'CISA KEV', 'Last Response', 'Days Since Last Response']
+    col_widths = {
+        'Name': 25, 'Username': 22, 'Device Type': 15, 'Vulnerability Name': 25,
+        'Vulnerability Score': 18, 'Vulnerability Severity': 20,
+        'Affected Products': 30, 'Has Known Exploit': 16, 'CISA KEV': 12,
+        'Last Response': 20, 'Days Since Last Response': 22, 'NVD': 10,
+    }
+    headers = cols_to_keep + ['NVD']
+
     wb = writer.book
-    note_fmt = wb.add_format({'italic': True, 'font_color': '#595959', 'font_size': 9})
+    ws = wb.add_worksheet('CVEs on Stale Devices')
 
-    # Sheet 3 — CVEs on stale devices
-    if df is not None and not df.empty:
-        out = _cve_prep(df, 'Date-Stale')
-        if out is not None and not out.empty:
-            ws = wb.add_worksheet('\U0001f551 CVEs on Stale Devices')
-            for ci, (h, w) in enumerate(zip(_CVE_HEADERS, _CVE_WIDTHS)):
-                ws.set_column(ci, ci, w)
-            end_row = _write_cve_table(ws, wb, out, _CVE_HEADERS, 'Source', link_fmt)
-            ws.autofilter(0, 0, end_row - 1, len(_CVE_HEADERS) - 1)
-            ws.write(end_row + 1, 0,
-                     '\u2139  \U0001f551 Unresolved CVEs on date-stale devices. '
-                     'Excluded from active metrics but retained here for audit.',
-                     note_fmt)
+    hdr_fmt    = wb.add_format({'bold': True, 'bg_color': '#2E75B6', 'font_color': 'white', 'border': 1})
+    sect_stale = wb.add_format({'bold': True, 'bg_color': '#EFEFEF', 'border': 1, 'font_size': 10})
+    sect_nirm  = wb.add_format({'bold': True, 'bg_color': '#C00000', 'font_color': 'white', 'border': 1, 'font_size': 10})
+    row_stale  = wb.add_format({'bg_color': '#F5F5F5', 'border': 1})
+    row_nirm   = wb.add_format({'bg_color': '#FFEBEE', 'border': 1})
+    link_stale = wb.add_format({'bg_color': '#F5F5F5', 'border': 1, 'font_color': '#0563C1', 'underline': True})
+    link_nirm  = wb.add_format({'bg_color': '#FFEBEE', 'border': 1, 'font_color': '#0563C1', 'underline': True})
+    note_fmt   = wb.add_format({'italic': True, 'font_color': '#595959', 'font_size': 9})
 
-    # Sheet 4 — CVEs on not-in-RMM devices
-    if not_in_rmm_cves_df is not None and not not_in_rmm_cves_df.empty:
-        out = _cve_prep(not_in_rmm_cves_df, 'Not Found in RMM')
-        if out is not None and not out.empty:
-            ws = wb.add_worksheet('\U0001f6ab CVEs on Devices Not in RMM')
-            for ci, (h, w) in enumerate(zip(_CVE_HEADERS, _CVE_WIDTHS)):
-                ws.set_column(ci, ci, w)
-            end_row = _write_cve_table(ws, wb, out, _CVE_HEADERS, 'Source', link_fmt)
-            ws.autofilter(0, 0, end_row - 1, len(_CVE_HEADERS) - 1)
-            ws.write(end_row + 1, 0,
-                     '\u2139  \U0001f6ab Unresolved CVEs on devices absent from the RMM inventory. '
-                     'Verify these devices \u2014 may be shadow IT or orphaned agents.',
-                     note_fmt)
+    for ci, col_nm in enumerate(headers):
+        ws.set_column(ci, ci, col_widths.get(col_nm, 15))
+
+    cur = 0
+
+    def _write_section(section_df, sect_fmt, data_fmt, lnk_fmt, label):
+        nonlocal cur
+        if section_df is None or section_df.empty: return
+        cols_p = [c for c in cols_to_keep if c in section_df.columns]
+        out = section_df[cols_p].copy()
+        out['NVD'] = ''
+        out = out.sort_values(by=['Name', 'Vulnerability Score'], ascending=[True, False])
+        cl = list(out.columns)
+        vn_col  = cl.index('Vulnerability Name') if 'Vulnerability Name' in cl else None
+        nvd_col = cl.index('NVD') if 'NVD' in cl else None
+
+        ws.merge_range(cur, 0, cur, len(headers)-1, label, sect_fmt); cur += 1
+        for ci, h in enumerate(headers): ws.write(cur, ci, h, hdr_fmt)
+        cur += 1
+
+        for _, r in out.iterrows():
+            for ci, col_nm in enumerate(headers):
+                val = r.get(col_nm, '')
+                if ci == vn_col and col_nm == 'Vulnerability Name':
+                    cve_id = extract_cve_id(str(val))
+                    url = f'https://nvd.nist.gov/vuln/detail/{cve_id}' if cve_id else ''
+                    if url: ws.write_url(cur, ci, url, lnk_fmt, str(val))
+                    else:   ws.write(cur, ci, str(val), data_fmt)
+                elif ci == nvd_col and col_nm == 'NVD':
+                    cve_id = extract_cve_id(str(r.get('Vulnerability Name', '')))
+                    url = f'https://nvd.nist.gov/vuln/detail/{cve_id}' if cve_id else ''
+                    if url: ws.write_url(cur, ci, url, lnk_fmt, 'NVD \u2197')
+                    else:   ws.write(cur, ci, '', data_fmt)
+                else:
+                    safe = val if not (isinstance(val, float) and __import__('pandas').isna(val)) else ''
+                    ws.write(cur, ci, safe, data_fmt)
+            cur += 1
+        cur += 1
+
+    _write_section(df if has_stale else None, sect_stale, row_stale, link_stale,
+                   '\u23f1  CVEs on Date-Stale Devices  (excluded from active metrics \u2014 last seen before cutoff)')
+    _write_section(not_in_rmm_cves_df if has_nirm else None, sect_nirm, row_nirm, link_nirm,
+                   '\U0001f6ab  CVEs on Devices Not Found in RMM  (audit record \u2014 device absent from inventory)')
+
+    ws.write(cur, 0,
+             '\u2139  Date-Stale CVEs: device excluded because Last Response predates the cutoff. '
+             'Not-in-RMM CVEs: N-able still reports CVEs for a device absent from the RMM inventory. '
+             'Verify decommission status \u2014 may be shadow IT or an orphaned agent.', note_fmt)
+    ws.set_row(cur, 30)
 
 
 def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
@@ -1350,7 +1274,7 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         server_count = int(triage_df.loc[srv_mask,'Name'].nunique())
 
     row = 3
-    ws.merge_range(row,0,row,3,'\U0001f4ca  Key Metrics  (active devices only \u2014 excludes stale / not in RMM)',sect_fmt); row+=1
+    ws.merge_range(row,0,row,3,'  Key Metrics  (active devices only \u2014 excludes stale / not in RMM)',sect_fmt); row+=1
     for label, value, fmt in [
         ('Total CVE detection rows',        total_rows,    val_fmt),
         ('Unique CVE types detected',        unique_cves,   val_fmt),
@@ -1373,7 +1297,7 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         _rr  = int(_res.sum()); _ur = int(_unr.sum()); _tot = _rr+_ur
         _rc  = int(triage_df.loc[_res,'Vulnerability Name'].nunique()) if 'Vulnerability Name' in triage_df.columns else 0
         _uc  = int(triage_df.loc[_unr,'Vulnerability Name'].nunique()) if 'Vulnerability Name' in triage_df.columns else 0
-        ws.merge_range(row,0,row,3,'\u2705  Resolution Status  (active devices only)',sect_fmt); row+=1
+        ws.merge_range(row,0,row,3,'  Resolution Status  (active devices only)',sect_fmt); row+=1
         ws.write(row,0,'Status',hdr_fmt); ws.write(row,1,'Detection Rows',hdr_fmt)
         ws.write(row,2,'% of Total',hdr_fmt); ws.write(row,3,'Unique CVE Types',hdr_fmt); row+=1
         _rp=_rr/_tot if _tot else 0; _up=_ur/_tot if _tot else 0
@@ -1381,17 +1305,9 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         ws.write(row,0,'Unresolved',lbl_fmt); ws.write(row,1,_ur,red_fmt); ws.write(row,2,_up,val_pct); ws.write(row,3,_uc,red_fmt); row+=1
         ws.write(row,0,'Total',     lbl_fmt); ws.write(row,1,_tot,val_fmt); ws.write(row,2,1.0,val_pct)
         ws.write(row,3,triage_df['Vulnerability Name'].nunique() if 'Vulnerability Name' in triage_df.columns else 0,val_fmt); row+=1
-        _note = (
-            f'\u2139  CVSS {threshold}+: {_rr:,} detection rows resolved  vs  {_ur:,} unresolved  '
-            f'({round(_rp*100,1)}% remediated).  '
-        )
-        if _uc:
-            _note += (
-                f'{_uc:,} CVE type(s) still present on at least one active device.  '
-                f'Note: a CVE type may appear in both resolved and unresolved rows across different devices \u2014 '
-                f'overlap does not imply double-counting.'
-            )
-        ws.merge_range(row,0,row,3, _note, note_fmt); row+=1
+        ws.merge_range(row,0,row,3,
+                       f'\u2139  CVSS 9.0+: {_rr:,} resolved  vs  {_ur:,} unresolved'
+                       +(f'  |  {_rc:,} CVE types resolved  vs  {_uc:,} unresolved' if _rc or _uc else ''),note_fmt); row+=1
 
     # Data Filtering Reconciliation waterfall
     _stale_rows = int(len(stale_excluded_df)) if stale_excluded_df is not None and not stale_excluded_df.empty else 0
@@ -1405,7 +1321,7 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     _t_cves = int(_combined['Vulnerability Name'].nunique()) if 'Vulnerability Name' in _combined.columns else 0
 
     row+=1
-    ws.merge_range(row,0,row,3,f'\U0001f50d  Data Filtering Reconciliation  (CVSS \u2265 {threshold})',sect_fmt); row+=1
+    ws.merge_range(row,0,row,3,f'  Data Filtering Reconciliation  (CVSS \u2265 {threshold})',sect_fmt); row+=1
     ws.write(row,0,'Filter Step',hdr_fmt); ws.write(row,1,'Unique Devices',hdr_fmt)
     ws.write(row,2,'Detection Rows',hdr_fmt); ws.write(row,3,'Unique CVE Types',hdr_fmt); row+=1
     ws.write(row,0,'[+]  Total raw detections (all devices, CVSS \u2265 threshold)',wf_plus)
@@ -1425,14 +1341,11 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     ws.set_row(row,42); row+=1
 
     # ── Top At-Risk Devices ──────────────────────────────────────────────────────
-    # Only unresolved CVEs count. Priority order:
-    #  1. Every server with ≥1 unresolved CVE (always listed)
-    #  2. Every device with a CVE with a known exploit (always listed)
-    #  3. Remaining slots to reach 10 by highest unresolved CVE count
+    # Priority: 1) every server with ≥1 unresolved CVE  2) any device with a
+    # known-exploit CVE  3) remainder by highest unresolved CVE count, up to 10.
     row += 1
     ws.merge_range(row, 0, row, 4,
-                   '\U0001f6a8  Top At-Risk Devices  (unresolved CVEs only)', sect_fmt)
-    ws.set_column('E:E', 16)
+                   '🚨  Top At-Risk Devices  (unresolved CVEs only)', sect_fmt)
     row += 1
 
     _has_uname   = 'Username'          in triage_df.columns
@@ -1452,11 +1365,11 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     _td_exp_r = workbook.add_format({'border': 1, 'bg_color': '#FCE4D6',
                                       'align': 'right', 'num_format': '#,##0'})
 
-    ws.write(row, 0, '\U0001f4bb Device Name', _th)
-    ws.write(row, 1, '\U0001f464 Username',    _th)
-    ws.write(row, 2, '\u26a0\ufe0f Unresolved CVEs', _th)
-    ws.write(row, 3, '\U0001f4a3 Has Exploit', _th)
-    ws.write(row, 4, '\U0001f5a5\ufe0f Device Type', _th)
+    ws.write(row, 0, '💻 Device Name', _th)
+    ws.write(row, 1, '👤 Username',    _th)
+    ws.write(row, 2, '⚠️ Unresolved CVEs', _th)
+    ws.write(row, 3, '💣 Has Exploit', _th)
+    ws.write(row, 4, '🖥️ Device Type', _th)
     row += 1
 
     if not triage_df.empty and 'Name' in triage_df.columns:
@@ -1476,8 +1389,8 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
                     if _has_exploit else ('Name', lambda s: 'No'),
                 device_type =('Device Type', 'first') if _has_dt else ('Name', lambda s: 'Unknown'),
             )
-            _is_srv = _agg['device_type'].astype(str).str.lower().str.contains('server', na=False)
-            _is_exp = _agg['has_exploit'].astype(str).str.strip().str.lower() == 'yes'
+            _is_srv  = _agg['device_type'].astype(str).str.lower().str.contains('server', na=False)
+            _is_exp  = _agg['has_exploit'].astype(str).str.strip().str.lower() == 'yes'
             _priority = set(_agg.loc[_is_srv | _is_exp, 'Name'].tolist())
             _sorted  = _agg.sort_values('cve_count', ascending=False)
             _ordered = (
@@ -1503,9 +1416,9 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
                 row += 1
 
             ws.merge_range(row, 0, row, 4,
-                '\u2139  \U0001f7e1 Amber = Server (always listed if unresolved CVEs exist).  '
-                '\U0001f7e5 Red = device has CVEs with known exploit.  '
-                'Up to 10 devices. Unresolved detections only.',
+                'ℹ  🟡 Amber = Server (always listed if unresolved CVEs exist).  '
+                '🟥 Red = device has CVEs with known exploit.  '
+                'Up to 10 devices shown. Counts are unresolved detections only.',
                 note_fmt)
             ws.set_row(row, 36); row += 1
         else:
@@ -1518,7 +1431,7 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
 
     # CVSS Score Split
     row+=1
-    ws.merge_range(row,0,row,3,'\U0001f4c8  CVSS Score Split  (active detection rows)',sect_fmt); row+=1
+    ws.merge_range(row,0,row,3,'  CVSS Score Split  (active detection rows)',sect_fmt); row+=1
     ws.write(row,0,'CVSS Score',hdr_fmt); ws.write(row,1,'Detection Rows',hdr_fmt)
     ws.write(row,2,'% of Total',hdr_fmt); ws.write(row,3,'Unique CVEs',hdr_fmt); row+=1
     score_split_start=row; score_split_data=[]
@@ -1536,7 +1449,7 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     if trend_data:
         m=trend_data['metrics']
         row+=1
-        ws.merge_range(row,0,row,3,'\U0001f4c5  Month-over-Month Patching Progress',sect_fmt); row+=1
+        ws.merge_range(row,0,row,3,'  Month-over-Month Patching Progress',sect_fmt); row+=1
         mom_start_row=row
         ws.write(row,0,'Metric',hdr_fmt); ws.write(row,1,'Count',hdr_fmt)
         ws.write(row,2,'Direction',hdr_fmt); ws.write(row,3,'',hdr_fmt); row+=1
@@ -1595,18 +1508,8 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
 
 def build_raw_data_sheet(writer, raw_df):
     df = _drop_internal(raw_df)
-    df = df.rename(columns={'Name': 'Device Name'})
-    cols = df.columns.tolist()
-    if 'Username' in cols and 'Device Name' in cols:
-        cols.remove('Username')
-        cols.insert(cols.index('Device Name') + 1, 'Username')
-        df = df[cols]
     df.to_excel(writer, sheet_name='Raw Data', index=False)
-    ws = writer.sheets['Raw Data']
-    ws.autofilter(0, 0, len(df), len(df.columns) - 1)
-    cl = df.columns.tolist()
-    if 'Device Name' in cl: ws.set_column(cl.index('Device Name'), cl.index('Device Name'), 28)
-    if 'Username'    in cl: ws.set_column(cl.index('Username'),    cl.index('Username'),    22)
+    writer.sheets['Raw Data'].autofilter(0, 0, len(df), len(df.columns) - 1)
 
 def build_patch_sheets(writer, overview_df, full_df, patch_df):
     for df, name in ((overview_df, 'Patch Match Overview'),
