@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Browser CVE Audit Report Generator v6
+Browser CVE Audit Report Generator v12
 ====================================
 1. Click "Select Task Report CSV(s)" and pick your CSV file(s)
 2. Click "Select Device Inventory" and pick the XLSX
@@ -161,9 +161,9 @@ def parse_browsers(output):
 #   <UserName>   <ProfileDirName>   <YYYY-MM-DD HH:MM:SS>
 # The datetime is captured loosely so minor PS formatting differences don't break it.
 _FF_USED_PAT = re.compile(
-    r"^[ \t]*(\S+)"                       # Windows username (no spaces)
+    r"^[ \t]*(.+?)"                        # username — lazy, allows spaces (e.g. "Yayi Yang")
     r"[ \t]+"
-    r"(\S+)"                              # Firefox profile dir name
+    r"(\S+\.\S+)"                         # profile dir — must contain a dot
     r"[ \t]+"
     r"(\d{1,2}/\d{1,2}/\d{4}"            # date variants:  M/D/YYYY
     r"|\d{4}-\d{2}-\d{2}"                #                 YYYY-MM-DD
@@ -257,9 +257,9 @@ def load_inventory(path, stale_days):
         inv["Last response (Local time)"], format="%m/%d/%y %I:%M:%S %p", errors="coerce")
     today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     inv["days_since"] = (today - inv["last_response_dt"]).dt.days
-    stale = inv["days_since"] > stale_days
+    stale_mask = inv["days_since"] > stale_days
     client_name = inv["Customer name"].dropna().iloc[0] if "Customer name" in inv.columns and not inv["Customer name"].dropna().empty else ""
-    return inv[~stale].copy(), inv[stale].copy(), str(client_name).strip()
+    return inv.copy(), inv[~stale_mask].copy(), inv[stale_mask].copy(), str(client_name).strip()
 
 def load_audit(paths):
     combined = pd.concat([pd.read_csv(p) for p in paths], ignore_index=True)
@@ -296,15 +296,18 @@ def build_flagged(audit, inv_active):
     seen = set()  # (device, browser, path, issue_type) — prevent double-counting
     for _, row in audit.iterrows():
         device = row["Device"]
-        ir = idx.loc[device] if device in idx.index else None
+        if device in idx.index:
+            _hit = idx.loc[device]
+            ir = _hit.iloc[0] if hasattr(_hit, "iloc") and _hit.ndim == 2 else _hit
+        else:
+            ir = None
+        days_val = int(ir["days_since"]) if ir is not None and "days_since" in ir.index and pd.notna(ir["days_since"]) else "N/A"
         base = {
-            "Device":        device,
-            "Client":        ir["Customer name"]               if ir is not None and "Customer name"             in ir.index else row.get("Client", ""),
-            "Site":          ir["Site name"]                   if ir is not None and "Site name"                 in ir.index else row.get("Site", ""),
-            "OS":            ir["OS version"]                  if ir is not None else "N/A",
-            "Model":         ir["Model"]                       if ir is not None else "N/A",
-            "Username":      ir["Username"]                    if ir is not None else "N/A",
-            "Last Response": str(ir["Last response (Local time)"]) if ir is not None else "N/A",
+            "Device":               device,
+            "Client":               ir["Customer name"]               if ir is not None and "Customer name"             in ir.index else row.get("Client", ""),
+            "Username":             ir["Username"]                    if ir is not None else "N/A",
+            "Last Response":        str(ir["Last response (Local time)"]) if ir is not None else "N/A",
+            "Days Since Response":  days_val,
         }
         browsers = parse_browsers(str(row["Output"]))
         dual_32, only_32, per_user = detect_issues(browsers)
@@ -339,7 +342,11 @@ def build_browser_sheet_rows(audit_active, inv_active, browser_name):
     rows = []
     for _, row in audit_active.iterrows():
         device = row["Device"]
-        inv = idx.loc[device] if device in idx.index else None
+        if device in idx.index:
+            _hit = idx.loc[device]
+            inv = _hit.iloc[0] if hasattr(_hit, "iloc") and _hit.ndim == 2 else _hit
+        else:
+            inv = None
         for b in parse_browsers(str(row["Output"])):
             if b["browser"] != browser_name:
                 continue
@@ -353,20 +360,20 @@ def build_browser_sheet_rows(audit_active, inv_active, browser_name):
                 if valid_dts:
                     ff_last_used = max(valid_dts).strftime("%d %b %Y  %H:%M")
 
+            inv_days = int(inv["days_since"]) if inv is not None and "days_since" in inv.index and pd.notna(inv["days_since"]) else "N/A"
             entry = {
-                "Device":              device,
-                "Client":              inv["Customer name"]               if inv is not None and "Customer name"             in inv.index else row.get("Client", ""),
-                "Site":                inv["Site name"]                   if inv is not None and "Site name"                 in inv.index else row.get("Site", ""),
-                "Version":             b["version"],
-                "Architecture":        b["arch"],
-                "Install Scope":       b["scope"],
-                "Install Path":        b["path"],
-                "Is 32-bit":           "Yes" if b["arch"] == "32-bit" else "No",
-                "Is Per-User/AppData": "Yes" if is_per_user else "No",
-                "Note":                _path_note(b["arch"], b["path"]),
-                "OS":                  inv["OS version"]                  if inv is not None else "N/A",
-                "Username":            inv["Username"]                    if inv is not None else "N/A",
-                "Last Response":       str(inv["Last response (Local time)"]) if inv is not None else "N/A",
+                "Device":               device,
+                "Client":               inv["Customer name"]               if inv is not None and "Customer name"             in inv.index else row.get("Client", ""),
+                "Version":              b["version"],
+                "Architecture":         b["arch"],
+                "Install Scope":        b["scope"],
+                "Install Path":         b["path"],
+                "Is 32-bit":            "Yes" if b["arch"] == "32-bit" else "No",
+                "Is Per-User/AppData":  "Yes" if is_per_user else "No",
+                "Note":                 _path_note(b["arch"], b["path"]),
+                "Username":             inv["Username"]                    if inv is not None else "N/A",
+                "Last Response":        str(inv["Last response (Local time)"]) if inv is not None else "N/A",
+                "Days Since Response":  inv_days,
             }
             if browser_name == "Mozilla Firefox":
                 entry["Last Used"] = ff_last_used
@@ -420,15 +427,15 @@ def browser_overview_counts(all_browser_rows):
     counts = []
     for browser_name, rows in all_browser_rows.items():
         devices     = {r["Device"] for r in rows}
-        installs_64 = [r for r in rows if r["Is 32-bit"] == "No"]
-        installs_32 = [r for r in rows if r["Is 32-bit"] == "Yes"]
+        devices_64  = {r["Device"] for r in rows if r["Is 32-bit"] == "No"}
+        devices_32  = {r["Device"] for r in rows if r["Is 32-bit"] == "Yes"}
         devices_per = {r["Device"] for r in rows if r["Is Per-User/AppData"] == "Yes"}
         counts.append({
-            "Browser":              browser_name,
-            "Devices":              len(devices),
-            "64-bit Installs":      len(installs_64),
-            "32-bit Installs":      len(installs_32),
-            "Per-User Installs":    len(devices_per),
+            "Browser":           browser_name,
+            "Devices":           len(devices),
+            "64-bit Devices":    len(devices_64),
+            "32-bit Devices":    len(devices_32),
+            "Per-User Devices":  len(devices_per),
         })
     return counts
 
@@ -445,7 +452,7 @@ def _write_browser_sheet(wb, browser_name, rows):
 
     is_firefox = browser_name == "Mozilla Firefox"
     hdrs = ["Device", "Version", "Architecture", "Install Scope",
-            "Install Path", "Is 32-bit", "Is Per-User/AppData", "Username", "Last Response"]
+            "Install Path", "Is 32-bit", "Is Per-User/AppData", "Days Since Response", "Username", "Last Response"]
     if is_firefox:
         hdrs.append("Last Used")
 
@@ -460,9 +467,9 @@ def _write_browser_sheet(wb, browser_name, rows):
         ws.row_dimensions[r].height = 18
 
     if is_firefox:
-        _widths(ws, [24, 18, 14, 16, 64, 10, 18, 24, 20, 22])
+        _widths(ws, [24, 18, 14, 16, 64, 10, 18, 14, 24, 20, 22])
     else:
-        _widths(ws, [24, 18, 14, 16, 64, 10, 18, 24, 20])
+        _widths(ws, [24, 18, 14, 16, 64, 10, 18, 14, 24, 20])
     ws.freeze_panes = "A2"; ws.auto_filter.ref = ws.dimensions
     _write_legend(ws, len(rows) + 3, [
         (COL["row_risk"],  "Risk row — install is 32-bit or per-user/AppData. Review and remediate."),
@@ -470,21 +477,29 @@ def _write_browser_sheet(wb, browser_name, rows):
     ])
 
 
-def build_firefox_last_used_rows(audit_active):
+def build_firefox_last_used_rows(audit_active, inv_active):
     """
     Parse the Firefox Usage Report section from every device's Output field.
     Returns a list of dicts ready to write to the sheet, sorted by last_used_dt desc.
     """
+    idx = inv_active.set_index("Device name")
     rows = []
     for _, row in audit_active.iterrows():
         device = row["Device"]
+        if device in idx.index:
+            _hit = idx.loc[device]
+            inv = _hit.iloc[0] if hasattr(_hit, "iloc") and _hit.ndim == 2 else _hit
+        else:
+            inv = None
+        inv_days = int(inv["days_since"]) if inv is not None and "days_since" in inv.index and pd.notna(inv["days_since"]) else "N/A"
         for rec in parse_firefox_last_used(str(row["Output"])):
             rows.append({
-                "Device":       device,
-                "Windows User": rec["user"],
-                "FF Profile":   rec["profile"],
-                "Last Used":    rec["last_used_dt"].strftime("%d %b %Y  %H:%M") if rec["last_used_dt"] else rec["last_used_raw"],
-                "_dt":          rec["last_used_dt"] or datetime.min,
+                "Device":               device,
+                "Windows User":         rec["user"],
+                "FF Profile":           rec["profile"],
+                "Last Used":            rec["last_used_dt"].strftime("%d %b %Y  %H:%M") if rec["last_used_dt"] else rec["last_used_raw"],
+                "Days Since Response":  inv_days,
+                "_dt":                  rec["last_used_dt"] or datetime.min,
             })
     rows.sort(key=lambda r: r["_dt"], reverse=True)
     return rows
@@ -495,7 +510,7 @@ def _write_firefox_last_used_sheet(wb, rows):
     ws = wb.create_sheet("🦊 Firefox Last Used")
     ws.sheet_view.showGridLines = False
 
-    hdrs = ["Device", "Windows User", "FF Profile", "Last Used"]
+    hdrs = ["Device", "Windows User", "FF Profile", "Last Used", "Days Since Response"]
     for c, h in enumerate(hdrs, 1):
         ws.cell(1, c, h)
     _hdr(ws, 1, len(hdrs), _fill(COL["amber"]))
@@ -515,7 +530,7 @@ def _write_firefox_last_used_sheet(wb, rows):
             cell.fill = row_fill; cell.alignment = WRAP
         ws.row_dimensions[r].height = 18
 
-    _widths(ws, [24, 20, 38, 22])
+    _widths(ws, [24, 20, 38, 22, 14])
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
     _write_legend(ws, len(rows) + 3, [
@@ -541,18 +556,18 @@ def build_report(flagged, not_scanned, stale_inv, inv_active, audit_active, all_
     ws = wb.active; ws.title = "Summary"; ws.sheet_view.showGridLines = False
     ws["A1"] = f"Browser CVE Audit Report — {client_name}" if client_name else "Browser CVE Audit Report"
     ws["A1"].font = Font(name="Arial", bold=True, size=16, color=COL["dark"])
-    ws["A2"] = f"Generated {datetime.now().strftime('%d %b %Y')}  |  Devices inactive >{stale_days} days excluded"
+    ws["A2"] = f"Generated {datetime.now().strftime('%d %b %Y')}  |  Offline >{stale_days}d devices excluded from Not Scanned"
     ws["A2"].font = Font(name="Arial", size=10, color="7F8C8D")
 
     # ── Section 1 — Fleet stat tiles (rows 4–9) ───────────────────────────────
     STAT_ROW = 4
     for i, (label, val, color) in enumerate([
-        ("Total Fleet (Inventory)",               len(inv_active) + len(stale_inv), COL["dark"]),
-        (f"Stale / Offline (>{stale_days} days)", len(stale_inv),                   COL["gold"]),
-        ("Active Devices (Inventory)",            len(inv_active),                   COL["navy"]),
-        ("Active Devices Scanned",                len(audit_active),                 COL["green"]),
-        ("Devices with Issues",                   len({r["Device"] for r in flagged}), COL["red"]),
-        ("Active Devices NOT Scanned",            len(not_scanned),                  COL["amber"]),
+        ("Total Fleet (Inventory)",                   len(inv_active),                              COL["dark"]),
+        (f"  ↳ Active (≤{stale_days}d)",             len(inv_active) - len(stale_inv),             COL["navy"]),
+        (f"  ↳ Offline >{stale_days}d",              len(stale_inv),                               COL["gold"]),
+        ("  ↳ Active Not Scanned",                   len(not_scanned),                             COL["amber"]),
+        ("Devices Scanned (Task Report)",            len(audit_active),                            COL["green"]),
+        ("Devices with Issues",                      len({r["Device"] for r in flagged}),          COL["red"]),
     ], STAT_ROW):
         f = _fill(color)
         ws.cell(i, 1, label).font = Font(name="Arial", bold=True, size=10, color="FFFFFF")
@@ -565,7 +580,7 @@ def build_report(flagged, not_scanned, stale_inv, inv_active, audit_active, all_
     # ── Section 2 — Browser counts table (rows 11–14) ────────────────────────
     # One header row + one coloured row per browser, 5 cols: Browser|Devices|64-bit|32-bit|Per-User
     OV_ROW  = 11
-    OV_HDRS = ["Browser", "Devices", "64-bit Installs", "32-bit Installs", "Per-User Installs"]
+    OV_HDRS = ["Browser", "Devices", "64-bit Devices", "32-bit Devices", "Per-User Devices"]
     for c, h in enumerate(OV_HDRS, 1):
         cell = ws.cell(OV_ROW, c, h)
         cell.fill = _fill(COL["dark"]); cell.font = HDR_FONT
@@ -575,8 +590,8 @@ def build_report(flagged, not_scanned, stale_inv, inv_active, audit_active, all_
     browser_counts = browser_overview_counts(all_browser_rows)
     for ri, rec in enumerate(browser_counts, OV_ROW + 1):
         cfg  = BROWSER_SHEET_CONFIG[rec["Browser"]]
-        vals = [rec["Browser"], rec["Devices"], rec["64-bit Installs"],
-                rec["32-bit Installs"], rec["Per-User Installs"]]
+        vals = [rec["Browser"], rec["Devices"], rec["64-bit Devices"],
+                rec["32-bit Devices"], rec["Per-User Devices"]]
         for c, v in enumerate(vals, 1):
             cell = ws.cell(ri, c, v)
             cell.font  = Font(name="Arial", bold=True, size=10, color="FFFFFF")
@@ -665,8 +680,8 @@ def build_report(flagged, not_scanned, stale_inv, inv_active, audit_active, all_
 
     # ── ⚠ Devices with Issues ─────────────────────────────────────────────────
     ws2 = wb.create_sheet("⚠ Devices with Issues"); ws2.sheet_view.showGridLines = False
-    hdrs = ["Device", "Client", "Site", "Browser", "Issue Type", "Version",
-            "Architecture", "Install Scope", "Install Path", "OS", "Model", "Username", "Last Response"]
+    hdrs = ["Device", "Client", "Browser", "Issue Type", "Version",
+            "Architecture", "Install Scope", "Install Path", "Username", "Last Response", "Days Since Response"]
     # Colour by issue type so it's visually scannable without filtering
     _ISSUE_FILL = {
         "32-bit Install (Dual — remove 32-bit copy)":  COL["row_dual32"],
@@ -675,14 +690,14 @@ def build_report(flagged, not_scanned, stale_inv, inv_active, audit_active, all_
     }
     for c, h in enumerate(hdrs, 1): ws2.cell(1, c, h)
     _hdr(ws2, 1, len(hdrs), _fill(COL["dark"]))
-    sorted_flagged = sorted(flagged, key=lambda x: (x["Client"], x["Site"], x["Device"], x["Browser"], x["Issue Type"]))
+    sorted_flagged = sorted(flagged, key=lambda x: (x["Client"], x["Device"], x["Browser"], x["Issue Type"]))
     for r, rec in enumerate(sorted_flagged, 2):
         row_fill = _fill(_ISSUE_FILL.get(rec.get("Issue Type", ""), COL["row_risk"]))
         for c, key in enumerate(hdrs, 1):
             cell = ws2.cell(r, c, rec.get(key, "")); cell.font = BODY_FONT
             cell.border = BORDER; cell.fill = row_fill; cell.alignment = WRAP
         ws2.row_dimensions[r].height = 18
-    _widths(ws2, [22, 14, 22, 20, 38, 16, 14, 14, 58, 36, 26, 26, 20]); ws2.freeze_panes = "A2"
+    _widths(ws2, [22, 14, 20, 38, 16, 14, 14, 58, 26, 20, 14]); ws2.freeze_panes = "A2"
     ws2.auto_filter.ref = ws2.dimensions
     _write_legend(ws2, len(sorted_flagged) + 3, [
         (COL["row_dual32"],  "32-bit Install (Dual) — same browser has both 32-bit and 64-bit installed. Remove the 32-bit copy."),
@@ -695,38 +710,39 @@ def build_report(flagged, not_scanned, stale_inv, inv_active, audit_active, all_
         _write_browser_sheet(wb, browser_name, all_browser_rows[browser_name])
 
     # ── Firefox Last Used sheet ───────────────────────────────────────────────
-    ff_last_used_rows = build_firefox_last_used_rows(audit_active)
+    ff_last_used_rows = build_firefox_last_used_rows(audit_active, inv_active)
     if ff_last_used_rows:
         _write_firefox_last_used_sheet(wb, ff_last_used_rows)
 
     ws3 = wb.create_sheet("🔍 Not Scanned (Active)"); ws3.sheet_view.showGridLines = False
-    ns_h = ["Device Name", "Customer", "Site", "Device Type", "OS Version", "Username", "Last Response", "Manufacturer", "Model"]
+    ns_h = ["Device Name", "Customer", "Username", "Last Response", "Days Since Response"]
     for c, h in enumerate(ns_h, 1): ws3.cell(1, c, h)
     _hdr(ws3, 1, len(ns_h), _fill(COL["amber"]))
     for r, (_, rec) in enumerate(not_scanned.iterrows(), 2):
+        days = int(rec["days_since"]) if "days_since" in rec.index and pd.notna(rec["days_since"]) else "?"
         alt = _fill(COL["row_blue"])
-        vals = [rec["Device name"], rec["Customer name"], rec["Site name"], rec["Device type"],
-                rec["OS version"], rec["Username"], str(rec["Last response (Local time)"]), rec["Manufacturer"], rec["Model"]]
+        vals = [rec["Device name"], rec["Customer name"], rec["Username"], str(rec["Last response (Local time)"]), days]
         for c, v in enumerate(vals, 1):
             cell = ws3.cell(r, c, v); cell.font = BODY_FONT
             cell.border = BORDER; cell.fill = alt; cell.alignment = WRAP
         ws3.row_dimensions[r].height = 18
-    _widths(ws3, [22, 14, 24, 14, 38, 26, 20, 16, 34]); ws3.freeze_panes = "A2"
+    _widths(ws3, [26, 14, 26, 20, 14]); ws3.freeze_panes = "A2"
+    ws3.auto_filter.ref = ws3.dimensions
 
-    ws4 = wb.create_sheet(f"🕐 Stale >{stale_days}d (Excluded)"); ws4.sheet_view.showGridLines = False
-    st_h = ["Device Name", "Customer", "Site", "Device Type", "OS Version", "Username", "Last Response", "Days Offline", "Manufacturer", "Model"]
+    ws4 = wb.create_sheet(f"🕐 Offline >{stale_days}d"); ws4.sheet_view.showGridLines = False
+    st_h = ["Device Name", "Customer", "Username", "Last Response", "Days Since Response"]
     for c, h in enumerate(st_h, 1): ws4.cell(1, c, h)
     _hdr(ws4, 1, len(st_h), _fill(COL["gold"]))
     for r, (_, rec) in enumerate(stale_inv.sort_values("days_since", ascending=False).iterrows(), 2):
         alt = _fill(COL["row_gold"])
         days = int(rec["days_since"]) if pd.notna(rec["days_since"]) else "?"
-        vals = [rec["Device name"], rec["Customer name"], rec["Site name"], rec["Device type"],
-                rec["OS version"], rec["Username"], str(rec["Last response (Local time)"]), days, rec["Manufacturer"], rec["Model"]]
+        vals = [rec["Device name"], rec["Customer name"], rec["Username"], str(rec["Last response (Local time)"]), days]
         for c, v in enumerate(vals, 1):
             cell = ws4.cell(r, c, v); cell.font = BODY_FONT
             cell.border = BORDER; cell.fill = alt; cell.alignment = WRAP
         ws4.row_dimensions[r].height = 18
-    _widths(ws4, [22, 14, 24, 14, 38, 26, 20, 18, 16, 34]); ws4.freeze_panes = "A2"
+    _widths(ws4, [26, 14, 26, 20, 14]); ws4.freeze_panes = "A2"
+    ws4.auto_filter.ref = ws4.dimensions
 
     wb.save(output_path)
     return len({r["Device"] for r in flagged}), len(not_scanned), len(stale_inv)
@@ -771,7 +787,7 @@ class App(tk.Tk):
 
     def __init__(self):
         super().__init__()
-        self.title("Browser CVE Audit v6")
+        self.title("Browser CVE Audit v12")
         self.configure(bg=self.BG)
         self.resizable(False, False)
 
@@ -844,7 +860,7 @@ class App(tk.Tk):
         # Stale days row
         stale_row = tk.Frame(self, bg=self.BG)
         stale_row.pack(fill="x", padx=20, pady=(4, 0))
-        self._lbl(stale_row, "Exclude devices offline for more than", size=9).pack(side="left")
+        self._lbl(stale_row, "Exclude offline devices last seen more than", size=9).pack(side="left")
         tk.Spinbox(stale_row, from_=1, to=365, textvariable=self.stale_days,
                    width=4, font=("Segoe UI", 9), bg="#2D3748", fg=self.TEXT,
                    buttonbackground="#374151", relief="flat",
@@ -950,35 +966,35 @@ class App(tk.Tk):
             self._log(f"Save as: {out_path}", "dim")
 
             self._log("Loading inventory…", "dim")
-            inv_active, stale_inv, client_name = load_inventory(self.inv_path, stale_days)
-            self._log(f"  Active: {len(inv_active)}  |  Stale: {len(stale_inv)}", "dim")
+            inv_full, inv_active, stale_inv, client_name = load_inventory(self.inv_path, stale_days)
+            self._log(f"  Total: {len(inv_full)}  |  Active: {len(inv_active)}  |  Offline >{stale_days}d: {len(stale_inv)}", "dim")
 
             self._log(f"Loading {len(self.task_files)} CSV(s)…", "dim")
             audit = load_audit(self.task_files)
             self._log(f"  Audit records: {len(audit)}", "dim")
 
-            # Inventory is the source of truth for the selected client/scope.
-            # Only devices present in the active inventory are included in scanned/issue/browser counts.
-            active_names = set(inv_active["Device name"])
+            # All scanned devices included. not_scanned = active only (no overlap with Offline sheet).
+            all_inv_names      = set(inv_full["Device name"])
+            active_names       = set(inv_active["Device name"])
             audit_device_names = set(audit["Device"])
-            audit_active = audit[audit["Device"].isin(active_names)].copy()
-            scanned_names = set(audit_active["Device"])
+            audit_active       = audit.copy()
+            scanned_names      = audit_device_names
             not_scanned = inv_active[
-                inv_active["Device name"].isin(active_names - scanned_names)
+                ~inv_active["Device name"].isin(scanned_names)
             ].sort_values(["Site name", "Device name"])
-            ignored_not_inventory = sorted(audit_device_names - active_names)
-            if ignored_not_inventory:
-                self._log(f"  Ignored scanned CSV devices not in inventory: {len(ignored_not_inventory)}", "warn")
-            self._log(f"  In-scope scanned devices: {len(audit_active)}", "dim")
+            not_in_inv = sorted(scanned_names - all_inv_names)
+            if not_in_inv:
+                self._log(f"  Scanned devices not in inventory (no metadata): {len(not_in_inv)}", "warn")
+            self._log(f"  Scanned: {len(audit_active)}  |  Active not scanned: {len(not_scanned)}", "dim")
 
             self._log("Checking browser installs…", "dim")
-            flagged = build_flagged(audit_active, inv_active)
-            all_browser_rows = {b: build_browser_sheet_rows(audit_active, inv_active, b) for b in BROWSERS_TRACKED}
+            flagged = build_flagged(audit_active, inv_full)
+            all_browser_rows = {b: build_browser_sheet_rows(audit_active, inv_full, b) for b in BROWSERS_TRACKED}
 
             self._log("Writing report…", "dim")
             Path(out_path).parent.mkdir(parents=True, exist_ok=True)
             n_f, n_ns, n_st = build_report(
-                flagged, not_scanned, stale_inv, inv_active, audit_active,
+                flagged, not_scanned, stale_inv, inv_full, audit_active,
                 all_browser_rows,
                 out_path, stale_days, client_name)
 
@@ -997,7 +1013,7 @@ class App(tk.Tk):
             self._log(f"   32-bit only     : {n_only32} devices", "warn" if n_only32 else "ok")
             self._log(f"   Per-user        : {n_per} devices", "warn" if n_per else "ok")
             self._log(f"   Not scanned     : {n_ns}", "warn" if n_ns else "ok")
-            self._log(f"   Stale excluded  : {n_st}", "dim")
+            self._log(f"   Offline >{stale_days}d (info): {n_st}", "dim")
             self._log(f"   FF last-used    : {ff_last_used_count} profile record(s)", "dim")
 
             self.after(0, lambda: self._offer_open(out_path))
