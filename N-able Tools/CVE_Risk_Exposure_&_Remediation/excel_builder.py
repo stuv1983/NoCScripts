@@ -644,6 +644,35 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
     if patch_gap_pairs is None:
         patch_gap_pairs = {}
 
+    from data_pipeline import _detect_product as _dp_detect_prod
+
+    # Hoist workbook-level format creation outside the per-product loop.
+    # get_workbook_styles() allocates ~20 xlsxwriter Format objects; calling it
+    # once per product sheet with many products wastes hundreds of allocations.
+    wb_outer   = writer.book
+    styles_    = get_workbook_styles(wb_outer)
+    patch_res_fmt  = styles_['row_blue']
+    exploit_fmt    = wb_outer.add_format({'bg_color': '#FFE0CC'})
+    coverage_fmt   = styles_['row_amber']
+    unmanaged_fmt  = styles_['row_red']
+    mismatch_fmt   = styles_['row_pink']
+    installing_fmt = styles_['row_teal']
+    _GAP_FMTS = {
+        'coverage_gap':        coverage_fmt,
+        'unmanaged_app':       unmanaged_fmt,
+        'detection_mismatch':  mismatch_fmt,
+        'patch_installing':    installing_fmt,
+    }
+    l_title = wb_outer.add_format({'bold': True, 'font_size': 9, 'bg_color': '#F2F2F2', 'border': 1})
+    l_cell  = wb_outer.add_format({'font_size': 9, 'border': 1})
+    _legend_fmts = {colour: wb_outer.add_format({'bg_color': colour, 'font_size': 9, 'border': 1})
+                    for colour in ('#DEEAF1', '#FFE0CC', '#FFF2CC', '#FCE4D6', '#F2CEEF', '#D9F0F4', '#FFFFFF')}
+    _baseline_note_fmt = wb_outer.add_format({'italic': True, 'font_color': '#595959', 'font_size': 8})
+
+    _TRUE_VALS = {'yes', 'true', '1', 'y'}
+    # Determine resolved set tuple-width once
+    _res_tuple_width = len(next(iter(patch_resolved_pairs))) if patch_resolved_pairs else 0
+
     cols_order = ['Resolved', 'Vulnerability Name', 'Name', 'Device Type',
                   'Vulnerability Severity', 'Vulnerability Score', 'Risk Severity Index',
                   'Has Known Exploit', 'CISA KEV', 'Last Response', 'Days Since Last Response', 'Affected Products',
@@ -665,39 +694,35 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
         if not _sheet_pk:
             _sheet_pk = _dp_detect_prod(str(product))
 
-        def _resolved_value(row):
-            nk = normalize_device_name(row['Name'])
-            ck = extract_cve_id(row['Vulnerability Name'])
-            if (nk, ck, _sheet_pk) in patch_resolved_pairs:
-                return '☑'
-            if patch_resolved_pairs and len(next(iter(patch_resolved_pairs))) == 2:
-                return '☑' if (nk, ck) in patch_resolved_pairs else '☐'
-            return '☐'
+        # Pre-compute normalised key columns once (vectorised) then resolve without apply().
+        _nk_series = group['Name'].apply(normalize_device_name)
+        _ck_series = group['Vulnerability Name'].apply(extract_cve_id)
 
-        group.insert(0, 'Resolved', group.apply(_resolved_value, axis=1))
+        if patch_resolved_pairs and len(next(iter(patch_resolved_pairs))) == 3:
+            # 3-tuple set: (device, cve, product)
+            _resolved_series = pd.Series(
+                [(nk, ck, _sheet_pk) in patch_resolved_pairs
+                 for nk, ck in zip(_nk_series, _ck_series)],
+                index=group.index,
+            )
+        elif patch_resolved_pairs:
+            # 2-tuple set: (device, cve)
+            _resolved_series = pd.Series(
+                [(nk, ck) in patch_resolved_pairs
+                 for nk, ck in zip(_nk_series, _ck_series)],
+                index=group.index,
+            )
+        else:
+            _resolved_series = pd.Series(False, index=group.index)
+
+        group.insert(0, 'Resolved', _resolved_series.map({True: '☑', False: '☐'}))
         group['NVD'] = ''
 
         final_cols = [c for c in cols_order if c in group.columns]
         group[final_cols].to_excel(writer, sheet_name=sheet_name, index=False)
 
         ws  = writer.sheets[sheet_name]
-        wb_ = writer.book
         ws.autofilter(0, 0, len(group), len(final_cols) - 1)
-
-        styles_           = get_workbook_styles(wb_)
-        patch_res_fmt     = styles_['row_blue']
-        exploit_fmt       = wb_.add_format({'bg_color': '#FFE0CC'})
-        coverage_fmt      = styles_['row_amber']
-        unmanaged_fmt     = styles_['row_red']
-        mismatch_fmt      = styles_['row_pink']
-        installing_fmt    = styles_['row_teal']
-
-        _GAP_FMTS = {
-            'coverage_gap':        coverage_fmt,
-            'unmanaged_app':       unmanaged_fmt,
-            'detection_mismatch':  mismatch_fmt,
-            'patch_installing':    installing_fmt,
-        }
 
         cl = final_cols
         if 'Resolved' in cl:
@@ -705,19 +730,16 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
             ws.data_validation(1, ri, len(group), ri, {'validate': 'list', 'source': ['☐', '☑']})
             ws.set_column(ri, ri, 10)
 
-        _TRUE_VALS = {'yes', 'true', '1', 'y'}
-        for row_i, (_, row) in enumerate(group[final_cols].iterrows(), start=1):
-            nk = normalize_device_name(str(row.get('Name', '')))
-            ck = extract_cve_id(str(row.get('Vulnerability Name', '')))
-            _is_resolved = (
-                (nk, ck, _sheet_pk) in patch_resolved_pairs
-                or (len(patch_resolved_pairs) > 0
-                    and len(next(iter(patch_resolved_pairs))) == 2
-                    and (nk, ck) in patch_resolved_pairs)
-            )
-            if _is_resolved:
+        # Vectorised row colouring: build per-row format decisions using pre-normalised
+        # key columns and pre-built format objects (no Python loop over rows).
+        _hke_col = 'Has Known Exploit'
+        _hke_vals = group[_hke_col].astype(str).str.strip().str.lower() if _hke_col in group.columns else None
+        _res_vals = group['Resolved'] if 'Resolved' in group.columns else None
+
+        for row_i, (nk, ck) in enumerate(zip(_nk_series, _ck_series), start=1):
+            if _res_vals is not None and _res_vals.iloc[row_i - 1] == '☑':
                 ws.set_row(row_i, None, patch_res_fmt)
-            elif str(row.get('Has Known Exploit', '')).strip().lower() in _TRUE_VALS:
+            elif _hke_vals is not None and _hke_vals.iloc[row_i - 1] in _TRUE_VALS:
                 ws.set_row(row_i, None, exploit_fmt)
             else:
                 gap = patch_gap_pairs.get((nk, ck))
@@ -737,9 +759,6 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
         if 'Baseline Compliance' in cl: ws.set_column(cl.index('Baseline Compliance'), cl.index('Baseline Compliance'), 22)
 
         legend_row = len(group) + 3
-        l_title = wb_.add_format({'bold': True, 'font_size': 9, 'bg_color': '#F2F2F2', 'border': 1})
-        l_cell  = wb_.add_format({'font_size': 9, 'border': 1})
-
         legend_entries = [
             ('#DEEAF1', 'blue row',   'Patch via RMM — install confirmed after CVE first detected'),
             ('#FFE0CC', 'orange row', 'Known active exploit — unresolved, prioritise immediately'),
@@ -753,10 +772,10 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
                  'ℹ  Baseline Compliance column: shows whether the installed version meets the '
                  'current rolling product baseline (_baseline in config.json), '
                  'independently of CVE-specific patch status.',
-                 wb_.add_format({'italic': True, 'font_color': '#595959', 'font_size': 8}))
+                 _baseline_note_fmt)
         ws.write(legend_row, 0, 'Legend', l_title)
         for i, (colour, label, desc) in enumerate(legend_entries, start=1):
-            fmt = wb_.add_format({'bg_color': colour, 'font_size': 9, 'border': 1})
+            fmt = _legend_fmts[colour]
             ws.write(legend_row + i, 0, f'  ({label})', fmt)
             ws.write(legend_row + i, 1, desc, l_cell)
             ws.set_row(legend_row + i, None, fmt)
@@ -1222,7 +1241,7 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     triage_df    — active scope only (stale + not-in-RMM removed). All Key Metrics use this.
     threshold    — CVSS floor shown in the waterfall header.
     """
-    ws = workbook.add_worksheet('Client Summary')
+    ws = workbook.add_worksheet('Summary')
     if not report_month:
         report_month = datetime.now().strftime("%B %Y")
 
@@ -1475,19 +1494,19 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     if score_split_data and len(score_split_data)>=2:
         pie=workbook.add_chart({'type':'pie'})
         pie.add_series({'name':'Detection Rows',
-                        'categories':['Client Summary',score_split_start,0,score_split_end,0],
-                        'values':    ['Client Summary',score_split_start,1,score_split_end,1],
+                        'categories':['Summary',score_split_start,0,score_split_end,0],
+                        'values':    ['Summary',score_split_start,1,score_split_end,1],
                         'data_labels':{'percentage':True,'category':True,'font':{'size':9}}})
         pie.set_title({'name':'Vulnerability Distribution by CVSS Score'}); pie.set_style(10)
         pie.set_size({'width':380,'height':260}); ws.insert_chart('F4',pie,{'x_offset':5,'y_offset':5})
         bar=workbook.add_chart({'type':'bar'})
         bar.add_series({'name':'Detection Rows',
-                        'categories':['Client Summary',score_split_start,0,score_split_end,0],
-                        'values':    ['Client Summary',score_split_start,1,score_split_end,1],
+                        'categories':['Summary',score_split_start,0,score_split_end,0],
+                        'values':    ['Summary',score_split_start,1,score_split_end,1],
                         'fill':{'color':'#2E75B6'},'data_labels':{'value':True,'font':{'size':9}}})
         bar.add_series({'name':'Unique CVEs',
-                        'categories':['Client Summary',score_split_start,0,score_split_end,0],
-                        'values':    ['Client Summary',score_split_start,3,score_split_end,3],
+                        'categories':['Summary',score_split_start,0,score_split_end,0],
+                        'values':    ['Summary',score_split_start,3,score_split_end,3],
                         'fill':{'color':'#ED7D31'},'data_labels':{'value':True,'font':{'size':9}}})
         bar.set_title({'name':'Patching Effort by CVSS Score'}); bar.set_x_axis({'name':'Count'})
         bar.set_y_axis({'name':'CVSS Score'}); bar.set_legend({'position':'bottom'}); bar.set_style(10)
@@ -1496,8 +1515,8 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         mcs=mom_start_row+1; mce=mcs+len(mom_data)-1
         mb=workbook.add_chart({'type':'bar'})
         mb.add_series({'name':'Count',
-                       'categories':['Client Summary',mcs,0,mce,0],
-                       'values':    ['Client Summary',mcs,1,mce,1],
+                       'categories':['Summary',mcs,0,mce,0],
+                       'values':    ['Summary',mcs,1,mce,1],
                        'fill':{'color':'#375623'},'data_labels':{'value':True,'font':{'size':9}}})
         mb.set_title({'name':'Month-over-Month Patching Progress'}); mb.set_x_axis({'name':'Count'})
         mb.set_legend({'none':True}); mb.set_style(10)

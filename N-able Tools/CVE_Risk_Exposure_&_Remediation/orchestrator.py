@@ -342,8 +342,13 @@ def run(request: DashboardRequest) -> DashboardResult:
                 log.info("Patch-confirmed resolved pairs: %d", len(patch_resolved_pairs))
 
             p_full['_root_cause'] = p_full.apply(classify_root_cause, axis=1)
-            for _, row in p_full[p_full['_root_cause'].notna()].iterrows():
-                patch_gap_pairs[(row['_nk'], row['_ck'])] = row['_root_cause']
+            _rc_mask = p_full['_root_cause'].notna()
+            for _nk, _ck, _rc in zip(
+                p_full.loc[_rc_mask, '_nk'],
+                p_full.loc[_rc_mask, '_ck'],
+                p_full.loc[_rc_mask, '_root_cause'],
+            ):
+                patch_gap_pairs[(_nk, _ck)] = _rc
 
             cause_counts: dict[str, int] = {}
             for c in patch_gap_pairs.values():
