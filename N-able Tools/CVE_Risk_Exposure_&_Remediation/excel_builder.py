@@ -821,10 +821,19 @@ def build_diagnostics_sheets(writer, diagnostics: dict) -> None:
         ws = writer.sheets['Version Drift']
         ws.autofilter(0, 0, len(drift_df), len(drift_df.columns) - 1)
         ws.set_column('A:A', 36); ws.set_column('C:C', 60)
+        # Audit Note column (may or may not be present)
+        _cols = list(drift_df.columns)
+        if 'Audit Note' in _cols:
+            _an_idx = _cols.index('Audit Note')
+            ws.set_column(_an_idx, _an_idx, 50)
         for i, spread in enumerate(drift_df.get('Distinct Versions', []), start=1):
             ws.set_row(i, None, red if spread >= 4 else amb if spread >= 2 else grn)
         ws.write(len(drift_df) + 2, 0,
-                 'High distinct-version count = inconsistent update cadence across fleet.', note)
+                 'High distinct-version count = inconsistent update cadence across fleet. '
+                 'Audit Note: per-user/AppData installs bypass GPO — remove and replace with system-scope. '
+                 '32-bit installs on 64-bit OS should be replaced.',
+                 wb.add_format({'italic': True, 'font_color': '#595959', 'text_wrap': True}))
+        ws.set_row(len(drift_df) + 2, 36)
         no_data = diagnostics.get('version_drift_no_data', [])
         if no_data:
             ws.write(len(drift_df) + 4, 0,
@@ -1006,7 +1015,10 @@ def build_patch_failure_sheet(writer, failure_df: 'pd.DataFrame',
     amb = wb.add_format({'bg_color': '#FFF2CC'})
     grn = wb.add_format({'bg_color': '#E2EFDA'})
     hdr = wb.add_format({'bold': True, 'bg_color': '#D9D9D9', 'border': 1})
+    hdr_red  = wb.add_format({'bold': True, 'bg_color': '#C00000', 'font_color': 'white', 'border': 1})
     note_fmt = wb.add_format({'italic': True, 'font_color': '#595959'})
+    title_fmt= wb.add_format({'bold': True, 'font_size': 12, 'bg_color': '#1F4E79',
+                               'font_color': 'white', 'border': 1})
 
     active_lookup = failure_lookup
     excluded_count = 0
@@ -1031,182 +1043,273 @@ def build_patch_failure_sheet(writer, failure_df: 'pd.DataFrame',
         return
 
     summary_df = pd.DataFrame(rows)
-    summary_df.to_excel(writer, sheet_name='Patch Failures', index=False)
-    ws = writer.sheets['Patch Failures']
-    ws.autofilter(0, 0, len(summary_df), len(summary_df.columns) - 1)
+
+    # ── Summary stats at top before the table ───────────────────────────────
+    ws = wb.add_worksheet('Patch Failures')
+    stat_fmt  = wb.add_format({'bold': True, 'bg_color': '#F2F2F2', 'border': 1})
+    stat_val  = wb.add_format({'border': 1, 'align': 'right'})
+
+    total_failures  = sum(r['Total Failures']     for r in rows)
+    total_devices   = len(rows)
+    total_kbs       = sum(r['Unique KBs Failing'] for r in rows)
+    active_fail_df  = failure_df[failure_df['_device_norm'].isin(set(active_lookup.keys()))]
+    cat_totals      = active_fail_df['_failure_cat'].value_counts()
+    top_cat_label   = cat_totals.index[0].replace('_', ' ').title() if not cat_totals.empty else '—'
+    top_cat_count   = int(cat_totals.iloc[0]) if not cat_totals.empty else 0
+
+    ws.merge_range(0, 0, 0, 5, 'Patch Failure Analysis', title_fmt)
+    stats = [
+        ('Devices with failures', total_devices),
+        ('Total failure events',  total_failures),
+        ('Distinct KBs failing',  total_kbs),
+        ('Most common failure',   f'{top_cat_label} ({top_cat_count} events)'),
+    ]
+    if excluded_count:
+        stats.append(('Excluded (not in inventory)', excluded_count))
+    for si, (label, val) in enumerate(stats):
+        ws.write(1 + si, 0, label, stat_fmt)
+        ws.write(1 + si, 1, val,   stat_val)
     ws.set_column('A:A', 26); ws.set_column('D:D', 30)
     ws.set_column('E:E', 55); ws.set_column('F:F', 55)
+    ws.set_column('B:C', 18)
 
-    for i, row in enumerate(rows, start=1):
+    # ── Device failure table ─────────────────────────────────────────────────
+    tbl_start = len(stats) + 3
+    for ci, col in enumerate(summary_df.columns):
+        ws.write(tbl_start, ci, col, hdr)
+    for i, row in enumerate(rows, start=tbl_start + 1):
         fc = row['Total Failures']
         ws.set_row(i, None, red if fc >= 20 else amb if fc >= 5 else grn)
+        for ci, col in enumerate(summary_df.columns):
+            ws.write(i, ci, row[col])
+    ws.autofilter(tbl_start, 0, tbl_start + len(rows), len(summary_df.columns) - 1)
 
-    active_devices_set = set(active_lookup.keys())
-    active_fail = failure_df[failure_df['_device_norm'].isin(active_devices_set)]
-    cat_totals = active_fail['_failure_cat'].value_counts()
-    ws.write(len(summary_df) + 2, 0, 'Failure category totals (active devices):', hdr)
+    # ── Category totals below table ──────────────────────────────────────────
+    note_start = tbl_start + len(rows) + 2
+    ws.write(note_start, 0, 'Failure category totals (active devices):', hdr)
     for i, (cat, count) in enumerate(cat_totals.items()):
-        ws.write(len(summary_df) + 3 + i, 0, f'  {cat.replace("_"," ").title()}')
-        ws.write(len(summary_df) + 3 + i, 1, count)
+        ws.write(note_start + 1 + i, 0, f'  {cat.replace("_"," ").title()}')
+        ws.write(note_start + 1 + i, 1, count)
 
-    if excluded_count:
-        ws.write(len(summary_df) + 3 + len(cat_totals) + 1, 0,
-                 f'  ℹ  {excluded_count} device(s) excluded — not in Device Inventory '
-                 f'(decommissioned)',
-                 wb.add_format({'italic': True, 'font_color': '#595959'}))
-
+    # ── CVEs on Failing Devices — enriched ──────────────────────────────────
     if not cve_device_overlap.empty:
-        out_cols = [c for c in ['Name', 'Vulnerability Name', 'Vulnerability Score',
-                                'Affected Products', 'Has Known Exploit']
-                    if c in cve_device_overlap.columns]
-        overlap = cve_device_overlap[out_cols].drop_duplicates().sort_values(
-            'Vulnerability Score', ascending=False) if 'Vulnerability Score' in out_cols else cve_device_overlap[out_cols]
+        # Add primary failure type to each row from lookup
+        _fail_info = {d: info for d, info in active_lookup.items()}
+        _norm_name = cve_device_overlap['Name'].astype(str).apply(
+            lambda n: n.strip().upper().split('\\')[-1].split('.')[0])
+
+        cve_out = cve_device_overlap.copy()
+        cve_out['_nk'] = _norm_name
+        cve_out['Primary Failure Type'] = cve_out['_nk'].map(
+            lambda nk: _fail_info[nk]['top_category'].replace('_', ' ').title()
+                       if nk in _fail_info else '—'
+        )
+        cve_out['Total Device Failures'] = cve_out['_nk'].map(
+            lambda nk: _fail_info[nk]['failure_count'] if nk in _fail_info else 0
+        )
+        cve_out['Failure Description'] = cve_out['_nk'].map(
+            lambda nk: _fail_info[nk]['top_description'] if nk in _fail_info else '—'
+        )
+        cve_out = cve_out.drop(columns=['_nk'], errors='ignore')
+
+        out_cols = [c for c in [
+            'Name', 'Vulnerability Name', 'Vulnerability Score', 'Affected Products',
+            'Has Known Exploit', 'Primary Failure Type', 'Total Device Failures',
+            'Failure Description'
+        ] if c in cve_out.columns]
+
+        overlap = (cve_out[out_cols]
+                   .drop_duplicates(subset=['Name', 'Vulnerability Name'])
+                   .sort_values(['Total Device Failures', 'Vulnerability Score'],
+                                ascending=[False, False])
+                   .reset_index(drop=True))
+
         overlap.to_excel(writer, sheet_name='CVEs on Failing Devices', index=False)
         ws2 = writer.sheets['CVEs on Failing Devices']
         ws2.autofilter(0, 0, len(overlap), len(overlap.columns) - 1)
-        ws2.set_column('A:A', 26); ws2.set_column('B:B', 22); ws2.set_column('D:D', 32)
+        ws2.set_column('A:A', 26); ws2.set_column('B:B', 22)
+        ws2.set_column('D:D', 32); ws2.set_column('F:F', 24)
+        ws2.set_column('G:G', 20); ws2.set_column('H:H', 55)
+        ws2.set_row(0, None, hdr_red)
+
+        # Colour rows by failure severity
+        for i, row in enumerate(overlap.itertuples(index=False), start=1):
+            fc = getattr(row, 'Total_Device_Failures', 0) or 0
+            ws2.set_row(i, None, red if fc >= 20 else amb if fc >= 5 else grn)
+
         ws2.write(len(overlap) + 2, 0,
-                  'These CVEs are on devices where patches are actively failing. '
-                  'Resolving the patch delivery issue (see Patch Failures sheet) '
-                  'should also clear these CVEs.', note_fmt)
+                  f'⚠  {len(overlap)} CVE detection(s) on {overlap["Name"].nunique()} device(s) '
+                  f'where patches are actively failing. '
+                  f'Resolving the delivery failure (Primary Failure Type) will unblock patching. '
+                  f'See Patch Failures sheet for per-device remediation steps.', note_fmt)
+        ws2.set_row(len(overlap) + 2, 50)
 
 def build_stale_excluded_sheet(writer, stale_df, not_in_rmm_df=None) -> None:
     """
-    'Stale Excluded Devices' worksheet — two sections:
-      1. Date-Stale (amber): Last Response before cutoff.
-      2. Not-Found-in-RMM (red): audit record for devices absent from inventory.
+    'Stale Excluded Devices' — one flat filterable table.
+    Date-stale rows = amber, Not-Found-in-RMM rows = red highlight.
+    A 'Reason' column distinguishes the two categories.
     """
     has_stale = stale_df is not None and not stale_df.empty
     has_nirm  = not_in_rmm_df is not None and not not_in_rmm_df.empty
     if not has_stale and not has_nirm:
         return
 
-    cols_to_keep = ['Name', 'Username', 'Last Response', 'Days Since Last Response', 'Device Type']
+    cols_src = ['Name', 'Username', 'Last Response', 'Days Since Last Response', 'Device Type']
     wb = writer.book
     ws = wb.add_worksheet('Stale Excluded Devices')
 
-    hdr_fmt    = wb.add_format({'bold': True, 'bg_color': '#2E75B6', 'font_color': 'white', 'border': 1})
-    sect_stale = wb.add_format({'bold': True, 'bg_color': '#FFF2CC', 'border': 1, 'font_size': 10})
-    sect_nirm  = wb.add_format({'bold': True, 'bg_color': '#C00000', 'font_color': 'white', 'border': 1, 'font_size': 10})
-    row_stale  = wb.add_format({'bg_color': '#FFFDE7', 'border': 1})
-    row_nirm   = wb.add_format({'bg_color': '#FFEBEE', 'border': 1})
-    note_fmt   = wb.add_format({'italic': True, 'font_color': '#595959', 'font_size': 9})
+    hdr_fmt  = wb.add_format({'bold': True, 'bg_color': '#2E75B6', 'font_color': 'white', 'border': 1})
+    row_stale= wb.add_format({'bg_color': '#FFFDE7', 'border': 1})
+    row_nirm = wb.add_format({'bg_color': '#FFEBEE', 'font_color': '#9C0006', 'border': 1})
+    note_fmt = wb.add_format({'italic': True, 'font_color': '#595959', 'font_size': 9})
 
-    ws.set_column('A:A', 35); ws.set_column('B:B', 25); ws.set_column('C:C', 25)
-    ws.set_column('D:D', 25); ws.set_column('E:E', 20)
-    headers = ['Device Name', 'Username', 'Last Response', 'Days Since Last Response', 'Device Type']
-    cur = 0
+    headers = ['Device Name', 'Username', 'Last Response', 'Days Since Last Response',
+               'Device Type', 'Reason']
+    col_widths = [35, 25, 25, 25, 18, 30]
+    for ci, w in enumerate(col_widths):
+        ws.set_column(ci, ci, w)
 
-    def _write_sect(df_in, sect_fmt, data_fmt, label):
-        nonlocal cur
-        if df_in is None or df_in.empty: return
-        ws.merge_range(cur, 0, cur, len(headers)-1, label, sect_fmt); cur += 1
-        for ci, h in enumerate(headers): ws.write(cur, ci, h, hdr_fmt)
-        cur += 1
-        cols_p = [c for c in cols_to_keep if c in df_in.columns]
-        df_w = df_in[cols_p].drop_duplicates(subset=['Name']).copy()
-        df_w = df_w.sort_values('Last Response' if 'Last Response' in df_w.columns else df_w.columns[0])
-        df_w = df_w.rename(columns={'Name': 'Device Name'})
-        for _, r in df_w.iterrows():
-            for ci, h in enumerate(headers): ws.write(cur, ci, str(r.get(h, '')), data_fmt)
-            cur += 1
-        cur += 1
+    # Build unified DataFrame
+    frames = []
+    if has_stale:
+        _s = stale_df[[c for c in cols_src if c in stale_df.columns]].drop_duplicates(subset=['Name']).copy()
+        _s['Reason'] = '⏱  Date-Stale'
+        frames.append(_s)
+    if has_nirm:
+        _n = not_in_rmm_df[[c for c in cols_src if c in not_in_rmm_df.columns]].drop_duplicates(subset=['Name']).copy()
+        _n['Reason'] = '🚫  Not Found in RMM'
+        frames.append(_n)
 
-    _write_sect(stale_df if has_stale else None, sect_stale, row_stale,
-                '\u23f1  Date-Stale Devices  (Last Response before cutoff date)')
-    _write_sect(not_in_rmm_df if has_nirm else None, sect_nirm, row_nirm,
-                '\U0001f6ab  Not Found in RMM  (device absent from inventory \u2014 audit record)')
+    combined = pd.concat(frames, ignore_index=True)
+    combined = combined.rename(columns={'Name': 'Device Name'})
+    combined = combined.sort_values(['Reason', 'Last Response'] if 'Last Response' in combined.columns else ['Reason'])
 
-    ws.write(cur, 0,
-             '\u2139  Date-Stale: last seen before the cutoff \u2014 may still be live. '
-             'Not-in-RMM: N-able reports CVEs for a device absent from the RMM inventory \u2014 '
+    # Header row
+    for ci, h in enumerate(headers):
+        ws.write(0, ci, h, hdr_fmt)
+
+    # Data rows
+    for ri, row in enumerate(combined.itertuples(index=False), start=1):
+        _reason = str(row[-1]) if hasattr(row, '_fields') else ''
+        _fmt = row_nirm if 'Not Found' in _reason else row_stale
+        for ci, h in enumerate(headers):
+            col_map = {'Device Name': 'Device Name', 'Username': 'Username',
+                       'Last Response': 'Last Response',
+                       'Days Since Last Response': 'Days Since Last Response',
+                       'Device Type': 'Device Type', 'Reason': 'Reason'}
+            try:
+                val = getattr(row, col_map[h].replace(' ', '_').replace('(', '').replace(')', ''))
+            except AttributeError:
+                val = ''
+            ws.write(ri, ci, str(val) if val is not None and not (isinstance(val, float) and pd.isna(val)) else '', _fmt)
+
+    # Autofilter on header row
+    ws.autofilter(0, 0, len(combined), len(headers) - 1)
+
+    note_row = len(combined) + 2
+    ws.write(note_row, 0,
+             'ℹ  Date-Stale: last seen before the cutoff — may still be live. '
+             'Not-in-RMM (🚫 red): device absent from RMM inventory — '
              'verify decommission status (shadow IT / orphaned agent).', note_fmt)
-    ws.set_row(cur, 30)
+    ws.set_row(note_row, 30)
 
 
 def build_stale_cves_sheet(writer, df, link_fmt, not_in_rmm_cves_df=None) -> None:
     """
-    'CVEs on Stale Devices' worksheet — two sections:
-      1. CVEs on date-stale devices  (light-grey rows)
-      2. CVEs on not-found-in-RMM devices  (red rows) — audit record
+    'CVEs on Stale Devices' — one flat filterable table.
+    Date-stale rows = light grey, Not-in-RMM rows = red.
+    A 'Reason' column distinguishes the two; autofilter on the header.
     """
     has_stale = df is not None and not df.empty
     has_nirm  = not_in_rmm_cves_df is not None and not not_in_rmm_cves_df.empty
     if not has_stale and not has_nirm:
         return
 
-    cols_to_keep = ['Name', 'Username', 'Device Type', 'Vulnerability Name', 'Vulnerability Score',
-                    'Vulnerability Severity', 'Affected Products',
-                    'Has Known Exploit', 'CISA KEV', 'Last Response', 'Days Since Last Response']
+    cols_src = ['Name', 'Username', 'Device Type', 'Vulnerability Name', 'Vulnerability Score',
+                'Vulnerability Severity', 'Affected Products',
+                'Has Known Exploit', 'CISA KEV', 'Last Response', 'Days Since Last Response']
+    headers  = cols_src + ['NVD', 'Reason']
     col_widths = {
         'Name': 25, 'Username': 22, 'Device Type': 15, 'Vulnerability Name': 25,
         'Vulnerability Score': 18, 'Vulnerability Severity': 20,
         'Affected Products': 30, 'Has Known Exploit': 16, 'CISA KEV': 12,
-        'Last Response': 20, 'Days Since Last Response': 22, 'NVD': 10,
+        'Last Response': 20, 'Days Since Last Response': 22, 'NVD': 10, 'Reason': 28,
     }
-    headers = cols_to_keep + ['NVD']
 
     wb = writer.book
     ws = wb.add_worksheet('CVEs on Stale Devices')
 
     hdr_fmt    = wb.add_format({'bold': True, 'bg_color': '#2E75B6', 'font_color': 'white', 'border': 1})
-    sect_stale = wb.add_format({'bold': True, 'bg_color': '#EFEFEF', 'border': 1, 'font_size': 10})
-    sect_nirm  = wb.add_format({'bold': True, 'bg_color': '#C00000', 'font_color': 'white', 'border': 1, 'font_size': 10})
     row_stale  = wb.add_format({'bg_color': '#F5F5F5', 'border': 1})
-    row_nirm   = wb.add_format({'bg_color': '#FFEBEE', 'border': 1})
+    row_nirm   = wb.add_format({'bg_color': '#FFEBEE', 'font_color': '#9C0006', 'border': 1})
     link_stale = wb.add_format({'bg_color': '#F5F5F5', 'border': 1, 'font_color': '#0563C1', 'underline': True})
-    link_nirm  = wb.add_format({'bg_color': '#FFEBEE', 'border': 1, 'font_color': '#0563C1', 'underline': True})
+    link_nirm  = wb.add_format({'bg_color': '#FFEBEE', 'border': 1, 'font_color': '#9C0006', 'underline': True})
     note_fmt   = wb.add_format({'italic': True, 'font_color': '#595959', 'font_size': 9})
 
     for ci, col_nm in enumerate(headers):
         ws.set_column(ci, ci, col_widths.get(col_nm, 15))
 
-    cur = 0
+    # Build unified DataFrame
+    frames = []
+    if has_stale:
+        _s = df[[c for c in cols_src if c in df.columns]].copy()
+        _s['NVD'] = ''; _s['Reason'] = '⏱  Date-Stale'
+        frames.append(_s)
+    if has_nirm:
+        _n = not_in_rmm_cves_df[[c for c in cols_src if c in not_in_rmm_cves_df.columns]].copy()
+        _n['NVD'] = ''; _n['Reason'] = '🚫  Not Found in RMM'
+        frames.append(_n)
 
-    def _write_section(section_df, sect_fmt, data_fmt, lnk_fmt, label):
-        nonlocal cur
-        if section_df is None or section_df.empty: return
-        cols_p = [c for c in cols_to_keep if c in section_df.columns]
-        out = section_df[cols_p].copy()
-        out['NVD'] = ''
-        out = out.sort_values(by=['Name', 'Vulnerability Score'], ascending=[True, False])
-        cl = list(out.columns)
-        vn_col  = cl.index('Vulnerability Name') if 'Vulnerability Name' in cl else None
-        nvd_col = cl.index('NVD') if 'NVD' in cl else None
+    combined = pd.concat(frames, ignore_index=True)
+    combined = combined.sort_values(
+        by=['Reason', 'Name', 'Vulnerability Score'],
+        ascending=[True, True, False]
+    )
+    cl = list(combined.columns)
+    vn_idx  = cl.index('Vulnerability Name') if 'Vulnerability Name' in cl else None
+    nvd_idx = headers.index('NVD')
 
-        ws.merge_range(cur, 0, cur, len(headers)-1, label, sect_fmt); cur += 1
-        for ci, h in enumerate(headers): ws.write(cur, ci, h, hdr_fmt)
-        cur += 1
+    # Header
+    for ci, h in enumerate(headers):
+        ws.write(0, ci, h, hdr_fmt)
 
-        for _, r in out.iterrows():
-            for ci, col_nm in enumerate(headers):
-                val = r.get(col_nm, '')
-                if ci == vn_col and col_nm == 'Vulnerability Name':
-                    cve_id = extract_cve_id(str(val))
-                    url = f'https://nvd.nist.gov/vuln/detail/{cve_id}' if cve_id else ''
-                    if url: ws.write_url(cur, ci, url, lnk_fmt, str(val))
-                    else:   ws.write(cur, ci, str(val), data_fmt)
-                elif ci == nvd_col and col_nm == 'NVD':
-                    cve_id = extract_cve_id(str(r.get('Vulnerability Name', '')))
-                    url = f'https://nvd.nist.gov/vuln/detail/{cve_id}' if cve_id else ''
-                    if url: ws.write_url(cur, ci, url, lnk_fmt, 'NVD \u2197')
-                    else:   ws.write(cur, ci, '', data_fmt)
-                else:
-                    safe = val if not (isinstance(val, float) and __import__('pandas').isna(val)) else ''
-                    ws.write(cur, ci, safe, data_fmt)
-            cur += 1
-        cur += 1
+    # Data rows
+    for ri, row in enumerate(combined.itertuples(index=False), start=1):
+        _reason = str(row[-1]) if hasattr(row, '_fields') else ''
+        _is_nirm = 'Not Found' in _reason
+        _rfmt  = row_nirm  if _is_nirm else row_stale
+        _lfmt  = link_nirm if _is_nirm else link_stale
+        row_vals = list(row)
+        for ci, col_nm in enumerate(headers):
+            _ci_src = cl.index(col_nm) if col_nm in cl else None
+            val = row_vals[_ci_src] if _ci_src is not None else ''
+            safe = val if not (isinstance(val, float) and pd.isna(val)) else ''
+            if col_nm == 'Vulnerability Name' and vn_idx is not None:
+                cve_id = extract_cve_id(str(safe))
+                url = f'https://nvd.nist.gov/vuln/detail/{cve_id}' if cve_id else ''
+                if url: ws.write_url(ri, ci, url, _lfmt, str(safe))
+                else:   ws.write(ri, ci, str(safe), _rfmt)
+            elif col_nm == 'NVD':
+                cve_val = row_vals[vn_idx] if vn_idx is not None else ''
+                cve_id  = extract_cve_id(str(cve_val))
+                url = f'https://nvd.nist.gov/vuln/detail/{cve_id}' if cve_id else ''
+                if url: ws.write_url(ri, nvd_idx, url, _lfmt, 'NVD ↗')
+                else:   ws.write(ri, nvd_idx, '', _rfmt)
+            else:
+                ws.write(ri, ci, safe, _rfmt)
 
-    _write_section(df if has_stale else None, sect_stale, row_stale, link_stale,
-                   '\u23f1  CVEs on Date-Stale Devices  (excluded from active metrics \u2014 last seen before cutoff)')
-    _write_section(not_in_rmm_cves_df if has_nirm else None, sect_nirm, row_nirm, link_nirm,
-                   '\U0001f6ab  CVEs on Devices Not Found in RMM  (audit record \u2014 device absent from inventory)')
+    # Autofilter on header row — works immediately on open
+    ws.autofilter(0, 0, len(combined), len(headers) - 1)
 
-    ws.write(cur, 0,
-             '\u2139  Date-Stale CVEs: device excluded because Last Response predates the cutoff. '
-             'Not-in-RMM CVEs: N-able still reports CVEs for a device absent from the RMM inventory. '
-             'Verify decommission status \u2014 may be shadow IT or an orphaned agent.', note_fmt)
-    ws.set_row(cur, 30)
+    note_row = len(combined) + 2
+    ws.write(note_row, 0,
+             'ℹ  Date-Stale (grey): device excluded — Last Response before cutoff. '
+             'Not-in-RMM (🚫 red): device absent from RMM inventory — '
+             'verify decommission status (shadow IT / orphaned agent). '
+             'Use the Reason filter to view each category separately.',
+             note_fmt)
+    ws.set_row(note_row, 36)
 
 
 def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,

@@ -22,6 +22,13 @@ from config import (
 # Overall, setting up logging is an important step in building a reliable and maintainable data processing pipeline, and it will help us to ensure that we can effectively monitor and troubleshoot the code as we develop and use it.
 log = logging.getLogger(__name__)
 
+# python-calamine reads xlsx 4-5× faster than openpyxl via a Rust parser.
+try:
+    import python_calamine  # noqa: F401
+    _XLSX_ENGINE: str = 'calamine'
+except ImportError:
+    _XLSX_ENGINE = 'openpyxl'
+
 # ==============================================================================
 # PRE-COMPILED REGEX  (compile once at import, reuse for every row)
 # Note: these are all case-insensitive, and designed to pull relevant info from messy strings in various formats. They are not intended to be strict validators, but rather flexible extractors that can handle a variety of input formats commonly found in vulnerability and patch data.
@@ -108,7 +115,7 @@ def classify_patch_gap(patch_match_result: str,
 # ==============================================================================
 def load_data(file_path: str) -> pd.DataFrame:
     if file_path.lower().endswith(('.xlsx', '.xls')):
-        return pd.read_excel(file_path)
+        return pd.read_excel(file_path, engine=_XLSX_ENGINE)
     return pd.read_csv(file_path)
 # The load_data function is designed to handle both CSV and Excel file formats, making it flexible for different types of input data. It checks the file extension to determine whether to use pandas' read_excel or read_csv function to load the data into a DataFrame. This allows users to provide their vulnerability and inventory data in the format that is most convenient for them, without needing to convert it beforehand. By returning a DataFrame, this function provides a consistent data structure for subsequent processing steps in the dashboard generation.
 # Note: The function assumes that the input file is well-formed and does not include error handling for cases such as missing files, unsupported formats, or malformed data. In a production environment, it would be advisable to add error handling to provide more informative feedback to the user in case of issues with the input file.
@@ -372,7 +379,7 @@ def _classify_resolution(row):
 
 def load_vulnerability_data(file_path: str) -> pd.DataFrame:
     if str(file_path).lower().endswith(('.xlsx', '.xls')):
-        xl = pd.ExcelFile(file_path)
+        xl = pd.ExcelFile(file_path, engine=_XLSX_ENGINE)
         if 'Raw Data' in xl.sheet_names:
             log.info("Detected dashboard workbook — reading 'Raw Data' sheet")
             df = xl.parse('Raw Data')
@@ -806,39 +813,124 @@ def process_patch_match(patch_path, cve_df, min_score=9.0):
         how='left', suffixes=('', '_p'),
     )
     merged = merged.sort_values(['_sr', '_pd'], ascending=[False, False], na_position='last')
-    gcols  = [c for c in cve.columns if not c.startswith('_')]
-    best   = merged.groupby(gcols, dropna=False, as_index=False).first()
+    # Avoid MultiIndex.from_product overflow: keep best match per original CVE row.
+    merged = merged.reset_index(drop=False)
+    best   = merged.drop_duplicates(subset='index', keep='first').drop(columns='index')
 
-    def _classify_match(row):
-        if not pd.isna(row.get('Patch')):
-            cve_arch   = _get_arch(str(row.get('Affected Products', '')))
-            patch_arch = _get_arch(str(row.get('Patch', '')))
-            if cve_arch and patch_arch and cve_arch != patch_arch:
-                return 'Device in patch report - product not found'
-            return STATUS_LABEL.get(str(row.get('Status', '')).strip(),
-                                     f"Matched - {str(row.get('Status', '')).lower()}")
-        if (row['_ck'], row['_sk'], row['_dk']) in patch_devices:
-            return 'Device in patch report - product not found'
-        return 'Not found in patch report'
+    # ── Patch Match Result (vectorised) ──────────────────────────────────────
+    _has_patch  = best['Patch'].notna()
+    _cve_arch   = best['Affected Products'].astype(str).apply(_get_arch)
+    _patch_arch = best['Patch'].fillna('').astype(str).apply(_get_arch)
+    _arch_mism  = _has_patch & _cve_arch.ne('') & _patch_arch.ne('') & _cve_arch.ne(_patch_arch)
+    _in_devices = pd.Series(
+        [t in patch_devices for t in zip(best['_ck'], best['_sk'], best['_dk'])],
+        index=best.index,
+    )
+    _matched_label = best['Status'].astype(str).str.strip().map(STATUS_LABEL).fillna(
+        'Matched - ' + best['Status'].astype(str).str.lower()
+    )
+    best['Patch Match Result'] = pd.NA
+    best.loc[_has_patch & ~_arch_mism,   'Patch Match Result'] = _matched_label[_has_patch & ~_arch_mism]
+    best.loc[_has_patch & _arch_mism,    'Patch Match Result'] = 'Device in patch report - product not found'
+    best.loc[~_has_patch & _in_devices,  'Patch Match Result'] = 'Device in patch report - product not found'
+    best.loc[~_has_patch & ~_in_devices, 'Patch Match Result'] = 'Not found in patch report'
 
-    best['Patch Match Result'] = best.apply(_classify_match, axis=1)
+    # ── Fixed version & baseline (vectorised) ────────────────────────────────
+    def _vec_fixed_version(pk_series, vname_series):
+        fv_out, fs_out = [], []
+        for pk, vname in zip(pk_series, vname_series):
+            rules = FIXED_VERSION_RULES.get(pk, {})
+            fv, fs = '', ''
+            for cve in _extract_cves(str(vname)):
+                if cve in rules:
+                    fv, fs = rules[cve], f'config rule ({cve})'
+                    break
+            fv_out.append(fv); fs_out.append(fs)
+        return fv_out, fs_out
 
-    fv = best.apply(_resolve_fixed_version, axis=1, result_type='expand')
-    fv.columns = ['Fixed Version Used', 'Fixed Version Source']
-    best = pd.concat([best, fv], axis=1)
+    def _vec_baseline(pk_series):
+        bl_out, bs_out = [], []
+        for pk in pk_series:
+            rules = FIXED_VERSION_RULES.get(pk, {})
+            bl = rules.get('_baseline', '').strip()
+            bl_out.append(bl); bs_out.append('rolling baseline' if bl else '')
+        return bl_out, bs_out
 
-    bl = best.apply(_resolve_baseline, axis=1, result_type='expand')
-    bl.columns = ['Product Baseline', 'Product Baseline Source']
-    best = pd.concat([best, bl], axis=1)
+    _pk_s = best.get('_pk', pd.Series([''] * len(best), index=best.index))
+    _fv_vals, _fs_vals = _vec_fixed_version(_pk_s, best['Vulnerability Name'])
+    best['Fixed Version Used']      = _fv_vals
+    best['Fixed Version Source']    = _fs_vals
+    _bl_vals, _bs_vals = _vec_baseline(_pk_s)
+    best['Product Baseline']        = _bl_vals
+    best['Product Baseline Source'] = _bs_vals
 
-    best['Matched Patch Version']        = best['_pv'].fillna('')
-    best['Matched KBs']                  = best['_kbs'].apply(
+    best['Matched Patch Version'] = best['_pv'].fillna('')
+    best['Matched KBs']           = best['_kbs'].apply(
         lambda v: ', '.join(v) if isinstance(v, list) else '')
-    best['Version Check Result']         = best.apply(_classify_version_check, axis=1)
-    best['Baseline Compliance']          = best.apply(_classify_baseline_compliance, axis=1)
+
+    # ── Version Check Result (vectorised) ────────────────────────────────────
+    _status_s  = best['Status'].astype(str).str.strip()
+    _pv_s      = best['Matched Patch Version'].astype(str).str.strip()
+    _fv_s      = best['Fixed Version Used'].astype(str).str.strip()
+    _bl_s      = best['Product Baseline'].astype(str).str.strip()
+    _inst_mask = _status_s.isin(INSTALLED_STATUSES)
+
+    def _vec_vcr(status_s, pv_s, fv_s, inst_mask):
+        out = []
+        for status, pv, fv, inst in zip(status_s, pv_s, fv_s, inst_mask):
+            if not inst:
+                out.append('Patch not yet installed' if status else 'No patch evidence')
+            elif not fv:
+                out.append('Installed version found - no fixed baseline' if pv else 'Installed - version unknown')
+            elif not pv:
+                out.append('Fixed baseline known - installed version not found')
+            else:
+                cmp = _version_gte(pv, fv)
+                out.append('Version compliant' if cmp is True else
+                           'Below fixed version' if cmp is False else
+                           'Version comparison failed')
+        return out
+
+    def _vec_bc(status_s, pv_s, bl_s, inst_mask):
+        out = []
+        for status, pv, bl, inst in zip(status_s, pv_s, bl_s, inst_mask):
+            if not inst:  out.append('Not installed')
+            elif not bl:  out.append('No baseline defined')
+            elif not pv:  out.append('Version unknown')
+            else:
+                cmp = _version_gte(pv, bl)
+                out.append('Compliant' if cmp is True else
+                           'Below baseline' if cmp is False else
+                           'Version unknown')
+        return out
+
+    best['Version Check Result'] = _vec_vcr(_status_s, _pv_s, _fv_s, _inst_mask)
+    best['Baseline Compliance']  = _vec_bc(_status_s, _pv_s, _bl_s, _inst_mask)
 
     best = best.rename(columns={'Patch': 'Matched Patch', '_pd': 'Patch Install Date'})
-    best['Patch Evidence Status'] = best.apply(_classify_resolution, axis=1)
+
+    # ── Patch Evidence Status (vectorised) ───────────────────────────────────
+    _vcr_s   = best['Version Check Result'].astype(str).str.strip()
+    _inst_dt = pd.to_datetime(best['Patch Install Date'], errors='coerce')
+    _cve_dates_max = best[['First detected', 'Date Published']].apply(
+        lambda col: pd.to_datetime(
+            col.astype(str).str.replace(' UTC', '', regex=False),
+            errors='coerce', utc=True
+        ).dt.tz_localize(None) if col.name in best.columns else pd.NaT,
+        axis=0,
+    ).max(axis=1)
+
+    def _vec_pes(status_s, vcr_s, inst_dt_s, cve_max_s):
+        out = []
+        for status, vcr, inst_dt, cve_max in zip(status_s, vcr_s, inst_dt_s, cve_max_s):
+            if status not in INSTALLED_STATUSES: out.append('Unresolved'); continue
+            if vcr in ('Below fixed version', 'No fixed baseline defined', ''): out.append('Unresolved'); continue
+            if 'version compliant' not in vcr.lower(): out.append('Unresolved'); continue
+            if pd.isna(inst_dt) or pd.isna(cve_max): out.append('Unresolved'); continue
+            out.append('Patch confirmed - pending rescan' if inst_dt >= cve_max else 'Unresolved')
+        return out
+
+    best['Patch Evidence Status'] = _vec_pes(_status_s, _vcr_s, _inst_dt, _cve_dates_max)
 
     best = _apply_cascade_resolution(best)
 
@@ -859,7 +951,7 @@ def process_patch_match(patch_path, cve_df, min_score=9.0):
 
 def load_previous_report(file_path):
     try:
-        xl = pd.ExcelFile(file_path)
+        xl = pd.ExcelFile(file_path, engine=_XLSX_ENGINE)
     except PermissionError:
         fname = os.path.basename(file_path)
         raise ValueError(f"'{fname}' is currently open in Excel.\n\nPlease close the file in Excel and try again.")
@@ -905,8 +997,8 @@ def load_previous_report(file_path):
     if prev_rename:
         df.rename(columns=prev_rename, inplace=True)
 
-    df['_Name_Key'] = df['Name'].apply(normalize_device_name)
-    df['_CVE_Key']  = df['Vulnerability Name'].apply(extract_cve_id)
+    df['_Name_Key'] = _normalize_device_col(df['Name'])
+    df['_CVE_Key']  = df['Vulnerability Name'].astype(str).apply(extract_cve_id)
     df['Vulnerability Score'] = pd.to_numeric(df.get('Vulnerability Score', 0), errors='coerce').fillna(0)
 
     _RESERVED = {
@@ -915,23 +1007,55 @@ def load_previous_report(file_path):
         'resolved', 'persisting cves',
         'patch match overview', 'patch match full data', 'patch report (full)',
         'patch confirmed', 'resolved (patch confirmed)', "cves on stale devices",
+        'client summary', 'summary',
     }
     resolved_pairs = set()
-    for sheet in xl.sheet_names:
-        if sheet.lower() in _RESERVED:
-            continue
-        try:
-            sdf = xl.parse(sheet)
-            if not {'Resolved', 'Name', 'Vulnerability Name'}.issubset(sdf.columns):
+    # Stream product sheets with openpyxl read_only — avoids full DataFrame
+    # deserialisation per sheet (xl.parse was ~2-3s on large workbooks).
+    try:
+        import openpyxl as _opx
+        _wb_ro = _opx.load_workbook(file_path, read_only=True, data_only=True)
+        for _ws in _wb_ro.worksheets:
+            if _ws.title.lower() in _RESERVED:
                 continue
-            checked = sdf[sdf['Resolved'].astype(str).str.strip() == '☑']
-            for _, row in checked.iterrows():
-                resolved_pairs.add((
-                    normalize_device_name(row['Name']),
-                    extract_cve_id(row['Vulnerability Name']),
-                ))
-        except Exception:
-            continue
+            try:
+                _header = None
+                for _hr in _ws.iter_rows(min_row=1, max_row=1, values_only=True):
+                    _header = [str(h).strip().lower() if h is not None else '' for h in _hr]
+                    break
+                if not _header or 'resolved' not in _header:
+                    continue
+                if 'name' not in _header or 'vulnerability name' not in _header:
+                    continue
+                _ri = _header.index('resolved')
+                _ni = _header.index('name')
+                _vi = _header.index('vulnerability name')
+                _max_i = max(_ri, _ni, _vi)
+                for _row in _ws.iter_rows(min_row=2, values_only=True):
+                    if len(_row) > _max_i and str(_row[_ri]).strip() == '☑':
+                        resolved_pairs.add((
+                            normalize_device_name(str(_row[_ni] or '')),
+                            extract_cve_id(str(_row[_vi] or '')),
+                        ))
+            except Exception:
+                continue
+        _wb_ro.close()
+    except ImportError:
+        for sheet in xl.sheet_names:
+            if sheet.lower() in _RESERVED:
+                continue
+            try:
+                sdf = xl.parse(sheet)
+                if not {'Resolved', 'Name', 'Vulnerability Name'}.issubset(sdf.columns):
+                    continue
+                checked = sdf[sdf['Resolved'].astype(str).str.strip() == '☑']
+                for nk, ck in zip(
+                    checked['Name'].apply(normalize_device_name),
+                    checked['Vulnerability Name'].apply(extract_cve_id),
+                ):
+                    resolved_pairs.add((nk, ck))
+            except Exception:
+                continue
 
     # ── Raw Data is the single source of truth ─────────────────────────────────
     # Do NOT attach _Checkbox_Resolved to df. Attaching it would let the column
@@ -955,8 +1079,8 @@ def _active_trend_scope(df: pd.DataFrame, threshold: float,
       • Deduplication on (_Name_Key, _CVE_Key, _Product_Key)
     """
     out = df.copy()
-    out['_Name_Key']    = out['Name'].apply(normalize_device_name)
-    out['_CVE_Key']     = out['Vulnerability Name'].apply(extract_cve_id)
+    out['_Name_Key']    = _normalize_device_col(out['Name'])
+    out['_CVE_Key']     = out['Vulnerability Name'].astype(str).apply(extract_cve_id)
     out['_Product_Key'] = (
         out['Affected Products'].astype(str).apply(_detect_product)
         if 'Affected Products' in out.columns else ''
@@ -1069,8 +1193,10 @@ def compute_trends(current_df, previous_df, threshold,
     persisting_pair_keys = cur_scoped_pair_keys & prev_pair_keys
 
     def _filter_pairs(df, keys):
-        mask = [k in keys for k in zip(df['_Name_Key'], df['_CVE_Key'], df['_Product_Key'])]
-        return _drop_internal(df[mask].copy())
+        if not keys or df.empty:
+            return _drop_internal(df.iloc[0:0].copy())
+        _key_df = pd.DataFrame(list(keys), columns=['_Name_Key', '_CVE_Key', '_Product_Key'])
+        return _drop_internal(df.merge(_key_df, on=['_Name_Key', '_CVE_Key', '_Product_Key'], how='inner').copy())
 
     new_pairs_df      = _filter_pairs(cur_t,       new_pair_keys).sort_values('Vulnerability Score', ascending=False)
     resolved_df       = _filter_pairs(prev_scoped,  resolved_pair_keys).sort_values('Vulnerability Score', ascending=False)
@@ -1325,3 +1451,156 @@ def build_patch_failure_lookup(failure_df: pd.DataFrame) -> dict:
             'categories':       cats,
         }
     return result
+
+# ==============================================================================
+# BROWSER AUDIT INTEGRATION
+# ==============================================================================
+
+def load_browser_audit(file_path: str) -> pd.DataFrame:
+    """
+    Parse a Browser Audit xlsx (from PS browser scan script).
+    Returns normalised rows with Device, Browser, Version, Architecture,
+    Install Scope, Is 32-bit, Is Per-User/AppData, Username, Last Response.
+    """
+    try:
+        xl = pd.ExcelFile(file_path, engine=_XLSX_ENGINE)
+    except Exception as e:
+        log.warning("load_browser_audit: cannot open %s — %s", file_path, e)
+        return pd.DataFrame()
+
+    _BROWSER_SHEETS = {
+        'chrome':  'Google Chrome',
+        'edge':    'Microsoft Edge',
+        'firefox': 'Mozilla Firefox',
+    }
+
+    frames = []
+    for sheet in xl.sheet_names:
+        sl = sheet.lower()
+        browser = next((v for k, v in _BROWSER_SHEETS.items() if k in sl), None)
+        if browser is None:
+            continue
+        try:
+            raw = xl.parse(sheet, header=None)
+        except Exception:
+            continue
+        if raw.empty:
+            continue
+
+        # Detect header row (first row with ≥3 non-null values)
+        header_row = None
+        for idx, row in raw.iterrows():
+            if len(row.dropna()) >= 3:
+                header_row = idx
+                break
+        if header_row is None:
+            continue
+
+        df = xl.parse(sheet, header=header_row)
+        df.columns = [str(c).strip() for c in df.columns]
+
+        rename = {}
+        for col in df.columns:
+            cl = col.lower().strip()
+            if cl == 'device':                      rename[col] = 'Device'
+            elif cl == 'version':                   rename[col] = 'Version'
+            elif cl == 'architecture':              rename[col] = 'Architecture'
+            elif cl == 'install scope':             rename[col] = 'Install Scope'
+            elif cl == 'install path':              rename[col] = 'Install Path'
+            elif 'is 32' in cl:                     rename[col] = 'Is 32-bit'
+            elif 'per-user' in cl or 'appdata' in cl: rename[col] = 'Is Per-User/AppData'
+            elif cl == 'username':                  rename[col] = 'Username'
+            elif 'last response' in cl:             rename[col] = 'Last Response'
+            elif 'last used' in cl:                 rename[col] = 'Last Used'
+        df = df.rename(columns=rename)
+
+        # Skip sheets that lack required columns (e.g. Firefox Last Used)
+        if 'Version' not in df.columns or 'Device' not in df.columns:
+            continue
+
+        df = df.dropna(subset=['Device', 'Version'], how='any')
+        df = df[df['Version'].astype(str).str.match(r'\d+[\d.]+')]
+        df['Browser'] = browser
+        df['Source']  = 'Browser Audit'
+        frames.append(df)
+
+    if not frames:
+        log.warning("load_browser_audit: no browser sheets found in %s", file_path)
+        return pd.DataFrame()
+
+    out = pd.concat(frames, ignore_index=True)
+    out['Device']  = out['Device'].astype(str).str.strip()
+    out['Version'] = out['Version'].astype(str).str.strip()
+    return out
+
+
+def merge_browser_audit_into_drift(version_drift_df: pd.DataFrame,
+                                   browser_audit_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Enrich version_drift_df with per-user/AppData and 32-bit install counts
+    from the browser audit. Adds an 'Audit Note' column.
+    """
+    if browser_audit_df is None or browser_audit_df.empty:
+        return version_drift_df
+
+    out = version_drift_df.copy() if not version_drift_df.empty else pd.DataFrame()
+
+    _BA_LABEL = {
+        'Google Chrome':   ['Google Chrome'],
+        'Microsoft Edge':  ['Microsoft Edge'],
+        'Mozilla Firefox': ['Mozilla Firefox'],
+    }
+
+    audit_rows = []
+    for browser, labels in _BA_LABEL.items():
+        grp = browser_audit_df[browser_audit_df['Browser'].isin(labels)]
+        if grp.empty:
+            continue
+
+        versions = (grp['Version'].dropna().astype(str).str.strip()
+                    .pipe(lambda s: s[s.str.match(r'\d+[\d.]+')]))
+        uniq_vers = sorted(versions.unique().tolist(),
+                           key=lambda v: tuple(int(x) for x in re.findall(r'\d+', v)) if re.findall(r'\d+', v) else (0,))
+        n_devices = grp['Device'].nunique()
+
+        pu_count  = int(grp['Is Per-User/AppData'].astype(str).str.strip().str.lower()
+                        .isin(['yes', 'true', '1']).sum()) if 'Is Per-User/AppData' in grp.columns else 0
+        bit32_cnt = int(grp['Is 32-bit'].astype(str).str.strip().str.lower()
+                        .isin(['yes', 'true', '1']).sum()) if 'Is 32-bit' in grp.columns else 0
+
+        notes = []
+        if pu_count:   notes.append(f'{pu_count} per-user/AppData install(s)')
+        if bit32_cnt:  notes.append(f'{bit32_cnt} 32-bit install(s) on 64-bit OS')
+        note_str = '; '.join(notes) if notes else '—'
+
+        audit_rows.append({
+            'Product':           browser,
+            'Distinct Versions': len(uniq_vers),
+            'Min Version':       uniq_vers[0]  if uniq_vers else '',
+            'Max Version':       uniq_vers[-1] if uniq_vers else '',
+            'Versions Seen':     ', '.join(uniq_vers),
+            'Device Count':      n_devices,
+            'Audit Note':        note_str,
+        })
+
+    if not audit_rows:
+        return out
+
+    audit_df = pd.DataFrame(audit_rows)
+
+    if out.empty:
+        out = audit_df.copy()
+        return out
+
+    if 'Audit Note' not in out.columns:
+        out['Audit Note'] = '—'
+
+    for _, arow in audit_df.iterrows():
+        prod = arow['Product']
+        mask = out['Product'].astype(str).str.startswith(prod)
+        if mask.any():
+            out.loc[mask, 'Audit Note'] = arow['Audit Note']
+        else:
+            out = pd.concat([out, pd.DataFrame([arow.to_dict()])], ignore_index=True)
+
+    return out

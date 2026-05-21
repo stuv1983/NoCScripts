@@ -27,6 +27,7 @@ from data_pipeline import (
     process_patch_match, load_previous_report, compute_trends,
     normalize_device_name, extract_cve_id, clean_sheet_name,
     load_patch_failure_report, build_patch_failure_lookup,
+    load_browser_audit, merge_browser_audit_into_drift,
 )
 from diagnostics import compute_patch_diagnostics, classify_root_cause
 import snapshot as snap_store
@@ -73,6 +74,8 @@ class DashboardRequest:
     include_patch:        bool           = False
     failure_report_path:  Optional[str]  = None
     include_failure_report: bool         = False
+    browser_audit_path:   Optional[str]  = None
+    include_browser_audit: bool          = False
     prev_report_path:     Optional[str]  = None
     include_trend:        bool           = False
     threshold:            float          = 9.0
@@ -358,6 +361,20 @@ def run(request: DashboardRequest) -> DashboardResult:
                 patch_data[1], product_rules,
                 resolved_pairs=patch_resolved_pairs,
             )
+
+            # Merge browser audit data into version drift if provided
+            if request.include_browser_audit and request.browser_audit_path:
+                try:
+                    browser_audit_df = load_browser_audit(request.browser_audit_path)
+                    if not browser_audit_df.empty:
+                        diagnostics['version_drift_df'] = merge_browser_audit_into_drift(
+                            diagnostics.get('version_drift_df', pd.DataFrame()),
+                            browser_audit_df,
+                        )
+                        log.info("Browser audit merged: %d device records", len(browser_audit_df))
+                except Exception as exc:
+                    log.warning("Could not process browser audit: %s", exc)
+                    warnings.append(f"Could not process browser audit: {exc}")
 
             rc_df = diagnostics.get('root_cause_df', pd.DataFrame())
             if not rc_df.empty:
