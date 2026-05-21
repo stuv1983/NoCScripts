@@ -23,6 +23,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
+from tkcalendar import Calendar
 
 from orchestrator import DashboardRequest, run as run_dashboard
 
@@ -158,6 +159,8 @@ def process_reports():
         return
 
     if not show_all_dates_var.get() and date_var.get().strip():
+        # date_var is always set by the calendar picker, so format is guaranteed valid.
+        # This guard is kept only for safety in case date_var is seeded programmatically.
         try:
             datetime.strptime(date_var.get().strip(), "%d/%m/%Y")
         except ValueError:
@@ -211,12 +214,70 @@ def toggle_rmm_state():
     rmm_browse_btn.configure(state=state)
 
 def toggle_date_state():
-    date_entry.configure(state="disabled" if show_all_dates_var.get() else "normal")
+    state = "disabled" if show_all_dates_var.get() else "normal"
+    date_entry.configure(state=state)
 
 def toggle_trend_state():
     state = "normal" if include_trend_var.get() else "disabled"
     prev_report_entry.configure(state=state)
     prev_report_browse_btn.configure(state=state)
+
+
+def open_date_picker():
+    """Open a calendar popup and write the chosen date back to date_var (dd/mm/yyyy)."""
+    dlg = ctk.CTkToplevel(root)
+    dlg.title("Select cutoff date")
+    dlg.resizable(False, False)
+    dlg.grab_set()
+
+    # Centre over main window
+    dlg.update_idletasks()
+    pw = root.winfo_x() + root.winfo_width()  // 2
+    ph = root.winfo_y() + root.winfo_height() // 2
+    dlg.geometry(f"300x310+{pw - 150}+{ph - 155}")
+
+    # Parse existing value so the calendar opens on the right month
+    try:
+        _initial = datetime.strptime(date_var.get().strip(), "%d/%m/%Y")
+        _y, _m, _d = _initial.year, _initial.month, _initial.day
+    except ValueError:
+        _today = date.today()
+        _y, _m, _d = _today.year, _today.month, _today.day
+
+    cal = Calendar(
+        dlg,
+        selectmode="day",
+        year=_y, month=_m, day=_d,
+        date_pattern="dd/mm/yyyy",
+        background="#1f1f1f",
+        foreground="white",
+        headersbackground="#1f6aa5",
+        headersforeground="white",
+        selectbackground="#2fa84f",
+        selectforeground="white",
+        normalbackground="#1f1f1f",
+        normalforeground="white",
+        weekendbackground="#1f1f1f",
+        weekendforeground="#aaaaaa",
+        othermonthbackground="#161616",
+        othermonthforeground="gray40",
+        bordercolor="#333333",
+        font="TkDefaultFont 10",
+    )
+    cal.pack(padx=12, pady=(12, 4), fill="both", expand=True)
+
+    def _confirm():
+        date_var.set(cal.get_date())
+        # Update the display label text
+        _date_display_var.set(date_var.get())
+        dlg.destroy()
+
+    btn_frame = ctk.CTkFrame(dlg, fg_color="transparent")
+    btn_frame.pack(fill="x", padx=12, pady=(0, 12))
+    ctk.CTkButton(btn_frame, text="Select", command=_confirm,
+                  fg_color=_GREEN, hover_color=_GREEN_HOVER).pack(side="left", expand=True, fill="x", padx=(0, 4))
+    ctk.CTkButton(btn_frame, text="Cancel", command=dlg.destroy,
+                  fg_color="gray40", hover_color="gray30").pack(side="left", expand=True, fill="x", padx=(4, 0))
 
 
 # ===========================================================================
@@ -529,6 +590,7 @@ rmm_var = tk.StringVar()
 skip_rmm_var = tk.BooleanVar()
 score_var = tk.StringVar(value="9.0")
 date_var = tk.StringVar(value=(date.today() - timedelta(days=90)).strftime('%d/%m/%Y'))
+_date_display_var = tk.StringVar(value=date_var.get())   # mirrors date_var for the label
 show_all_dates_var = tk.BooleanVar()
 report_month_var = tk.StringVar(value=datetime.now().strftime('%B %Y'))
 prev_report_var = tk.StringVar()
@@ -601,15 +663,31 @@ row += 1
 _date_frame = ctk.CTkFrame(filters_card, fg_color="transparent")
 _date_frame.grid(row=row, column=0, sticky="w", padx=16, pady=(4, 6))
 ctk.CTkLabel(_date_frame, text="Exclude stale devices last seen before:").pack(side="left")
-date_entry = ctk.CTkEntry(_date_frame, textvariable=date_var, width=120)
-date_entry.pack(side="left", padx=(8, 8))
-ctk.CTkLabel(_date_frame, text="dd/mm/yyyy", text_color=_MUTED_FG, font=ctk.CTkFont(size=11)).pack(side="left")
+# Read-only date display — updated by the calendar picker
+_date_display_label = ctk.CTkLabel(
+    _date_frame,
+    textvariable=_date_display_var,
+    text_color="white",
+    font=ctk.CTkFont(size=13, weight="bold"),
+    width=100,
+    anchor="w",
+)
+_date_display_label.pack(side="left", padx=(8, 4))
+date_entry = ctk.CTkButton(
+    _date_frame,
+    text="📅 Pick date",
+    width=110,
+    command=open_date_picker,
+    fg_color=_BLUE,
+    hover_color=_BLUE_HOVER,
+)
+date_entry.pack(side="left", padx=(0, 8))
 ctk.CTkCheckBox(
     _date_frame,
     text="Show all dates",
     variable=show_all_dates_var,
     command=toggle_date_state,
-).pack(side="left", padx=(16, 0))
+).pack(side="left", padx=(8, 0))
 row += 1
 
 report_month_entry = _inline_field(filters_card, row, "Report Month:", report_month_var, width=160)
