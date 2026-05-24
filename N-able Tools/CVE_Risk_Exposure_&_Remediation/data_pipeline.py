@@ -934,11 +934,43 @@ def process_patch_match(patch_path, cve_df, min_score=9.0):
 
     best = _apply_cascade_resolution(best)
 
+    # ── N Days Exposed ────────────────────────────────────────────────────────
+    # True n-day clock: days since the CVE was publicly disclosed (Date Published
+    # from CVE.org/NVD).  Falls back to First detected when Date Published is
+    # missing (conservative — N-able may detect later than disclosure).
+    # Patched rows show '✓ Patched' so the column remains useful in every row.
+    _today_ts = pd.Timestamp.now().normalize()
+
+    def _n_days_exposed(row):
+        # Skip rows already confirmed patched
+        if str(row.get('Patch Evidence Status', '')).strip() == 'Patch confirmed - pending rescan':
+            return '✓ Patched'
+        dp = row.get('Date Published', pd.NaT)
+        fd = row.get('First detected',  pd.NaT)
+        anchor = dp if not pd.isna(dp) else fd
+        if pd.isna(anchor):
+            return '—'
+        try:
+            days = (_today_ts - pd.Timestamp(anchor)).days
+            return max(days, 0)
+        except Exception:
+            return '—'
+
+    best['N Days Exposed'] = best.apply(_n_days_exposed, axis=1)
+
+    # Insert N Days Exposed immediately after Date Published (or First detected)
+    _cols = best.columns.tolist()
+    _anchor_col = next((c for c in ('Date Published', 'First detected') if c in _cols), None)
+    if _anchor_col and 'N Days Exposed' in _cols:
+        _cols.remove('N Days Exposed')
+        _cols.insert(_cols.index(_anchor_col) + 1, 'N Days Exposed')
+        best = best[_cols]
+
     best = best.drop(columns=[c for c in best.columns if c.startswith('_')], errors='ignore')
 
     ov_cols = ['Name', 'Device Type', 'Threat Status', 'Vulnerability Score',
-               'Affected Products', 'Date Published', 'First detected', 'Last updated',
-               'Last Response', 'Matched Patch', 'Patch Install Date',
+               'Affected Products', 'Date Published', 'N Days Exposed', 'First detected',
+               'Last updated', 'Last Response', 'Matched Patch', 'Patch Install Date',
                'Patch Match Result', 'Patch Evidence Status',
                'Product Baseline', 'Baseline Compliance']
     overview = _make_excel_safe(best[[c for c in ov_cols if c in best.columns]])

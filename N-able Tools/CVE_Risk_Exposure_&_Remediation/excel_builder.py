@@ -375,6 +375,56 @@ def build_overview_sheet(workbook, merged_df, filtered_df, triage_df, threshold,
     ws.write(r0+3, 4, 'Avg CVEs / Device'); ws.write(r0+3, 5, avg_per_dev)
     ws.write(r0+4, 4, 'Servers Impacted');  ws.write(r0+4, 5, f'{srv_aff} ({srv_pct})')
 
+    # ── N-day Exposure Age summary ────────────────────────────────────────────
+    if 'N Days Exposed' in filtered_df.columns:
+        _nde_num = pd.to_numeric(filtered_df['N Days Exposed'], errors='coerce')
+        _unresolved_nde = _nde_num.dropna()  # '✓ Patched' and '—' become NaN, excluded
+
+        # Deduplicate by CVE so each unique vulnerability is counted once
+        _nde_per_cve = (
+            filtered_df[['Vulnerability Name', 'N Days Exposed']]
+            .drop_duplicates(subset=['Vulnerability Name'])
+            .copy()
+        )
+        _nde_per_cve['_n'] = pd.to_numeric(_nde_per_cve['N Days Exposed'], errors='coerce')
+        _nde_vals = _nde_per_cve['_n'].dropna()
+
+        _band_180  = int((_nde_vals >= 180).sum())
+        _band_91   = int(((_nde_vals >= 91)  & (_nde_vals < 180)).sum())
+        _band_31   = int(((_nde_vals >= 31)  & (_nde_vals < 91)).sum())
+        _band_0    = int((_nde_vals < 31).sum())
+        _avg_age   = round(_nde_vals.mean(), 0) if not _nde_vals.empty else 0
+        _max_age   = int(_nde_vals.max()) if not _nde_vals.empty else 0
+
+        _nday_hdr  = workbook.add_format({
+            'bold': True, 'bg_color': '#2E4057', 'font_color': 'white', 'border': 1,
+        })
+        _nday_crit = workbook.add_format({
+            'bold': True, 'bg_color': '#C00000', 'font_color': 'white',
+        })
+        _nday_high = workbook.add_format({'bg_color': '#FCE4D6', 'bold': True})
+        _nday_amb  = workbook.add_format({'bg_color': '#FFF2CC', 'bold': True})
+        _nday_ok   = workbook.add_format({'bg_color': '#E2EFDA', 'bold': True})
+        _nday_lbl  = workbook.add_format({'font_size': 9, 'italic': True, 'font_color': '#595959'})
+
+        nr = r0 + 6
+        ws.merge_range(nr, 0, nr, 5, 'N-Day Exposure Age  (unique CVEs, unpatched only)', _nday_hdr)
+        ws.write(nr+1, 0, '≥ 180 days',        _nday_crit); ws.write(nr+1, 1, _band_180, _nday_crit)
+        ws.write(nr+1, 2, 'Critical — far outside patch SLA', _nday_lbl)
+        ws.write(nr+2, 0, '91 – 179 days',     _nday_high); ws.write(nr+2, 1, _band_91,  _nday_high)
+        ws.write(nr+2, 2, 'High — breach 90-day remediation target', _nday_lbl)
+        ws.write(nr+3, 0, '31 – 90 days',      _nday_amb);  ws.write(nr+3, 1, _band_31,  _nday_amb)
+        ws.write(nr+3, 2, 'Amber — approaching or past 30-day target', _nday_lbl)
+        ws.write(nr+4, 0, '0 – 30 days',       _nday_ok);   ws.write(nr+4, 1, _band_0,   _nday_ok)
+        ws.write(nr+4, 2, 'Within acceptable window', _nday_lbl)
+        ws.write(nr+5, 0, 'Avg exposure age');  ws.write(nr+5, 1, f'{int(_avg_age)} days')
+        ws.write(nr+5, 3, 'Max exposure age');  ws.write(nr+5, 4, f'{_max_age} days')
+        ws.write(nr+6, 0,
+                 'ℹ  N = days since CVE.org/NVD Date Published (falls back to First Detected '
+                 'if no publish date available). "✓ Patched" rows are excluded.',
+                 workbook.add_format({'italic': True, 'font_color': '#595959', 'font_size': 8}))
+        ws.set_row(nr+6, 22)
+
     if evidence_summary:
         summ_fmt  = workbook.add_format({'bold': True, 'font_size': 10})
         summ_note = workbook.add_format({'italic': True, 'font_color': '#595959', 'font_size': 9})
@@ -634,6 +684,31 @@ def build_all_detections_sheet(writer, merged_df, link_fmt, missing_row_fmt):
         ws.conditional_format(1, 0, len(df), len(cl) - 1, {
             'type': 'formula', 'criteria': f'=${lr}2="Not Found in RMM"',
             'format': missing_row_fmt,
+        })
+    if 'N Days Exposed' in cl:
+        nde_idx  = cl.index('N Days Exposed')
+        nde_col  = get_col_letter(nde_idx)
+        ws.set_column(nde_idx, nde_idx, 15)
+        wb = writer.book
+        # >180 days unpatched — critical (dark red)
+        ws.conditional_format(1, nde_idx, len(df), nde_idx, {
+            'type': 'cell', 'criteria': '>=', 'value': 180,
+            'format': wb.add_format({'bg_color': '#C00000', 'font_color': 'white', 'bold': True}),
+        })
+        # 91–179 days — high (red)
+        ws.conditional_format(1, nde_idx, len(df), nde_idx, {
+            'type': 'cell', 'criteria': 'between', 'minimum': 91, 'maximum': 179,
+            'format': wb.add_format({'bg_color': '#FCE4D6'}),
+        })
+        # 31–90 days — amber
+        ws.conditional_format(1, nde_idx, len(df), nde_idx, {
+            'type': 'cell', 'criteria': 'between', 'minimum': 31, 'maximum': 90,
+            'format': wb.add_format({'bg_color': '#FFF2CC'}),
+        })
+        # 0–30 days — green (within acceptable window)
+        ws.conditional_format(1, nde_idx, len(df), nde_idx, {
+            'type': 'cell', 'criteria': 'between', 'minimum': 0, 'maximum': 30,
+            'format': wb.add_format({'bg_color': '#E2EFDA'}),
         })
 
 def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
