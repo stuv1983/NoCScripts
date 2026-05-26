@@ -747,6 +747,11 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
             _sheet_pk = _dp_detect_prod(str(product))
 
         def _resolved_value(row):
+            # Approaching-stale devices: cannot confirm patch took effect if device
+            # hasn't checked in for >= warning_days. Raw data is source of truth —
+            # force ☐ so these rows never show blue regardless of patch_resolved_pairs.
+            if row['Name'] in approaching_stale_names:
+                return '☐'
             nk = normalize_device_name(row['Name'])
             ck = extract_cve_id(row['Vulnerability Name'])
             if (nk, ck, _sheet_pk) in patch_resolved_pairs:
@@ -787,28 +792,57 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
             ws.data_validation(1, ri, len(group), ri, {'validate': 'list', 'source': ['☐', '☑']})
             ws.set_column(ri, ri, 10)
 
+        _last = len(group)   # last data row (1-indexed)
         _TRUE_VALS = {'yes', 'true', '1', 'y'}
+
+        # ── Bulk colouring via conditional_format (Excel XML — no Python loop needed) ──
+        # Priority 1: Resolved (☑ in col A) → blue.  Covers the majority of rows.
+        ws.conditional_format(1, 0, _last, len(cl) - 1, {
+            'type':     'formula',
+            'criteria': '=$A1="☑"',
+            'format':   patch_res_fmt,
+        })
+        # Priority 2: Known exploit → orange.  Has Known Exploit col value is in the sheet.
+        _exp_col = 'Has Known Exploit'
+        if _exp_col in cl:
+            _ec = chr(ord('A') + cl.index(_exp_col))
+            ws.conditional_format(1, 0, _last, len(cl) - 1, {
+                'type':     'formula',
+                'criteria': f'=OR(${_ec}1=TRUE,UPPER(TEXT(${_ec}1,"@"))="YES")',
+                'format':   exploit_fmt,
+            })
+
+        # ── Sparse colouring via set_row for Python-computed states ──
+        # Priority (highest to lowest):
+        #   1. Approaching stale — device offline >= warning_days.
+        #      Cannot trust any patch confirmation if the device hasn't checked in.
+        #      Overrides resolved (blue) because the device may not have received the patch.
+        #   2. Known exploit (orange-red) — unresolved high-priority CVE.
+        #   3. Patch gap types (coverage, unmanaged, mismatch, installing).
+        #   4. Resolved ☑ rows not in approaching — handled by conditional_format, skip.
+        # NOTE: set_row takes precedence over conditional_format in xlsxwriter,
+        # so we only call set_row when we intentionally want to override CF.
+        _approaching = approaching_stale_names or set()
         for row_i, (_, row) in enumerate(group[final_cols].iterrows(), start=1):
             nk = normalize_device_name(str(row.get('Name', '')))
             ck = extract_cve_id(str(row.get('Vulnerability Name', '')))
-            _is_resolved = (
-                (nk, ck, _sheet_pk) in patch_resolved_pairs
-                or (len(patch_resolved_pairs) > 0
-                    and len(next(iter(patch_resolved_pairs))) == 2
-                    and (nk, ck) in patch_resolved_pairs)
-            )
-            _device_name = str(row.get('Name', ''))
-            if _is_resolved:
-                ws.set_row(row_i, None, patch_res_fmt)
-            elif str(row.get('Has Known Exploit', '')).strip().lower() in _TRUE_VALS:
-                ws.set_row(row_i, None, exploit_fmt)
-            elif _device_name in approaching_stale_names:
+            # Priority 1: approaching-stale overrides everything — device offline >= warning_days.
+            # We cannot confirm the patch actually applied if the device never checked back in.
+            if str(row.get('Name', '')) in _approaching:
                 gap = patch_gap_pairs.get((nk, ck))
                 ws.set_row(row_i, None, _GAP_FMTS.get(gap, approaching_fmt) if gap and gap in _GAP_FMTS else approaching_fmt)
-            else:
-                gap = patch_gap_pairs.get((nk, ck))
-                if gap and gap in _GAP_FMTS:
-                    ws.set_row(row_i, None, _GAP_FMTS[gap])
+                continue
+            # Priority 2: skip resolved rows — handled by conditional_format ☑ → blue
+            _row_resolved = str(row.get('Resolved', '')).strip() == '☑'
+            if _row_resolved:
+                continue
+            # Priority 3: known exploit on unresolved row
+            if str(row.get(_exp_col, '')).strip().lower() in _TRUE_VALS:
+                continue
+            # Priority 4: patch gap types
+            gap = patch_gap_pairs.get((nk, ck))
+            if gap and gap in _GAP_FMTS:
+                ws.set_row(row_i, None, _GAP_FMTS[gap])
 
         if 'Vulnerability Name' in cl:
             vn_idx = cl.index('Vulnerability Name')
@@ -829,7 +863,7 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
         legend_entries = [
             ('#DEEAF1', 'blue row',   'Patch via RMM — install confirmed after CVE first detected'),
             ('#FFE0CC', 'orange row', 'Known active exploit — unresolved, prioritise immediately'),
-            ('#FFF3E0', 'amber-orange row', f'Stale / approaching stale — last seen within {stale_warning_days}d of (or past) the 30-day threshold'),
+            ('#FFF3E0', 'amber-orange row', f'Approaching stale — device offline \u2265 {stale_warning_days}d; patch confirmation unreliable (overrides blue)'),
             ('#FFF2CC', 'yellow row', 'Coverage gap — device not in patch report'),
             ('#FCE4D6', 'peach row',  'Unmanaged app — product not tracked in patch report'),
             ('#F2CEEF', 'pink row',   'Detection mismatch — CVE detected but no matching patch found'),
@@ -895,11 +929,28 @@ def build_diagnostics_sheets(writer, diagnostics: dict) -> None:
         ws.autofilter(0, 0, len(lag_df), len(lag_df.columns) - 1)
         ws.set_column('A:A', 28); ws.set_column('B:B', 18); ws.set_column('C:C', 32)
         ws.set_column('F:F', 12)
-        for i, lag in enumerate(lag_df.get('Lag (days)', []), start=1):
-            fmt = red if lag is not None and (lag < 0 or lag > 60) else \
-                  amb if lag is not None and lag > 14 else grn
-            ws.set_row(i, None, fmt)
-        ws.write(len(lag_df) + 2, 0,
+        # Find the Lag column index for conditional_format
+        _lag_cols = list(lag_df.columns)
+        _lag_idx  = _lag_cols.index('Lag (days)') if 'Lag (days)' in _lag_cols else None
+        _n = len(lag_df)
+        if _lag_idx is not None:
+            _lag_letter = chr(ord('A') + _lag_idx)
+            # Green: 0–14 days — patched promptly
+            ws.conditional_format(1, 0, _n, len(_lag_cols) - 1, {
+                'type': 'formula', 'criteria': f'=AND(${_lag_letter}1>=0,${_lag_letter}1<=14)',
+                'format': grn,
+            })
+            # Amber: 15–60 days — acceptable but slow
+            ws.conditional_format(1, 0, _n, len(_lag_cols) - 1, {
+                'type': 'formula', 'criteria': f'=AND(${_lag_letter}1>14,${_lag_letter}1<=60)',
+                'format': amb,
+            })
+            # Red: >60 days or negative (patch pre-dates detection — data anomaly)
+            ws.conditional_format(1, 0, _n, len(_lag_cols) - 1, {
+                'type': 'formula', 'criteria': f'=OR(${_lag_letter}1>60,${_lag_letter}1<0)',
+                'format': red,
+            })
+        ws.write(_n + 2, 0,
                  'Negative lag = patch installed before CVE was first detected.', note)
 
     drift_df = diagnostics.get('version_drift_df', pd.DataFrame())
@@ -913,8 +964,24 @@ def build_diagnostics_sheets(writer, diagnostics: dict) -> None:
         if 'Audit Note' in _cols:
             _an_idx = _cols.index('Audit Note')
             ws.set_column(_an_idx, _an_idx, 50)
-        for i, spread in enumerate(drift_df.get('Distinct Versions', []), start=1):
-            ws.set_row(i, None, red if spread >= 4 else amb if spread >= 2 else grn)
+        # Colour by Distinct Versions count using conditional_format
+        _dv_cols = list(drift_df.columns)
+        _dv_idx  = _dv_cols.index('Distinct Versions') if 'Distinct Versions' in _dv_cols else None
+        _dn = len(drift_df)
+        if _dv_idx is not None:
+            _dv_letter = chr(ord('A') + _dv_idx)
+            ws.conditional_format(1, 0, _dn, len(_dv_cols) - 1, {
+                'type': 'formula', 'criteria': f'=${_dv_letter}1=1',
+                'format': grn,
+            })
+            ws.conditional_format(1, 0, _dn, len(_dv_cols) - 1, {
+                'type': 'formula', 'criteria': f'=AND(${_dv_letter}1>=2,${_dv_letter}1<4)',
+                'format': amb,
+            })
+            ws.conditional_format(1, 0, _dn, len(_dv_cols) - 1, {
+                'type': 'formula', 'criteria': f'=${_dv_letter}1>=4',
+                'format': red,
+            })
         ws.write(len(drift_df) + 2, 0,
                  'High distinct-version count = inconsistent update cadence across fleet. '
                  'Audit Note: per-user/AppData installs bypass GPO — remove and replace with system-scope. '

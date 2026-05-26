@@ -269,14 +269,42 @@ def _extract_best_version(text) -> str:
     return sorted(versions, key=lambda v: (len(v.split('.')), [int(x) for x in v.split('.')]))[-1]
 
 def _parse_version(value) -> Optional[tuple]:
-    parts = _DIGITS_RE.findall(str(value).strip())
-    return tuple(int(p) for p in parts) if parts else None
+    """
+    Parse a version string into a comparable tuple using packaging.version.
+    Falls back to extracting digit sequences for simple numeric-only strings
+    that packaging cannot handle (e.g. plain build numbers without dots).
+    Returns None when no version can be parsed.
+    """
+    try:
+        from packaging.version import Version
+        v = str(value).strip().lstrip('v')
+        return Version(v).release   # tuple of ints, e.g. (136, 0, 7103, 116)
+    except Exception:
+        parts = _DIGITS_RE.findall(str(value).strip())
+        return tuple(int(p) for p in parts) if parts else None
+
 
 def _version_gte(left, right):
-    l, r = _parse_version(left), _parse_version(right)
-    if l is None or r is None: return None
-    n = max(len(l), len(r))
-    return (l + (0,) * (n - len(l))) >= (r + (0,) * (n - len(r)))
+    """
+    Returns True if left >= right, False if left < right, None when either
+    version cannot be parsed or the comparison is ambiguous (e.g. pre-release).
+
+    Uses packaging.version.Version for correctness on complex strings like
+    '2.0-rc1', 'v3.14.1-beta', '136.0.7103.116'. Falls back to tuple
+    comparison when packaging cannot parse either side.
+    """
+    try:
+        from packaging.version import Version, InvalidVersion
+        lv = str(left).strip().lstrip('v')
+        rv = str(right).strip().lstrip('v')
+        return Version(lv) >= Version(rv)
+    except Exception:
+        # Fall back to plain digit-tuple comparison (handles build-number-only strings)
+        l, r = _parse_version(left), _parse_version(right)
+        if l is None or r is None:
+            return None
+        n = max(len(l), len(r))
+        return (l + (0,) * (n - len(l))) >= (r + (0,) * (n - len(r)))
 
 def _make_excel_safe(df):
     out = df.copy()

@@ -78,15 +78,24 @@ def _make_session() -> requests.Session:
     return session
 
 
-_SESSION: Optional[requests.Session] = None
+import threading as _threading
+_thread_local = _threading.local()
 
 
 def _get_session() -> requests.Session:
-    """Return the module-level session, creating it on first call."""
-    global _SESSION
-    if _SESSION is None:
-        _SESSION = _make_session()
-    return _SESSION
+    """
+    Return a requests.Session scoped to the current thread.
+
+    Using threading.local() ensures each worker thread in the ThreadPoolExecutor
+    owns its own session and connection pool, eliminating the risk of pool
+    exhaustion or state leakage when multiple threads make concurrent requests.
+    The module-level _SESSION global is no longer used.
+    """
+    session = getattr(_thread_local, 'session', None)
+    if session is None:
+        session = _make_session()
+        _thread_local.session = session
+    return session
 
 
 def _mask_key(value: str) -> str:
