@@ -706,12 +706,12 @@ row += 1
 # Approaching-stale warning window
 _warn_frame = ctk.CTkFrame(filters_card, fg_color="transparent")
 _warn_frame.grid(row=row, column=0, sticky="w", padx=16, pady=(0, 6))
-ctk.CTkLabel(_warn_frame, text="⚠  Highlight devices approaching stale within:").pack(side="left")
+ctk.CTkLabel(_warn_frame, text="⚠  Highlight active devices last seen within:").pack(side="left")
 _warn_days_entry = ctk.CTkEntry(_warn_frame, textvariable=stale_warning_days_var, width=52)
 _warn_days_entry.pack(side="left", padx=(8, 4))
 ctk.CTkLabel(
     _warn_frame,
-    text="days  (highlighted orange in product sheets and overview, not excluded from report)",
+    text="days of going stale  (orange in product sheets — only flags devices still in report, not already-stale ones)",
     text_color=_MUTED_FG,
     font=ctk.CTkFont(size=11),
 ).pack(side="left")

@@ -1402,7 +1402,8 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
                                not_in_rmm_unique_cves=0,
                                report_month='',
                                approaching_stale_names: Optional[Set[str]] = None,
-                               stale_warning_days: int = 14):
+                               stale_warning_days: int = 14,
+                               product_to_sheet: Optional[dict] = None):
     """
     Client Summary sheet.
 
@@ -1410,7 +1411,7 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     triage_df    — active scope only (stale + not-in-RMM removed). All Key Metrics use this.
     threshold    — CVSS floor shown in the waterfall header.
     """
-    ws = workbook.add_worksheet('Client Summary')
+    ws = workbook.add_worksheet('Summary')
     if not report_month:
         report_month = datetime.now().strftime("%B %Y")
 
@@ -1444,62 +1445,279 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     ws.write('A2', f'Report Month: {report_month}  |  Generated: {datetime.now().strftime("%d %b %Y")}',
              workbook.add_format({'italic': True, 'font_color': '#595959', 'font_size': 9}))
 
-    # Key Metrics — all from triage_df (active scope only)
-    total_rows     = len(triage_df)
-    unique_cves    = int(triage_df['Vulnerability Name'].nunique()) if 'Vulnerability Name' in triage_df.columns else 0
-    unique_devices = int(triage_df['Name'].nunique())               if 'Name'               in triage_df.columns else 0
-    score_col      = 'Vulnerability Score' if 'Vulnerability Score' in triage_df.columns else None
-    crit_mask      = triage_df[score_col] >= 9.0 if score_col else pd.Series([True]*len(triage_df))
+    # ── Key Metrics ─────────────────────────────────────────────────────────────
+    # ALL counts from triage_df: active scope only (stale + not-in-RMM removed).
+    # Deduplicate exactly as build_product_sheets does: for each Base Product sheet,
+    # drop_duplicates(['Name','Vulnerability Name']), then concat.
+    # This makes Key Metrics row counts match the live COUNTIF totals exactly.
+    _p2s_keys = set((product_to_sheet or {}).keys())
+    if 'Base Product' in triage_df.columns and _p2s_keys:
+        _dedup_frames = [
+            grp.drop_duplicates(subset=['Name', 'Vulnerability Name'])
+            for bp, grp in triage_df.groupby('Base Product')
+            if bp in _p2s_keys
+        ]
+        triage_dedup = pd.concat(_dedup_frames, ignore_index=True) if _dedup_frames else triage_df.copy()
+    elif 'Base Product' in triage_df.columns:
+        _dedup_frames = [
+            grp.drop_duplicates(subset=['Name', 'Vulnerability Name'])
+            for _, grp in triage_df.groupby('Base Product')
+        ]
+        triage_dedup = pd.concat(_dedup_frames, ignore_index=True) if _dedup_frames else triage_df.copy()
+    else:
+        triage_dedup = triage_df.drop_duplicates(subset=['Name', 'Vulnerability Name']).copy()
+
+    _sc = ('Threat Status' if 'Threat Status' in triage_dedup.columns
+           else 'Status'   if 'Status'        in triage_dedup.columns else None)
+    _is_res = (triage_dedup[_sc].astype(str).str.strip().str.upper() == 'RESOLVED'
+               if _sc else pd.Series([False] * len(triage_dedup), index=triage_dedup.index))
+    _is_unr = ~_is_res
+
+    total_rows     = len(triage_dedup)
+    unique_cves    = int(triage_dedup['Vulnerability Name'].nunique()) if 'Vulnerability Name' in triage_dedup.columns else 0
+    unique_devices = int(triage_dedup['Name'].nunique())               if 'Name'               in triage_dedup.columns else 0
+    score_col      = 'Vulnerability Score' if 'Vulnerability Score' in triage_dedup.columns else None
+    crit_mask      = pd.to_numeric(triage_dedup[score_col], errors='coerce') >= 9.0 if score_col else pd.Series([True]*len(triage_dedup), index=triage_dedup.index)
     crit_rows      = int(crit_mask.sum())
-    crit_cves      = int(triage_df.loc[crit_mask,'Vulnerability Name'].nunique()) if score_col and 'Vulnerability Name' in triage_df.columns else unique_cves
-    exploit_col    = 'Has Known Exploit' if 'Has Known Exploit' in triage_df.columns else None
-    exploit_count  = int((triage_df[exploit_col]==True).sum()) if exploit_col else 0
-    kev_col        = 'CISA KEV' if 'CISA KEV' in triage_df.columns else None
-    kev_count      = int((triage_df[kev_col]==True).sum()) if kev_col else 0
-    server_count   = 0
-    if 'Device Type' in triage_df.columns and 'Name' in triage_df.columns:
-        srv_mask     = triage_df['Device Type'].astype(str).str.lower().str.contains('server', na=False)
-        server_count = int(triage_df.loc[srv_mask,'Name'].nunique())
+    crit_cves      = int(triage_dedup.loc[crit_mask, 'Vulnerability Name'].nunique()) if score_col and 'Vulnerability Name' in triage_dedup.columns else unique_cves
 
-    row = 3
-    ws.merge_range(row,0,row,3,'  Key Metrics  (active devices only \u2014 excludes stale / not in RMM)',sect_fmt); row+=1
-    for label, value, fmt in [
-        ('Total CVE detection rows',        total_rows,    val_fmt),
-        ('Unique CVE types detected',        unique_cves,   val_fmt),
-        ('Unique devices affected',          unique_devices,val_fmt),
-        ('Detections at CVSS 9.0+',          crit_rows,     red_fmt),
-        ('Unique CVEs at CVSS 9.0+',         crit_cves,     red_fmt),
-        ('Detections with known exploit',    exploit_count, red_fmt if exploit_count else val_fmt),
-        ('Detections on CISA KEV list',      kev_count,     red_fmt if kev_count     else val_fmt),
-        ('Servers with CVE detections',      server_count,  val_fmt),
-    ]:
-        ws.write(row,0,label,lbl_fmt); ws.merge_range(row,1,row,3,value,fmt); row+=1
+    exploit_col     = 'Has Known Exploit' if 'Has Known Exploit' in triage_dedup.columns else None
+    exploit_mask    = triage_dedup[exploit_col].astype(str).str.strip().str.lower().isin(['yes','true','1','y']) if exploit_col else pd.Series([False]*len(triage_dedup), index=triage_dedup.index)
+    exploit_count   = int(exploit_mask.sum())
+    exploit_patched = int((exploit_mask & _is_res).sum())
+    exploit_unpatch = int((exploit_mask & _is_unr).sum())
 
-    # Resolution Status
-    _sc = ('Threat Status' if 'Threat Status' in triage_df.columns
-           else 'Status'   if 'Status'        in triage_df.columns else None)
-    row+=1
-    if _sc:
-        _res = triage_df[_sc].astype(str).str.strip().str.upper()=='RESOLVED'
-        _unr = ~_res
-        _rr  = int(_res.sum()); _ur = int(_unr.sum()); _tot = _rr+_ur
-        _rc  = int(triage_df.loc[_res,'Vulnerability Name'].nunique()) if 'Vulnerability Name' in triage_df.columns else 0
-        _uc  = int(triage_df.loc[_unr,'Vulnerability Name'].nunique()) if 'Vulnerability Name' in triage_df.columns else 0
-        ws.merge_range(row,0,row,3,'  Resolution Status  (active devices only)',sect_fmt); row+=1
-        ws.write(row,0,'Status',hdr_fmt); ws.write(row,1,'Detection Rows',hdr_fmt)
-        ws.write(row,2,'% of Total',hdr_fmt); ws.write(row,3,'Unique CVE Types',hdr_fmt); row+=1
-        _rp=_rr/_tot if _tot else 0; _up=_ur/_tot if _tot else 0
-        ws.write(row,0,'Resolved',  lbl_fmt); ws.write(row,1,_rr,grn_fmt); ws.write(row,2,_rp,val_pct); ws.write(row,3,_rc,grn_fmt); row+=1
-        ws.write(row,0,'Unresolved',lbl_fmt); ws.write(row,1,_ur,red_fmt); ws.write(row,2,_up,val_pct); ws.write(row,3,_uc,red_fmt); row+=1
-        ws.write(row,0,'Total',     lbl_fmt); ws.write(row,1,_tot,val_fmt); ws.write(row,2,1.0,val_pct)
-        ws.write(row,3,triage_df['Vulnerability Name'].nunique() if 'Vulnerability Name' in triage_df.columns else 0,val_fmt); row+=1
-        ws.merge_range(row,0,row,3,
-                       f'\u2139  CVSS 9.0+: {_rr:,} resolved  vs  {_ur:,} unresolved'
-                       +(f'  |  {_rc:,} CVE types resolved  vs  {_uc:,} unresolved' if _rc or _uc else ''),note_fmt); row+=1
+    # Server/workstation exploit breakdowns — detection row counts, active scope only
+    if 'Device Type' in triage_dedup.columns:
+        _srv_mask = triage_dedup['Device Type'].astype(str).str.lower().str.contains('server',      na=False)
+        _wks_mask = triage_dedup['Device Type'].astype(str).str.lower().str.contains('workstation', na=False)
+        srv_exp_total   = int((exploit_mask & _srv_mask).sum())
+        srv_exp_patched = int((exploit_mask & _srv_mask & _is_res).sum())
+        srv_exp_unpatch = int((exploit_mask & _srv_mask & _is_unr).sum())
+        wks_exp_total   = int((exploit_mask & _wks_mask).sum())
+        wks_exp_patched = int((exploit_mask & _wks_mask & _is_res).sum())
+        wks_exp_unpatch = int((exploit_mask & _wks_mask & _is_unr).sum())
+    else:
+        srv_exp_total = srv_exp_patched = srv_exp_unpatch = 0
+        wks_exp_total = wks_exp_patched = wks_exp_unpatch = 0
 
-    # Data Filtering Reconciliation waterfall
+    # Device-type counts for Device Breakdown sub-table (unique devices)
+    if 'Device Type' in triage_dedup.columns and 'Name' in triage_dedup.columns:
+        srv_total   = int(triage_dedup.loc[_srv_mask,           'Name'].nunique())
+        srv_unpatch = int(triage_dedup.loc[_srv_mask & _is_unr, 'Name'].nunique())
+        wks_total   = int(triage_dedup.loc[_wks_mask,           'Name'].nunique())
+        wks_unres   = int(triage_dedup.loc[_wks_mask & _is_unr, 'Name'].nunique())
+    else:
+        srv_total = srv_unpatch = wks_total = wks_unres = 0
+
+    # Stale device-type counts (context — from stale_excluded_df)
+    _stale_srv = _stale_wks = 0
+    if stale_excluded_df is not None and not stale_excluded_df.empty and 'Device Type' in stale_excluded_df.columns and 'Name' in stale_excluded_df.columns:
+        _stale_srv = int(stale_excluded_df[stale_excluded_df['Device Type'].astype(str).str.lower().str.contains('server',      na=False)]['Name'].nunique())
+        _stale_wks = int(stale_excluded_df[stale_excluded_df['Device Type'].astype(str).str.lower().str.contains('workstation', na=False)]['Name'].nunique())
+
+    # Stale + NIRM counts for Key Metrics math rows — computed once, reused in waterfall
     _stale_rows = int(len(stale_excluded_df)) if stale_excluded_df is not None and not stale_excluded_df.empty else 0
     _stale_devs = int(stale_excluded_df['Name'].nunique()) if stale_excluded_df is not None and not stale_excluded_df.empty and 'Name' in stale_excluded_df.columns else 0
+    _stale_crit = 0   # detection rows at CVSS 9+ on stale devices
+    _stale_crit_cves = 0  # unique CVE types at CVSS 9+ on stale devices
+    if stale_excluded_df is not None and not stale_excluded_df.empty and score_col and score_col in stale_excluded_df.columns:
+        _stale_sc = pd.to_numeric(stale_excluded_df[score_col], errors='coerce')
+        _stale_crit      = int((_stale_sc >= 9.0).sum())
+        _stale_crit_cves = int(stale_excluded_df.loc[_stale_sc >= 9.0, 'Vulnerability Name'].nunique()) if 'Vulnerability Name' in stale_excluded_df.columns else 0
+    # NIRM (not_in_rmm_cve_count already passed in as detection rows; compute CVSS 9+ subset from filtered_df)
+    _nirm_devs  = not_in_rmm_count
+    _nirm_crit  = 0
+    _nirm_crit_cves = 0
+    if 'Last Response' in filtered_df.columns and score_col and score_col in filtered_df.columns:
+        _nirm_mask     = filtered_df['Last Response'] == 'Not Found in RMM'
+        _nirm_sc       = pd.to_numeric(filtered_df.loc[_nirm_mask, score_col], errors='coerce')
+        _nirm_crit     = int((_nirm_sc >= 9.0).sum())
+        _nirm_crit_cves = int(filtered_df.loc[_nirm_mask & (pd.to_numeric(filtered_df[score_col], errors='coerce') >= 9.0), 'Vulnerability Name'].nunique()) if 'Vulnerability Name' in filtered_df.columns else 0
+    _excl_devs       = _stale_devs + _nirm_devs
+    _excl_crit       = _stale_crit + _nirm_crit
+    _excl_crit_cves  = _stale_crit_cves + _nirm_crit_cves   # note: may overlap; shown as informational
+
+    # ── Key Metrics — 4-column grid: Metric | All | Active | Excluded ───────────
+    # "All" = entire dataset (no stale/NIRM filter), "Active" = triage_df scope,
+    # "Excluded" = stale + not-in-RMM. Active + Excluded = All (exact for rows).
+    _zero_fmt = workbook.add_format({'num_format': '#,##0', 'align': 'center',
+                                     'bg_color': '#E2EFDA', 'border': 1})
+    _excl_hdr = workbook.add_format({'bold': True, 'bg_color': '#F2F2F2',
+                                     'font_color': '#595959', 'border': 1,
+                                     'align': 'center'})
+    _excl_val = workbook.add_format({'num_format': '#,##0', 'align': 'center',
+                                     'bg_color': '#F2F2F2', 'font_color': '#595959',
+                                     'border': 1})
+    _all_hdr  = workbook.add_format({'bold': True, 'bg_color': '#D6E4F0',
+                                     'font_color': '#1F3864', 'border': 1,
+                                     'align': 'center'})
+    _all_val  = workbook.add_format({'num_format': '#,##0', 'align': 'center',
+                                     'bg_color': '#D6E4F0', 'font_color': '#1F3864',
+                                     'border': 1})
+    def _unr_fmt(n): return red_fmt if n > 0 else _zero_fmt
+
+    # Compute "All" totals — the full score-filtered dataset before stale/NIRM removal
+    _all_df = filtered_df.copy() if filtered_df is not None else triage_df.copy()
+    # Add stale rows back in to get true "all" counts
+    if stale_excluded_df is not None and not stale_excluded_df.empty:
+        _all_df = pd.concat([_all_df, stale_excluded_df], ignore_index=True)
+
+    _all_rows   = len(_all_df)
+    _all_cves   = int(_all_df['Vulnerability Name'].nunique()) if 'Vulnerability Name' in _all_df.columns else 0
+    _all_devs   = int(_all_df['Name'].nunique())               if 'Name'               in _all_df.columns else 0
+    _all_sc     = pd.to_numeric(_all_df.get(score_col, pd.Series(dtype=float)), errors='coerce') if score_col else pd.Series(dtype=float)
+    _all_crit   = int((_all_sc >= 9.0).sum())
+    _all_crit_cves = int(_all_df.loc[_all_sc >= 9.0, 'Vulnerability Name'].nunique()) if 'Vulnerability Name' in _all_df.columns else 0
+
+    _excl_rows      = _stale_rows + not_in_rmm_cve_count
+    _excl_devs_tot  = _stale_devs + _nirm_devs
+    _excl_crit_tot  = _stale_crit + _nirm_crit
+    _excl_crit_cves_tot = _stale_crit_cves + _nirm_crit_cves
+
+    row = 3
+    ws.merge_range(row, 0, row, 3, '  Key Metrics', sect_fmt)
+    row += 1
+
+    # Header row
+    ws.write(row, 0, 'Metric',       hdr_fmt)
+    ws.write(row, 1, 'All',          _all_hdr)
+    ws.write(row, 2, 'Active only',  hdr_fmt)
+    ws.write(row, 3, 'Excl. (stale / not in RMM)', _excl_hdr)
+    row += 1
+
+    for metric, all_val, active_val, excl_val, active_fmt in [
+        ('Total detection rows',        _all_rows,          total_rows,     _excl_rows,             val_fmt),
+        ('Unique CVE types',            _all_cves,          unique_cves,    0,                      val_fmt),   # CVEs overlap — excl shown as n/a
+        ('Unique devices',              _all_devs,          unique_devices, _excl_devs_tot,         val_fmt),
+        ('Detections at CVSS 9.0+',    _all_crit,          crit_rows,      _excl_crit_tot,         red_fmt if crit_rows else val_fmt),
+        ('Unique CVEs at CVSS 9.0+',   _all_crit_cves,     crit_cves,      0,                      red_fmt if crit_cves else val_fmt),   # overlap
+    ]:
+        ws.write(row, 0, metric,      lbl_fmt)
+        ws.write(row, 1, all_val,     _all_val)
+        ws.write(row, 2, active_val,  active_fmt)
+        ws.write(row, 3, excl_val if excl_val else '—',  _excl_val)
+        row += 1
+
+    ws.merge_range(row, 0, row, 3,
+                   '\u2139  All = full dataset at CVSS \u2265 threshold.  '
+                   'Active = excludes stale (\u226530 days without response) and devices not found in RMM.  '
+                   'Active + Excluded = All for row counts and device counts.  '
+                   'Unique CVE type counts may overlap between active and excluded devices (shown as \u2014).  '
+                   '\u26a0  Unique device counts may appear lower than detection totals: a device running '
+                   'Chrome, Edge and Firefox appears once per product sheet but counts as one unique device.',
+                   note_fmt)
+    ws.set_row(row, 54)
+    row += 2
+    # Build COUNTIF formula strings — these make both tables live when ☐/☑ are toggled
+    _p2s = product_to_sheet or {}
+    if _p2s:
+        # Row A = Resolved checkbox, col C = Name, col D = Device Type (0-indexed → A,C,D)
+        _f_res   = ' + '.join([f"COUNTIF('{s}'!A:A,\"☑\")" for s in _p2s.values()])
+        _f_unres = ' + '.join([f"COUNTIF('{s}'!A:A,\"☐\")" for s in _p2s.values()])
+        # Total = ☑ + ☐ only — COUNTA overcounts due to legend/header rows in each sheet
+        _f_total = f'({_f_res}) + ({_f_unres})'
+        # Device type unresolved: count rows where Resolved=☐ AND DevType matches
+        _f_srv_unr = None   # device unique-count across sheets needs SUMPRODUCT — kept static
+        _f_wks_unr = None
+        _f_srv_all = None
+        _f_wks_all = None
+        _live = True
+    else:
+        _live = False
+
+    _live_fmt  = workbook.add_format({'num_format': '#,##0', 'align': 'center',
+                                      'bg_color': '#EBF3FB', 'border': 1,
+                                      'font_color': '#1F3864'})  # blue tint = live formula cell
+    _live_pct  = workbook.add_format({'num_format': '0%',   'align': 'center',
+                                      'bg_color': '#EBF3FB', 'border': 1,
+                                      'font_color': '#1F3864'})
+    _live_note = '\u26a1 Blue cells update automatically when ☑/☐ are toggled in product sheets.'
+
+    def _write_val(r, c, formula, static, fmt):
+        """Write a live formula if available, otherwise static value."""
+        if _live and formula:
+            ws.write_formula(r, c, f'={formula}', fmt, static)
+        else:
+            ws.write(r, c, static, fmt)
+
+    # ── Resolution Status (active devices only) — LIVE ──────────────────────────
+    row += 1
+    ws.merge_range(row, 0, row, 3, '  Resolution Status  (active devices only)', sect_fmt); row += 1
+    ws.write(row, 0, 'Status',          hdr_fmt)
+    ws.write(row, 1, 'Detection Rows',  hdr_fmt)
+    ws.write(row, 2, '% of Total',      hdr_fmt)
+    ws.write(row, 3, 'Unique CVE Types (at generation)', hdr_fmt)
+    row += 1
+
+    _rr  = int(_is_res.sum()); _ur = int(_is_unr.sum()); _tot = _rr + _ur
+    _rc  = int(triage_dedup.loc[_is_res, 'Vulnerability Name'].nunique()) if 'Vulnerability Name' in triage_dedup.columns else 0
+    _uc  = int(triage_dedup.loc[_is_unr, 'Vulnerability Name'].nunique()) if 'Vulnerability Name' in triage_dedup.columns else 0
+
+    res_row = row
+    ws.write(row, 0, 'Resolved',   lbl_fmt)
+    _write_val(row, 1, _f_res,   _rr,  grn_fmt)
+    # % = resolved / total — live
+    if _live:
+        ws.write_formula(row, 2, f'=IF({_f_total}>0,({_f_res})/({_f_total}),0)', _live_pct, _rr/_tot if _tot else 0)
+    else:
+        ws.write(row, 2, _rr/_tot if _tot else 0, val_pct)
+    ws.write(row, 3, _rc, grn_fmt)
+    row += 1
+
+    ws.write(row, 0, 'Unresolved', lbl_fmt)
+    _write_val(row, 1, _f_unres, _ur,  red_fmt)
+    if _live:
+        ws.write_formula(row, 2, f'=IF({_f_total}>0,({_f_unres})/({_f_total}),0)', _live_pct, _ur/_tot if _tot else 0)
+    else:
+        ws.write(row, 2, _ur/_tot if _tot else 0, val_pct)
+    ws.write(row, 3, _uc, red_fmt)
+    row += 1
+
+    ws.write(row, 0, 'Total', lbl_fmt)
+    _write_val(row, 1, _f_total, _tot, val_fmt)
+    ws.write(row, 2, 1.0, val_pct)
+    ws.write(row, 3, triage_dedup['Vulnerability Name'].nunique() if 'Vulnerability Name' in triage_dedup.columns else 0, val_fmt)
+    row += 1
+
+    ws.merge_range(row, 0, row, 3,
+                   f'\u2139  {_live_note}  '
+                   f'Unique CVE Type counts are fixed at report generation — they do not update live.',
+                   note_fmt)
+    ws.set_row(row, 36); row += 2
+
+    # ── Device Breakdown (active scope) — unique device counts ───────────────────
+    ws.merge_range(row, 0, row, 3,
+                   '  Device Breakdown  (active scope \u2014 unique devices, CVE \u2265 threshold)',
+                   sect_fmt)
+    row += 1
+    ws.write(row, 0, 'Type',                             hdr_fmt)
+    ws.write(row, 1, 'Unique devices',                   hdr_fmt)
+    ws.write(row, 2, 'Devices with unresolved CVEs',     hdr_fmt)
+    ws.write(row, 3, 'Stale devices (excluded)',         hdr_fmt)
+    row += 1
+
+    ws.write(row, 0, 'Servers',      lbl_fmt)
+    ws.write(row, 1, srv_total,      val_fmt)
+    ws.write(row, 2, srv_unpatch,    red_fmt if srv_unpatch else _zero_fmt)
+    ws.write(row, 3, _stale_srv,     wf_mval if _stale_srv else val_fmt)
+    row += 1
+
+    ws.write(row, 0, 'Workstations', lbl_fmt)
+    ws.write(row, 1, wks_total,      val_fmt)
+    ws.write(row, 2, wks_unres,      red_fmt if wks_unres else _zero_fmt)
+    ws.write(row, 3, _stale_wks,     wf_mval if _stale_wks else val_fmt)
+    row += 1
+
+    ws.merge_range(row, 0, row, 3,
+                   '\u2139  Counts are unique devices — a device with Chrome, Edge and Firefox counts as one device.  '
+                   '"Devices with unresolved CVEs" = at least one detection still marked \u2610 across any product.  '
+                   '"Stale devices (excluded)" = inactive \u226530 days, moved to Stale Excluded Devices sheet.  '
+                   'All counts fixed at report generation.',
+                   note_fmt)
+    ws.set_row(row, 42); row += 2
+
+    # Data Filtering Reconciliation waterfall — reuses _stale_* and _nirm_* computed above
     _stale_cves = int(stale_excluded_df['Vulnerability Name'].nunique()) if stale_excluded_df is not None and not stale_excluded_df.empty and 'Vulnerability Name' in stale_excluded_df.columns else 0
     _cutoff_lbl = cutoff_date if cutoff_date else 'N/A (all dates included)'
 
@@ -1508,25 +1726,26 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     _t_devs = int(_combined['Name'].nunique())               if 'Name'               in _combined.columns else 0
     _t_cves = int(_combined['Vulnerability Name'].nunique()) if 'Vulnerability Name' in _combined.columns else 0
 
-    row+=1
-    ws.merge_range(row,0,row,3,f'  Data Filtering Reconciliation  (CVSS \u2265 {threshold})',sect_fmt); row+=1
-    ws.write(row,0,'Filter Step',hdr_fmt); ws.write(row,1,'Unique Devices',hdr_fmt)
-    ws.write(row,2,'Detection Rows',hdr_fmt); ws.write(row,3,'Unique CVE Types',hdr_fmt); row+=1
-    ws.write(row,0,'[+]  Total raw detections (all devices, CVSS \u2265 threshold)',wf_plus)
-    ws.write(row,1,_t_devs,val_fmt); ws.write(row,2,_t_rows,val_fmt); ws.write(row,3,_t_cves,val_fmt); row+=1
-    if _stale_rows>0:
-        ws.write(row,0,f'[-]  Excluded: stale devices  (Last Response before {_cutoff_lbl})',wf_minus)
-        ws.write(row,1,_stale_devs,wf_mval); ws.write(row,2,_stale_rows,wf_mval); ws.write(row,3,_stale_cves,wf_mval); row+=1
-    if not_in_rmm_count>0:
-        ws.write(row,0,'[-]  Excluded: device not found in RMM',wf_minus)
-        ws.write(row,1,not_in_rmm_count,wf_mval); ws.write(row,2,not_in_rmm_cve_count,wf_mval); ws.write(row,3,not_in_rmm_unique_cves,wf_mval); row+=1
-    ws.write(row,0,'[=]  Active tracked scope  (Key Metrics above)',wf_eq_lbl)
-    ws.write(row,1,unique_devices,wf_eq_val); ws.write(row,2,total_rows,wf_eq_val); ws.write(row,3,unique_cves,wf_eq_val); row+=1
-    ws.merge_range(row,0,row,3,
+    row += 1
+    ws.merge_range(row, 0, row, 3, f'  Data Filtering Reconciliation  (CVSS \u2265 {threshold})', sect_fmt); row += 1
+    ws.write(row, 0, 'Filter Step',      hdr_fmt); ws.write(row, 1, 'Unique Devices', hdr_fmt)
+    ws.write(row, 2, 'Detection Rows',   hdr_fmt); ws.write(row, 3, 'Unique CVE Types', hdr_fmt); row += 1
+    ws.write(row, 0, '[+]  Total raw detections (all devices, CVSS \u2265 threshold)', wf_plus)
+    ws.write(row, 1, _t_devs, val_fmt); ws.write(row, 2, _t_rows, val_fmt); ws.write(row, 3, _t_cves, val_fmt); row += 1
+    if _stale_rows > 0:
+        ws.write(row, 0, f'[-]  Excluded: stale devices  (last seen before {_cutoff_lbl} OR \u226530 days without response)', wf_minus)
+        ws.write(row, 1, _stale_devs, wf_mval); ws.write(row, 2, _stale_rows, wf_mval); ws.write(row, 3, _stale_cves, wf_mval); row += 1
+    if not_in_rmm_count > 0:
+        ws.write(row, 0, '[-]  Excluded: device not found in RMM', wf_minus)
+        ws.write(row, 1, not_in_rmm_count, wf_mval); ws.write(row, 2, not_in_rmm_cve_count, wf_mval); ws.write(row, 3, not_in_rmm_unique_cves, wf_mval); row += 1
+    ws.write(row, 0, '[=]  Active tracked scope  (Key Metrics above)', wf_eq_lbl)
+    ws.write(row, 1, unique_devices, wf_eq_val); ws.write(row, 2, total_rows, wf_eq_val); ws.write(row, 3, unique_cves, wf_eq_val); row += 1
+    ws.merge_range(row, 0, row, 3,
                    '\u2139  Row counts subtract precisely. Unique Device and CVE Type counts may not subtract '
                    'perfectly \u2014 a CVE type on both an excluded and an active device is counted in both groups. '
-                   'Stale devices are listed in the "Stale Excluded Devices" sheet.',note_fmt)
-    ws.set_row(row,42); row+=1
+                   'Stale devices are listed in the "Stale Excluded Devices" sheet.',
+                   note_fmt)
+    ws.set_row(row, 42); row += 1
 
     # ── Top At-Risk Devices ──────────────────────────────────────────────────────
     # Priority: 1) every server with ≥1 unresolved CVE  2) any device with a
@@ -1676,40 +1895,50 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     row+=1
     ws.write(row,0,'\u2139  All Key Metrics exclude stale devices and devices not found in RMM. '
                    'See the reconciliation table above for the full filtering breakdown.',note_fmt)
+    row += 2
 
-    # Charts
-    if score_split_data and len(score_split_data)>=2:
-        pie=workbook.add_chart({'type':'pie'})
-        pie.add_series({'name':'Detection Rows',
-                        'categories':['Client Summary',score_split_start,0,score_split_end,0],
-                        'values':    ['Client Summary',score_split_start,1,score_split_end,1],
-                        'data_labels':{'percentage':True,'category':True,'font':{'size':9}}})
-        pie.set_title({'name':'Vulnerability Distribution by CVSS Score'}); pie.set_style(10)
-        pie.set_size({'width':380,'height':260}); ws.insert_chart('F4',pie,{'x_offset':5,'y_offset':5})
-        bar=workbook.add_chart({'type':'bar'})
-        bar.add_series({'name':'Detection Rows',
-                        'categories':['Client Summary',score_split_start,0,score_split_end,0],
-                        'values':    ['Client Summary',score_split_start,1,score_split_end,1],
-                        'fill':{'color':'#2E75B6'},'data_labels':{'value':True,'font':{'size':9}}})
-        bar.add_series({'name':'Unique CVEs',
-                        'categories':['Client Summary',score_split_start,0,score_split_end,0],
-                        'values':    ['Client Summary',score_split_start,3,score_split_end,3],
-                        'fill':{'color':'#ED7D31'},'data_labels':{'value':True,'font':{'size':9}}})
-        bar.set_title({'name':'Patching Effort by CVSS Score'}); bar.set_x_axis({'name':'Count'})
-        bar.set_y_axis({'name':'CVSS Score'}); bar.set_legend({'position':'bottom'}); bar.set_style(10)
-        bar.set_size({'width':380,'height':260}); ws.insert_chart('F20',bar,{'x_offset':5,'y_offset':5})
-    if trend_data and mom_data and mom_start_row is not None:
-        mcs=mom_start_row+1; mce=mcs+len(mom_data)-1
-        mb=workbook.add_chart({'type':'bar'})
-        mb.add_series({'name':'Count',
-                       'categories':['Client Summary',mcs,0,mce,0],
-                       'values':    ['Client Summary',mcs,1,mce,1],
-                       'fill':{'color':'#375623'},'data_labels':{'value':True,'font':{'size':9}}})
-        mb.set_title({'name':'Month-over-Month Patching Progress'}); mb.set_x_axis({'name':'Count'})
-        mb.set_legend({'none':True}); mb.set_style(10)
-        mb.set_size({'width':380,'height':260}); ws.insert_chart('F36',mb,{'x_offset':5,'y_offset':5})
+    # ── Top 10 Products (Score 9.0+) ────────────────────────────────────────────
+    ws.merge_range(row, 0, row, 3, f'  Top 10 Products  (Score {threshold}+, active devices only)', sect_fmt)
+    row += 1
+    ws.write(row, 0, 'Product',          hdr_fmt)
+    ws.write(row, 1, 'Devices affected', hdr_fmt)
+    ws.write(row, 2, 'Unique CVEs',      hdr_fmt)
+    ws.write(row, 3, 'Detections',       hdr_fmt)
+    row += 1
 
-    log.debug("Client Summary sheet written")
+    _p2s = product_to_sheet or {}
+    if 'Base Product' in triage_df.columns:
+        _prod_grp = (
+            triage_df.groupby('Base Product')
+            .agg(devices=('Name', 'nunique'),
+                 cves=('Vulnerability Name', 'nunique'),
+                 detections=('Vulnerability Name', 'count'))
+            .sort_values('devices', ascending=False)
+            .head(10)
+        )
+        _link_fmt_prod = workbook.add_format({'font_color': '#0563C1', 'underline': True,
+                                              'border': 1, 'bg_color': '#FFFFFF'})
+        for prod, pr in _prod_grp.iterrows():
+            sheet = _p2s.get(prod)
+            if sheet:
+                ws.write_url(row, 0, f"internal:'{sheet}'!A1",
+                             _link_fmt_prod, string=str(prod))
+            else:
+                ws.write(row, 0, str(prod), lbl_fmt)
+            ws.write(row, 1, int(pr['devices']),    val_fmt)
+            ws.write(row, 2, int(pr['cves']),        val_fmt)
+            ws.write(row, 3, int(pr['detections']),  val_fmt)
+            row += 1
+    else:
+        ws.merge_range(row, 0, row, 3, 'Base Product column not available.', note_fmt)
+        row += 1
+    ws.merge_range(row, 0, row, 3,
+                   '\u2139  Product names are hyperlinked to their triage sheet. '
+                   'Counts are for active devices only (stale/not-in-RMM excluded).',
+                   note_fmt)
+    ws.set_row(row, 30)
+
+    log.debug("Summary sheet written")
 
 
 def build_raw_data_sheet(writer, raw_df):

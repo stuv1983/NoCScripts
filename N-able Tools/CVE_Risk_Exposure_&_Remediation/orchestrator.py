@@ -35,7 +35,7 @@ from excel_builder import (
     get_workbook_styles,
     build_client_summary_sheet,
     build_trend_summary_sheet, build_trend_detail_sheets,
-    build_overview_sheet, build_all_detections_sheet,
+    build_all_detections_sheet,
     build_product_sheets, build_stale_excluded_sheet,
     build_stale_cves_sheet,
     build_raw_data_sheet, build_patch_sheets, build_diagnostics_sheets,
@@ -311,11 +311,9 @@ def run(request: DashboardRequest) -> DashboardResult:
         )
 
         report_month_val = request.report_month if request.report_month else datetime.now().strftime('%B %Y')
-        report_month_name = report_month_val.split()[0] if ' ' in report_month_val else report_month_val
-        overview_sheet_name = f"{report_month_name} Detections"
-        
+
         reserved = {
-            "cves on stale devices", 'trend summary', overview_sheet_name.lower(), 'all detections', 'raw data',
+            "cves on stale devices", 'trend summary', 'all detections', 'raw data',
             'stale excluded devices', 'new this month', 'resolved', 'persisting cves',
             'patch match overview', 'patch match full data', 'patch report (full)',
             'patch confirmed', 'resolved (patch confirmed)',
@@ -511,28 +509,12 @@ def run(request: DashboardRequest) -> DashboardResult:
                 report_month=report_month_val,
                 approaching_stale_names=approaching_stale_names,
                 stale_warning_days=request.stale_warning_days,
+                product_to_sheet=product_to_sheet,
             )
             if trend_data:
                 build_trend_summary_sheet(wb, trend_data, request.threshold,
                                           prev_report_name, header_fmt,
                                           customer_name=customer_name)
-
-            build_overview_sheet(
-                wb, merged_df, filtered_df, triage_df, request.threshold,
-                product_to_sheet, header_fmt, link_fmt,
-                customer_name=customer_name,
-                patch_confirmed_count=patch_confirmed_count,
-                redetected_count=redetected_count,
-                sheet_name=overview_sheet_name,
-                trend_metrics=trend_data['metrics'] if trend_data else None,
-                evidence_summary=diagnostics.get('evidence_summary'),
-                recommended_actions=diagnostics.get('recommended_actions'),
-                has_prev_report=trend_data is not None,
-                stale_excluded_df=stale_excluded if not stale_excluded.empty else None,
-                report_month=report_month_val,
-                approaching_stale_names=approaching_stale_names,
-                stale_warning_days=request.stale_warning_days,
-            )
 
             if trend_data:
                 build_trend_detail_sheets(writer, wb, trend_data, link_fmt,
