@@ -45,7 +45,7 @@ def get_workbook_styles(wb) -> dict:
         'row_red':      wb.add_format({'bg_color': '#FCE4D6'}),
         'row_green':    wb.add_format({'bg_color': '#E2EFDA'}),
         'row_amber':    wb.add_format({'bg_color': '#FFF2CC'}),
-        'row_blue':     wb.add_format({'bg_color': '#DEEAF1'}),
+        'row_blue':     wb.add_format({'bg_color': '#BDD7EE', 'font_color': '#1F3864'}),  # deeper blue — resolved/confirmed
         'row_pink':     wb.add_format({'bg_color': '#F2CEEF'}),
         'row_teal':     wb.add_format({'bg_color': '#D9F0F4'}), 
         'row_missing':  wb.add_format({'bg_color': '#FFC7CE', 'font_color': '#9C0006'}),
@@ -795,7 +795,7 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
         _last = len(group)   # last data row (1-indexed)
         _TRUE_VALS = {'yes', 'true', '1', 'y'}
 
-        unresolved_fmt = wb_.add_format({'bg_color': '#FFE7E7'})  # light pink — unresolved, needs action
+        unresolved_fmt = wb_.add_format({'bg_color': '#FFCCCC', 'font_color': '#8B0000'})  # coral red — unresolved, clearly distinct from blue
 
         # ── Bulk colouring via conditional_format (Excel XML — no Python loop needed) ──
         # Rules are evaluated in the order added — first added = highest priority in Excel.
@@ -871,14 +871,14 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
         l_cell  = wb_.add_format({'font_size': 9, 'border': 1})
 
         legend_entries = [
-            ('#DEEAF1', 'blue row',   'Patch via RMM — install confirmed after CVE first detected'),
+            ('#BDD7EE', 'blue row',   'Patch via RMM — install confirmed after CVE first detected'),
             ('#FFE0CC', 'orange row', 'Known active exploit — unresolved, prioritise immediately'),
             ('#FFF3E0', 'amber-orange row', f'Approaching stale — device offline \u2265 {stale_warning_days}d; patch confirmation unreliable (overrides blue)'),
             ('#FFF2CC', 'yellow row', 'Coverage gap — device not in patch report'),
             ('#FCE4D6', 'peach row',  'Unmanaged app — product not tracked in patch report'),
             ('#F2CEEF', 'pink row',   'Detection mismatch — CVE detected but no matching patch found'),
             ('#D9F0F4', 'teal row',   'Patch installing — patch is in progress, re-check after next RMM sync'),
-            ('#FFE7E7', 'pink row',   'Unresolved — patch available but not yet applied'),
+            ('#FFCCCC', 'red row',    'Unresolved — patch not yet applied'),
         ]
         ws.write(legend_row + len(legend_entries) + 2, 0,
                  'ℹ  Baseline Compliance column: shows whether the installed version meets the '
@@ -905,7 +905,7 @@ def build_diagnostics_sheets(writer, diagnostics: dict) -> None:
         'No patch evidence':             '#FFF2CC',
         'Product not tracked':           '#FFF2CC',
         'No patch baseline defined':     '#FFF2CC',
-        'Installed but version unknown': '#DEEAF1',
+        'Installed but version unknown': '#BDD7EE',
     }
 
     rc_df = diagnostics.get('root_cause_df', pd.DataFrame())
