@@ -795,14 +795,24 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
         _last = len(group)   # last data row (1-indexed)
         _TRUE_VALS = {'yes', 'true', '1', 'y'}
 
+        unresolved_fmt = wb_.add_format({'bg_color': '#FFE7E7'})  # light pink — unresolved, needs action
+
         # ── Bulk colouring via conditional_format (Excel XML — no Python loop needed) ──
-        # Priority 1: Resolved (☑ in col A) → blue.  Covers the majority of rows.
+        # Rules are evaluated in the order added — first added = highest priority in Excel.
+        # Priority 1: Resolved (☑ in col A) → blue.
         ws.conditional_format(1, 0, _last, len(cl) - 1, {
             'type':     'formula',
             'criteria': '=$A1="☑"',
             'format':   patch_res_fmt,
         })
-        # Priority 2: Known exploit → orange.  Has Known Exploit col value is in the sheet.
+        # Priority 2: Unresolved (☐ in col A) → light red. Makes unresolved rows
+        # immediately visible against the blue resolved rows.
+        ws.conditional_format(1, 0, _last, len(cl) - 1, {
+            'type':     'formula',
+            'criteria': '=$A1="☐"',
+            'format':   unresolved_fmt,
+        })
+        # Priority 3: Known exploit → darker orange (overrides unresolved red).
         _exp_col = 'Has Known Exploit'
         if _exp_col in cl:
             _ec = chr(ord('A') + cl.index(_exp_col))
@@ -868,7 +878,7 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
             ('#FCE4D6', 'peach row',  'Unmanaged app — product not tracked in patch report'),
             ('#F2CEEF', 'pink row',   'Detection mismatch — CVE detected but no matching patch found'),
             ('#D9F0F4', 'teal row',   'Patch installing — patch is in progress, re-check after next RMM sync'),
-            ('#FFFFFF', 'white row',  'Unresolved — patch available but not yet applied'),
+            ('#FFE7E7', 'pink row',   'Unresolved — patch available but not yet applied'),
         ]
         ws.write(legend_row + len(legend_entries) + 2, 0,
                  'ℹ  Baseline Compliance column: shows whether the installed version meets the '
@@ -1536,8 +1546,16 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
 
     _sc = ('Threat Status' if 'Threat Status' in triage_dedup.columns
            else 'Status'   if 'Status'        in triage_dedup.columns else None)
-    _is_res = (triage_dedup[_sc].astype(str).str.strip().str.upper() == 'RESOLVED'
-               if _sc else pd.Series([False] * len(triage_dedup), index=triage_dedup.index))
+    _approaching_set = approaching_stale_names or set()
+    # Mirror the _resolved_value logic used in product sheets:
+    # approaching-stale devices are forced to ☐ (unresolved) regardless of Threat Status,
+    # because we cannot confirm a patch applied if the device hasn't checked in.
+    _is_approaching_row = (triage_dedup['Name'].isin(_approaching_set)
+                           if 'Name' in triage_dedup.columns
+                           else pd.Series([False] * len(triage_dedup), index=triage_dedup.index))
+    _raw_resolved = (triage_dedup[_sc].astype(str).str.strip().str.upper() == 'RESOLVED'
+                     if _sc else pd.Series([False] * len(triage_dedup), index=triage_dedup.index))
+    _is_res = _raw_resolved & ~_is_approaching_row   # approaching rows always count as unresolved
     _is_unr = ~_is_res
 
     total_rows     = len(triage_dedup)

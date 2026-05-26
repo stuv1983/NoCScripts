@@ -226,10 +226,6 @@ def run(request: DashboardRequest) -> DashboardResult:
             ].copy()
 
             # ── Pass 2: days-stale (last seen after cutoff but >= 30 days ago) ──
-            # These devices pass the date filter because their Last Response is
-            # after the cutoff, but they are clearly inactive by the 30-day rule.
-            # e.g. GP5CG1210RQ0: Last Response = 3/19/26 (after Mar 1 cutoff)
-            #      but Days Since Last Response = 68 → stale.
             if 'Days Since Last Response' in merged_df.columns:
                 _days_col = pd.to_numeric(merged_df['Days Since Last Response'], errors='coerce')
                 stale_names_by_days = set(
@@ -245,7 +241,7 @@ def run(request: DashboardRequest) -> DashboardResult:
             stale_by_days_df = high[
                 high['Name'].isin(stale_names_by_days) &
                 (high['Last Response'] != 'Not Found in RMM') &
-                ~high['Name'].isin(set(stale_by_date['Name'].unique()))  # no double-count
+                ~high['Name'].isin(set(stale_by_date['Name'].unique()))
             ].copy()
 
             stale_excluded = pd.concat([stale_by_date, stale_by_days_df], ignore_index=True)
@@ -257,29 +253,33 @@ def run(request: DashboardRequest) -> DashboardResult:
                 (merged_df['Last Response'] == 'Not Found in RMM')
             ]
 
-            # ── Approaching stale: devices offline >= warning_days but not yet stale ──
-            # warning_days is an absolute threshold — flag any device that hasn't
-            # responded in >= warning_days days (e.g. 7 days = hasn't been seen in a week).
-            warning_days = max(1, int(request.stale_warning_days))
-            if 'Days Since Last Response' in merged_df.columns:
-                _days_col2   = pd.to_numeric(merged_df['Days Since Last Response'], errors='coerce')
-                _active_mask = merged_df['Last Response'] != 'Not Found in RMM'
-                approaching_stale_names = set(
-                    merged_df.loc[
-                        _active_mask & (_days_col2 >= warning_days),
-                        'Name'
-                    ].unique()
-                )
-
             log.info(
                 "Date filter applied (>= %s): %d rows kept, "
-                "%d stale excluded (%d by date-filter, %d by %d-day rule), "
-                "%d device(s) flagged (offline >= %d days)",
+                "%d stale excluded (%d by date-filter, %d by %d-day rule)",
                 request.cutoff_date, len(merged_df),
                 len(all_stale_names), len(stale_by_date['Name'].unique()),
                 len(stale_names_by_days - set(stale_by_date['Name'].unique())),
-                _STALE_DAYS, len(approaching_stale_names), warning_days,
+                _STALE_DAYS,
             )
+
+        # ── Approaching stale: always computed — independent of cutoff_date ────
+        # Any active device offline >= warning_days is flagged orange and treated
+        # as unresolved (patch cannot be confirmed if device hasn't checked in).
+        # This runs whether or not a date filter is active.
+        warning_days = max(1, int(request.stale_warning_days))
+        if 'Days Since Last Response' in merged_df.columns:
+            _days_col_ap  = pd.to_numeric(merged_df['Days Since Last Response'], errors='coerce')
+            _active_mask  = merged_df['Last Response'] != 'Not Found in RMM'
+            approaching_stale_names = set(
+                merged_df.loc[
+                    _active_mask & (_days_col_ap >= warning_days),
+                    'Name'
+                ].unique()
+            )
+        log.info(
+            "%d device(s) flagged as approaching stale (offline >= %d days)",
+            len(approaching_stale_names), warning_days,
+        )
 
         if merged_df.empty:
             msg = (
