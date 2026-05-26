@@ -444,12 +444,36 @@ def run(request: DashboardRequest) -> DashboardResult:
             _raw_resolved = merged_df[
                 merged_df[_status_col_inj].astype(str).str.strip().str.upper() == 'RESOLVED'
             ].copy()
+            _raw_unresolved = merged_df[
+                merged_df[_status_col_inj].astype(str).str.strip().str.upper() == 'UNRESOLVED'
+            ].copy()
             if not _raw_resolved.empty:
                 _raw_pairs = set(zip(
                     _raw_resolved['Name'].apply(normalize_device_name),
                     _raw_resolved['Vulnerability Name'].apply(extract_cve_id),
                     _raw_resolved['Affected Products'].astype(str).apply(_dp_detect_raw),
                 ))
+                # Remove any (name, cve, product) that also appears as UNRESOLVED in raw.
+                # Raw data is source of truth: if a row exists with UNRESOLVED for the
+                # same (device, CVE, product), the CVE is not resolved on that device
+                # regardless of whether another row for the same combination shows RESOLVED.
+                # This handles the Chromium pattern where the same CVE can appear as both
+                # RESOLVED (one browser version) and UNRESOLVED (another) for the same device.
+                if not _raw_unresolved.empty:
+                    _unresolved_pairs = set(zip(
+                        _raw_unresolved['Name'].apply(normalize_device_name),
+                        _raw_unresolved['Vulnerability Name'].apply(extract_cve_id),
+                        _raw_unresolved['Affected Products'].astype(str).apply(_dp_detect_raw),
+                    ))
+                    _conflict_count = len(_raw_pairs & _unresolved_pairs)
+                    _raw_pairs -= _unresolved_pairs   # UNRESOLVED wins over RESOLVED
+                    if _conflict_count:
+                        log.info(
+                            "Raw injection: removed %d conflicting pair(s) where same "
+                            "(device, CVE, product) has both RESOLVED and UNRESOLVED rows — "
+                            "treating as UNRESOLVED (raw data is source of truth)",
+                            _conflict_count,
+                        )
                 _before = len(patch_resolved_pairs)
                 patch_resolved_pairs |= _raw_pairs
                 log.info("Raw RESOLVED injection: %d pair(s) added (%d already present)",
