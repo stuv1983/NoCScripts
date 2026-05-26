@@ -261,7 +261,9 @@ def build_overview_sheet(workbook, merged_df, filtered_df, triage_df, threshold,
                           recommended_actions: Optional[list] = None,
                           has_prev_report: bool = False,
                           stale_excluded_df: Optional[pd.DataFrame] = None,
-                          report_month: str = ''):
+                          report_month: str = '',
+                          approaching_stale_names: Optional[Set[str]] = None,
+                          stale_warning_days: int = 14):
     ws = workbook.add_worksheet(sheet_name)
     if not report_month:
         report_month = datetime.now().strftime("%B %Y")
@@ -713,11 +715,15 @@ def build_all_detections_sheet(writer, merged_df, link_fmt, missing_row_fmt):
 
 def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
                           patch_resolved_pairs=None,
-                          patch_gap_pairs: Optional[Dict[Tuple[str, str], str]] = None):
+                          patch_gap_pairs: Optional[Dict[Tuple[str, str], str]] = None,
+                          approaching_stale_names: Optional[Set[str]] = None,
+                          stale_warning_days: int = 14):
     if patch_resolved_pairs is None:
         patch_resolved_pairs = set()
     if patch_gap_pairs is None:
         patch_gap_pairs = {}
+    if approaching_stale_names is None:
+        approaching_stale_names = set()
 
     cols_order = ['Resolved', 'Vulnerability Name', 'Name', 'Device Type',
                   'Vulnerability Severity', 'Vulnerability Score', 'Risk Severity Index',
@@ -766,6 +772,7 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
         unmanaged_fmt     = styles_['row_red']
         mismatch_fmt      = styles_['row_pink']
         installing_fmt    = styles_['row_teal']
+        approaching_fmt   = wb_.add_format({'bg_color': '#FFF3E0', 'font_color': '#7B3F00'})  # orange-tinted — approaching stale
 
         _GAP_FMTS = {
             'coverage_gap':        coverage_fmt,
@@ -790,10 +797,14 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
                     and len(next(iter(patch_resolved_pairs))) == 2
                     and (nk, ck) in patch_resolved_pairs)
             )
+            _device_name = str(row.get('Name', ''))
             if _is_resolved:
                 ws.set_row(row_i, None, patch_res_fmt)
             elif str(row.get('Has Known Exploit', '')).strip().lower() in _TRUE_VALS:
                 ws.set_row(row_i, None, exploit_fmt)
+            elif _device_name in approaching_stale_names:
+                gap = patch_gap_pairs.get((nk, ck))
+                ws.set_row(row_i, None, _GAP_FMTS.get(gap, approaching_fmt) if gap and gap in _GAP_FMTS else approaching_fmt)
             else:
                 gap = patch_gap_pairs.get((nk, ck))
                 if gap and gap in _GAP_FMTS:
@@ -818,6 +829,7 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
         legend_entries = [
             ('#DEEAF1', 'blue row',   'Patch via RMM — install confirmed after CVE first detected'),
             ('#FFE0CC', 'orange row', 'Known active exploit — unresolved, prioritise immediately'),
+            ('#FFF3E0', 'amber-orange row', f'Stale / approaching stale — last seen within {stale_warning_days}d of (or past) the 30-day threshold'),
             ('#FFF2CC', 'yellow row', 'Coverage gap — device not in patch report'),
             ('#FCE4D6', 'peach row',  'Unmanaged app — product not tracked in patch report'),
             ('#F2CEEF', 'pink row',   'Detection mismatch — CVE detected but no matching patch found'),
@@ -1264,20 +1276,16 @@ def build_stale_excluded_sheet(writer, stale_df, not_in_rmm_df=None) -> None:
     for ci, h in enumerate(headers):
         ws.write(0, ci, h, hdr_fmt)
 
-    # Data rows
-    for ri, row in enumerate(combined.itertuples(index=False), start=1):
-        _reason = str(row[-1]) if hasattr(row, '_fields') else ''
+    # Data rows — use positional access to avoid itertuples mangling column names with spaces
+    col_positions = {col: i for i, col in enumerate(combined.columns)}
+    for ri, row_vals in enumerate(combined.values.tolist(), start=1):
+        _reason = str(row_vals[col_positions['Reason']]) if 'Reason' in col_positions else ''
         _fmt = row_nirm if 'Not Found' in _reason else row_stale
         for ci, h in enumerate(headers):
-            col_map = {'Device Name': 'Device Name', 'Username': 'Username',
-                       'Last Response': 'Last Response',
-                       'Days Since Last Response': 'Days Since Last Response',
-                       'Device Type': 'Device Type', 'Reason': 'Reason'}
-            try:
-                val = getattr(row, col_map[h].replace(' ', '_').replace('(', '').replace(')', ''))
-            except AttributeError:
-                val = ''
-            ws.write(ri, ci, str(val) if val is not None and not (isinstance(val, float) and pd.isna(val)) else '', _fmt)
+            src_col = h  # headers align with combined columns (Device Name, Username, etc.)
+            pos = col_positions.get(src_col)
+            val = row_vals[pos] if pos is not None else ''
+            ws.write(ri, ci, str(val) if val is not None and not (isinstance(val, float) and (val != val)) else '', _fmt)
 
     # Autofilter on header row
     ws.autofilter(0, 0, len(combined), len(headers) - 1)
@@ -1392,7 +1400,9 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
                                cutoff_date=None, stale_excluded_df=None,
                                not_in_rmm_count=0, not_in_rmm_cve_count=0,
                                not_in_rmm_unique_cves=0,
-                               report_month=''):
+                               report_month='',
+                               approaching_stale_names: Optional[Set[str]] = None,
+                               stale_warning_days: int = 14):
     """
     Client Summary sheet.
 
@@ -1581,24 +1591,42 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
                     _seen.add(_r.Name); _top.append(_r)
                 if len(_top) >= 10: break
 
+            _approaching = approaching_stale_names or set()
+            _td_approach   = workbook.add_format({'border': 1, 'bg_color': '#FFF3E0', 'font_color': '#7B3F00'})
+            _td_approach_r = workbook.add_format({'border': 1, 'bg_color': '#FFF3E0', 'font_color': '#7B3F00',
+                                                   'align': 'right', 'num_format': '#,##0'})
+
             for _r in _top:
-                _srv = 'server' in str(_r.device_type).lower()
-                _exp = str(_r.has_exploit).strip().lower() == 'yes'
-                _bf  = _td_exp   if _exp else (_td_srv   if _srv else _td)
-                _nf  = _td_exp_r if _exp else (_td_srv_r if _srv else _td_r)
-                ws.write(row, 0, str(_r.Name),        _bf)
-                ws.write(row, 1, str(_r.username),    _bf)
-                ws.write(row, 2, int(_r.cve_count),   _nf)
-                ws.write(row, 3, str(_r.has_exploit), _bf)
-                ws.write(row, 4, str(_r.device_type), _bf)
+                _srv        = 'server' in str(_r.device_type).lower()
+                _exp        = str(_r.has_exploit).strip().lower() == 'yes'
+                _near_stale = _r.Name in _approaching
+                if _exp:
+                    _bf, _nf = _td_exp, _td_exp_r
+                elif _near_stale:
+                    _bf, _nf = _td_approach, _td_approach_r
+                elif _srv:
+                    _bf, _nf = _td_srv, _td_srv_r
+                else:
+                    _bf, _nf = _td, _td_r
+                _name_label = f'⚠ {_r.Name}' if _near_stale else str(_r.Name)
+                ws.write(row, 0, _name_label,             _bf)
+                ws.write(row, 1, str(_r.username),        _bf)
+                ws.write(row, 2, int(_r.cve_count),       _nf)
+                ws.write(row, 3, str(_r.has_exploit),     _bf)
+                ws.write(row, 4, str(_r.device_type),     _bf)
                 row += 1
 
+            _approach_note = (
+                f'  🟧 Orange = stale / approaching stale (last seen within {stale_warning_days}d of or past the 30-day threshold — ⚠ prefix on name).  '
+                if _approaching else ''
+            )
             ws.merge_range(row, 0, row, 4,
-                'ℹ  🟡 Amber = Server (always listed if unresolved CVEs exist).  '
-                '🟥 Red = device has CVEs with known exploit.  '
-                'Up to 10 devices shown. Counts are unresolved detections only.',
+                f'ℹ  🟡 Amber = Server (always listed if unresolved CVEs exist).  '
+                f'🟥 Red = device has CVEs with known exploit.  '
+                f'{_approach_note}'
+                f'Up to 10 devices shown. Counts are unresolved detections only.',
                 note_fmt)
-            ws.set_row(row, 36); row += 1
+            ws.set_row(row, 36 if not _approaching else 50); row += 1
         else:
             ws.merge_range(row, 0, row, 4, 'No unresolved CVE data.', note_fmt); row += 1
     else:

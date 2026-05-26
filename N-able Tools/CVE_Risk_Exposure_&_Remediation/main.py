@@ -158,6 +158,16 @@ def process_reports():
             f"Minimum CVE Score must be a number (e.g. 9.0).\nCurrent value: {score_var.get()!r}")
         return
 
+    try:
+        stale_warning_days = int(stale_warning_days_var.get())
+        if stale_warning_days < 1:
+            raise ValueError
+    except ValueError:
+        messagebox.showerror("Error",
+            f"Approaching-stale warning must be a whole number ≥ 1 (e.g. 14).\n"
+            f"Current value: {stale_warning_days_var.get()!r}")
+        return
+
     if not show_all_dates_var.get() and date_var.get().strip():
         # date_var is always set by the calendar picker, so format is guaranteed valid.
         # This guard is kept only for safety in case date_var is seeded programmatically.
@@ -195,6 +205,7 @@ def process_reports():
         show_all_dates         = show_all_dates_var.get(),
         sync_baselines         = sync_baselines_var.get(),
         report_month           = report_month_var.get().strip(),
+        stale_warning_days     = stale_warning_days,
     )
 
     log.info("Starting dashboard generation: %s", output_path)
@@ -216,6 +227,7 @@ def toggle_rmm_state():
 def toggle_date_state():
     state = "disabled" if show_all_dates_var.get() else "normal"
     date_entry.configure(state=state)
+    _warn_days_entry.configure(state=state)
 
 def toggle_trend_state():
     state = "normal" if include_trend_var.get() else "disabled"
@@ -592,6 +604,7 @@ score_var = tk.StringVar(value="9.0")
 date_var = tk.StringVar(value=(date.today() - timedelta(days=90)).strftime('%d/%m/%Y'))
 _date_display_var = tk.StringVar(value=date_var.get())   # mirrors date_var for the label
 show_all_dates_var = tk.BooleanVar()
+stale_warning_days_var = tk.StringVar(value="14")        # approaching-stale warning window (days)
 report_month_var = tk.StringVar(value=datetime.now().strftime('%B %Y'))
 prev_report_var = tk.StringVar()
 include_trend_var = tk.BooleanVar()
@@ -688,6 +701,20 @@ ctk.CTkCheckBox(
     variable=show_all_dates_var,
     command=toggle_date_state,
 ).pack(side="left", padx=(8, 0))
+row += 1
+
+# Approaching-stale warning window
+_warn_frame = ctk.CTkFrame(filters_card, fg_color="transparent")
+_warn_frame.grid(row=row, column=0, sticky="w", padx=16, pady=(0, 6))
+ctk.CTkLabel(_warn_frame, text="⚠  Highlight devices approaching stale within:").pack(side="left")
+_warn_days_entry = ctk.CTkEntry(_warn_frame, textvariable=stale_warning_days_var, width=52)
+_warn_days_entry.pack(side="left", padx=(8, 4))
+ctk.CTkLabel(
+    _warn_frame,
+    text="days  (highlighted orange in product sheets and overview, not excluded from report)",
+    text_color=_MUTED_FG,
+    font=ctk.CTkFont(size=11),
+).pack(side="left")
 row += 1
 
 report_month_entry = _inline_field(filters_card, row, "Report Month:", report_month_var, width=160)

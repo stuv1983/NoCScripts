@@ -79,6 +79,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--report-month', default='', metavar='MONTH',
                    help='Report label e.g. "April 2026". Defaults to current month. '
                         'Allows retroactive labelling when generating last month\'s report today.')
+    p.add_argument('--stale-warning-days', default=14, type=int, metavar='DAYS',
+                   help='Highlight active devices whose last response is within this many days of '
+                        'the stale cutoff (default: 14). Shown orange in product sheets and '
+                        'overview — devices are NOT excluded from the report.')
     p.add_argument('--verbose',   action='store_true',
                    help='Enable DEBUG-level logging')
     return p
@@ -126,6 +130,7 @@ def main() -> int:
         sync_baselines         = args.sync_baselines,
         exclude_missing_rmm    = args.exclude_missing_rmm,
         report_month           = args.report_month,
+        stale_warning_days     = args.stale_warning_days,
     )
 
     log.info("Starting headless dashboard generation")

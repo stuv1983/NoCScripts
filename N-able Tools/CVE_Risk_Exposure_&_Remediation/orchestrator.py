@@ -84,6 +84,7 @@ class DashboardRequest:
     sync_baselines:       bool           = False
     exclude_missing_rmm:  bool           = False
     report_month:         str            = ''
+    stale_warning_days:   int            = 14   # flag active devices within this many days of going stale
 
 @dataclass
 class DashboardResult:
@@ -209,23 +210,74 @@ def run(request: DashboardRequest) -> DashboardResult:
 
         raw_df         = merged_df.copy()
         stale_excluded = pd.DataFrame()
+        approaching_stale_names: set = set()
+        _STALE_DAYS = 30   # fixed staleness threshold (days without a response)
 
         if not request.show_all_dates and request.cutoff_date:
             cutoff = pd.to_datetime(request.cutoff_date, dayfirst=True, errors='coerce')
             if pd.isna(cutoff):
                 cutoff = pd.to_datetime('1900-01-01')
-            high   = merged_df[merged_df['Vulnerability Score'] >= request.threshold]
-            stale_excluded = high[
+            high = merged_df[merged_df['Vulnerability Score'] >= request.threshold]
+
+            # ── Pass 1: date-filter stale (last seen before cutoff_date) ────────
+            stale_by_date = high[
                 (high['_Sort_Time'] < cutoff) &
                 (high['Last Response'] != 'Not Found in RMM')
             ].copy()
+
+            # ── Pass 2: days-stale (last seen after cutoff but >= 30 days ago) ──
+            # These devices pass the date filter because their Last Response is
+            # after the cutoff, but they are clearly inactive by the 30-day rule.
+            # e.g. GP5CG1210RQ0: Last Response = 3/19/26 (after Mar 1 cutoff)
+            #      but Days Since Last Response = 68 → stale.
+            if 'Days Since Last Response' in merged_df.columns:
+                _days_col = pd.to_numeric(merged_df['Days Since Last Response'], errors='coerce')
+                stale_names_by_days = set(
+                    merged_df.loc[
+                        (merged_df['Last Response'] != 'Not Found in RMM') &
+                        (_days_col >= _STALE_DAYS),
+                        'Name'
+                    ].unique()
+                )
+            else:
+                stale_names_by_days = set()
+
+            stale_by_days_df = high[
+                high['Name'].isin(stale_names_by_days) &
+                (high['Last Response'] != 'Not Found in RMM') &
+                ~high['Name'].isin(set(stale_by_date['Name'].unique()))  # no double-count
+            ].copy()
+
+            stale_excluded = pd.concat([stale_by_date, stale_by_days_df], ignore_index=True)
+            all_stale_names = set(stale_excluded['Name'].unique())
+
+            # Remove ALL stale devices (both passes) from the working dataset
             merged_df = merged_df[
-                (merged_df['_Sort_Time'] >= cutoff) |
+                (~merged_df['Name'].isin(all_stale_names)) |
                 (merged_df['Last Response'] == 'Not Found in RMM')
             ]
+
+            # ── Approaching stale: in report but within warning window of 30d ──
+            warning_days = max(1, int(request.stale_warning_days))
+            warn_lower   = _STALE_DAYS - warning_days
+            if 'Days Since Last Response' in merged_df.columns:
+                _days_col2   = pd.to_numeric(merged_df['Days Since Last Response'], errors='coerce')
+                _active_mask = merged_df['Last Response'] != 'Not Found in RMM'
+                approaching_stale_names = set(
+                    merged_df.loc[
+                        _active_mask & (_days_col2 >= warn_lower),
+                        'Name'
+                    ].unique()
+                )
+
             log.info(
-                "Date filter applied (>= %s): %d rows kept, %d stale excluded",
-                request.cutoff_date, len(merged_df), len(stale_excluded),
+                "Date filter applied (>= %s): %d rows kept, "
+                "%d stale excluded (%d by date-filter, %d by %d-day rule), "
+                "%d device(s) approaching stale (within %dd of threshold)",
+                request.cutoff_date, len(merged_df),
+                len(all_stale_names), len(stale_by_date['Name'].unique()),
+                len(stale_names_by_days - set(stale_by_date['Name'].unique())),
+                _STALE_DAYS, len(approaching_stale_names), warning_days,
             )
 
         if merged_df.empty:
@@ -457,6 +509,8 @@ def run(request: DashboardRequest) -> DashboardResult:
                 not_in_rmm_cve_count=_not_in_rmm_cve_rows,
                 not_in_rmm_unique_cves=_not_in_rmm_unique_cves,
                 report_month=report_month_val,
+                approaching_stale_names=approaching_stale_names,
+                stale_warning_days=request.stale_warning_days,
             )
             if trend_data:
                 build_trend_summary_sheet(wb, trend_data, request.threshold,
@@ -476,6 +530,8 @@ def run(request: DashboardRequest) -> DashboardResult:
                 has_prev_report=trend_data is not None,
                 stale_excluded_df=stale_excluded if not stale_excluded.empty else None,
                 report_month=report_month_val,
+                approaching_stale_names=approaching_stale_names,
+                stale_warning_days=request.stale_warning_days,
             )
 
             if trend_data:
@@ -484,7 +540,9 @@ def run(request: DashboardRequest) -> DashboardResult:
 
             build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
                                   patch_resolved_pairs=patch_resolved_pairs,
-                                  patch_gap_pairs=patch_gap_pairs)
+                                  patch_gap_pairs=patch_gap_pairs,
+                                  approaching_stale_names=approaching_stale_names,
+                                  stale_warning_days=request.stale_warning_days)
 
             if not stale_excluded.empty or not not_in_rmm_df.empty:
                 build_stale_excluded_sheet(writer, stale_excluded,
