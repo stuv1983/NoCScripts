@@ -711,7 +711,7 @@ _warn_days_entry = ctk.CTkEntry(_warn_frame, textvariable=stale_warning_days_var
 _warn_days_entry.pack(side="left", padx=(8, 4))
 ctk.CTkLabel(
     _warn_frame,
-    text="days of going stale  (orange in product sheets — only flags devices still in report, not already-stale ones)",
+    text="days without response  (orange in product sheets — flags any active device offline this long)",
     text_color=_MUTED_FG,
     font=ctk.CTkFont(size=11),
 ).pack(side="left")
