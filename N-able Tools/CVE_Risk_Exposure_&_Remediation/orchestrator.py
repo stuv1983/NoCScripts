@@ -262,24 +262,22 @@ def run(request: DashboardRequest) -> DashboardResult:
                 _STALE_DAYS,
             )
 
-        # ── Approaching stale: always computed — independent of cutoff_date ────
-        # Any active device offline >= warning_days is flagged orange and treated
-        # as unresolved (patch cannot be confirmed if device hasn't checked in).
-        # This runs whether or not a date filter is active.
+        # ── Approaching stale: DISABLED FOR TESTING ─────────────────────────────
         warning_days = max(1, int(request.stale_warning_days))
-        if 'Days Since Last Response' in merged_df.columns:
-            _days_col_ap  = pd.to_numeric(merged_df['Days Since Last Response'], errors='coerce')
-            _active_mask  = merged_df['Last Response'] != 'Not Found in RMM'
-            approaching_stale_names = set(
-                merged_df.loc[
-                    _active_mask & (_days_col_ap >= warning_days),
-                    'Name'
-                ].unique()
-            )
-        log.info(
-            "%d device(s) flagged as approaching stale (offline >= %d days)",
-            len(approaching_stale_names), warning_days,
-        )
+        approaching_stale_names: set = set()
+        # if 'Days Since Last Response' in merged_df.columns:
+        #     _days_col_ap  = pd.to_numeric(merged_df['Days Since Last Response'], errors='coerce')
+        #     _active_mask  = merged_df['Last Response'] != 'Not Found in RMM'
+        #     approaching_stale_names = set(
+        #         merged_df.loc[
+        #             _active_mask & (_days_col_ap >= warning_days),
+        #             'Name'
+        #         ].unique()
+        #     )
+        # log.info(
+        #     "%d device(s) flagged as approaching stale (offline >= %d days)",
+        #     len(approaching_stale_names), warning_days,
+        # )
 
         if merged_df.empty:
             msg = (
@@ -436,48 +434,56 @@ def run(request: DashboardRequest) -> DashboardResult:
                         f"see 'Patch Evidence Notes' sheet"
                     )
 
-        _status_col_inj = ('Threat Status' if 'Threat Status' in merged_df.columns
-                           else 'Status'   if 'Status'        in merged_df.columns
-                           else None)
-        if _status_col_inj:
-            from data_pipeline import _detect_product as _dp_detect_raw
-            _raw_resolved = merged_df[
-                merged_df[_status_col_inj].astype(str).str.strip().str.upper() == 'RESOLVED'
-            ].copy()
-            _raw_unresolved = merged_df[
-                merged_df[_status_col_inj].astype(str).str.strip().str.upper() == 'UNRESOLVED'
-            ].copy()
-            if not _raw_resolved.empty:
-                _raw_pairs = set(zip(
-                    _raw_resolved['Name'].apply(normalize_device_name),
-                    _raw_resolved['Vulnerability Name'].apply(extract_cve_id),
-                    _raw_resolved['Affected Products'].astype(str).apply(_dp_detect_raw),
+        # ── Bulletproof raw scanner override ────────────────────────────────────
+        # Read directly from raw_df (pre-filter, pre-join source of truth) so no
+        # date-filter or RMM-join step can silently drop an UNRESOLVED row and let
+        # a false-positive blue ☑ survive.  2-tuple (device, cve) matching means
+        # product-name formatting differences can never cause a miss.
+        from data_pipeline import _detect_product as _dp_detect_raw
+        _unresolved_pairs_2d: set = set()
+        _raw_inject_pairs:    set = set()
+
+        for _col in ('Threat Status', 'Status', 'threat status', 'status'):
+            if _col not in raw_df.columns:
+                continue
+            _col_upper = raw_df[_col].astype(str).str.strip().str.upper()
+            _raw_unr = raw_df[_col_upper == 'UNRESOLVED']
+            if not _raw_unr.empty:
+                _unresolved_pairs_2d |= set(zip(
+                    _raw_unr['Name'].apply(normalize_device_name),
+                    _raw_unr['Vulnerability Name'].apply(extract_cve_id),
                 ))
-                # Remove any (name, cve, product) that also appears as UNRESOLVED in raw.
-                # Raw data is source of truth: if a row exists with UNRESOLVED for the
-                # same (device, CVE, product), the CVE is not resolved on that device
-                # regardless of whether another row for the same combination shows RESOLVED.
-                # This handles the Chromium pattern where the same CVE can appear as both
-                # RESOLVED (one browser version) and UNRESOLVED (another) for the same device.
-                if not _raw_unresolved.empty:
-                    _unresolved_pairs = set(zip(
-                        _raw_unresolved['Name'].apply(normalize_device_name),
-                        _raw_unresolved['Vulnerability Name'].apply(extract_cve_id),
-                        _raw_unresolved['Affected Products'].astype(str).apply(_dp_detect_raw),
-                    ))
-                    _conflict_count = len(_raw_pairs & _unresolved_pairs)
-                    _raw_pairs -= _unresolved_pairs   # UNRESOLVED wins over RESOLVED
-                    if _conflict_count:
-                        log.info(
-                            "Raw injection: removed %d conflicting pair(s) where same "
-                            "(device, CVE, product) has both RESOLVED and UNRESOLVED rows — "
-                            "treating as UNRESOLVED (raw data is source of truth)",
-                            _conflict_count,
-                        )
-                _before = len(patch_resolved_pairs)
-                patch_resolved_pairs |= _raw_pairs
-                log.info("Raw RESOLVED injection: %d pair(s) added (%d already present)",
-                         len(patch_resolved_pairs) - _before, len(_raw_pairs) - (len(patch_resolved_pairs) - _before))
+            _raw_res = raw_df[_col_upper == 'RESOLVED']
+            if not _raw_res.empty:
+                _raw_inject_pairs |= set(zip(
+                    _raw_res['Name'].apply(normalize_device_name),
+                    _raw_res['Vulnerability Name'].apply(extract_cve_id),
+                    _raw_res['Affected Products'].astype(str).apply(_dp_detect_raw),
+                ))
+
+        # Step 1: strip false positives from patch tool memory.
+        # If the scanner says UNRESOLVED for (device, cve), remove every matching
+        # 3-tuple from patch_resolved_pairs regardless of product string.
+        if _unresolved_pairs_2d and patch_resolved_pairs:
+            to_remove = {p for p in patch_resolved_pairs if (p[0], p[1]) in _unresolved_pairs_2d}
+            if to_remove:
+                patch_resolved_pairs -= to_remove
+                log.info(
+                    "Scanner override: removed %d pair(s) from patch_resolved_pairs "
+                    "because raw_df still shows UNRESOLVED — will render as red ☐",
+                    len(to_remove),
+                )
+
+        # Step 2: inject raw RESOLVED pairs, skipping any (device, cve) that is
+        # still UNRESOLVED in the scanner (UNRESOLVED always wins).
+        if _raw_inject_pairs:
+            clean = {p for p in _raw_inject_pairs if (p[0], p[1]) not in _unresolved_pairs_2d}
+            skipped = len(_raw_inject_pairs) - len(clean)
+            if skipped:
+                log.info("Raw injection: skipped %d pair(s) where scanner also shows UNRESOLVED", skipped)
+            _before = len(patch_resolved_pairs)
+            patch_resolved_pairs |= clean
+            log.info("Raw RESOLVED injection: %d pair(s) added", len(patch_resolved_pairs) - _before)
 
         patch_confirmed_count = 0
         if patch_resolved_pairs:

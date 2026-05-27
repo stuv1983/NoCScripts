@@ -799,17 +799,20 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
 
         # ── Bulk colouring via conditional_format (Excel XML — no Python loop needed) ──
         # Rules are evaluated in the order added — first added = highest priority in Excel.
+        # IMPORTANT: range starts at Excel row 2 (xlsxwriter row index 1), so formula
+        # must reference row 2 ($A2) not row 1 ($A1). Using $A1 causes an off-by-one:
+        # each row gets coloured based on the PREVIOUS row's value, not its own.
         # Priority 1: Resolved (☑ in col A) → blue.
         ws.conditional_format(1, 0, _last, len(cl) - 1, {
             'type':     'formula',
-            'criteria': '=$A1="☑"',
+            'criteria': '=$A2="☑"',
             'format':   patch_res_fmt,
         })
         # Priority 2: Unresolved (☐ in col A) → light red. Makes unresolved rows
         # immediately visible against the blue resolved rows.
         ws.conditional_format(1, 0, _last, len(cl) - 1, {
             'type':     'formula',
-            'criteria': '=$A1="☐"',
+            'criteria': '=$A2="☐"',
             'format':   unresolved_fmt,
         })
         # Priority 3: Known exploit → darker orange (overrides unresolved red).
@@ -818,7 +821,7 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
             _ec = chr(ord('A') + cl.index(_exp_col))
             ws.conditional_format(1, 0, _last, len(cl) - 1, {
                 'type':     'formula',
-                'criteria': f'=OR(${_ec}1=TRUE,UPPER(TEXT(${_ec}1,"@"))="YES")',
+                'criteria': f'=OR(${_ec}2=TRUE,UPPER(TEXT(${_ec}2,"@"))="YES")',
                 'format':   exploit_fmt,
             })
 
@@ -947,17 +950,17 @@ def build_diagnostics_sheets(writer, diagnostics: dict) -> None:
             _lag_letter = chr(ord('A') + _lag_idx)
             # Green: 0–14 days — patched promptly
             ws.conditional_format(1, 0, _n, len(_lag_cols) - 1, {
-                'type': 'formula', 'criteria': f'=AND(${_lag_letter}1>=0,${_lag_letter}1<=14)',
+                'type': 'formula', 'criteria': f'=AND(${_lag_letter}2>=0,${_lag_letter}2<=14)',
                 'format': grn,
             })
             # Amber: 15–60 days — acceptable but slow
             ws.conditional_format(1, 0, _n, len(_lag_cols) - 1, {
-                'type': 'formula', 'criteria': f'=AND(${_lag_letter}1>14,${_lag_letter}1<=60)',
+                'type': 'formula', 'criteria': f'=AND(${_lag_letter}2>14,${_lag_letter}2<=60)',
                 'format': amb,
             })
             # Red: >60 days or negative (patch pre-dates detection — data anomaly)
             ws.conditional_format(1, 0, _n, len(_lag_cols) - 1, {
-                'type': 'formula', 'criteria': f'=OR(${_lag_letter}1>60,${_lag_letter}1<0)',
+                'type': 'formula', 'criteria': f'=OR(${_lag_letter}2>60,${_lag_letter}2<0)',
                 'format': red,
             })
         ws.write(_n + 2, 0,
@@ -981,15 +984,15 @@ def build_diagnostics_sheets(writer, diagnostics: dict) -> None:
         if _dv_idx is not None:
             _dv_letter = chr(ord('A') + _dv_idx)
             ws.conditional_format(1, 0, _dn, len(_dv_cols) - 1, {
-                'type': 'formula', 'criteria': f'=${_dv_letter}1=1',
+                'type': 'formula', 'criteria': f'=${_dv_letter}2=1',
                 'format': grn,
             })
             ws.conditional_format(1, 0, _dn, len(_dv_cols) - 1, {
-                'type': 'formula', 'criteria': f'=AND(${_dv_letter}1>=2,${_dv_letter}1<4)',
+                'type': 'formula', 'criteria': f'=AND(${_dv_letter}2>=2,${_dv_letter}2<4)',
                 'format': amb,
             })
             ws.conditional_format(1, 0, _dn, len(_dv_cols) - 1, {
-                'type': 'formula', 'criteria': f'=${_dv_letter}1>=4',
+                'type': 'formula', 'criteria': f'=${_dv_letter}2>=4',
                 'format': red,
             })
         ws.write(len(drift_df) + 2, 0,
