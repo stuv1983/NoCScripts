@@ -1738,6 +1738,9 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         _live = True
     else:
         _live = False
+        _f_res   = None
+        _f_unres = None
+        _f_total = None
 
     _live_fmt  = workbook.add_format({'num_format': '#,##0', 'align': 'center',
                                       'bg_color': '#EBF3FB', 'border': 1,

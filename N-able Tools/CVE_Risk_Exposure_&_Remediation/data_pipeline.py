@@ -462,6 +462,30 @@ def load_vulnerability_data(file_path: str) -> pd.DataFrame:
     for col, default in defaults.items():
         if col not in df.columns: df[col] = default
 
+    # If no numeric score column was found, derive one from Severity text labels.
+    # This handles N-able exports that ship Severity (CRITICAL/IMPORTANT/MODERATE/LOW)
+    # instead of a CVSS float column.
+    _SEVERITY_SCORE_MAP = {
+        'critical':  9.0,
+        'important': 7.0,
+        'moderate':  5.0,
+        'low':       2.0,
+    }
+    _all_zero = (pd.to_numeric(df['Vulnerability Score'], errors='coerce').fillna(0) == 0).all()
+    if _all_zero and 'Vulnerability Severity' in df.columns:
+        df['Vulnerability Score'] = (
+            df['Vulnerability Severity']
+            .astype(str).str.strip().str.lower()
+            .map(_SEVERITY_SCORE_MAP)
+            .fillna(0.0)
+        )
+        log.info(
+            "No numeric score column found — derived Vulnerability Score from Severity "
+            "(%d rows mapped, %d unmapped)",
+            int((df['Vulnerability Score'] > 0).sum()),
+            int((df['Vulnerability Score'] == 0).sum()),
+        )
+
     df['Vulnerability Name'] = df['Vulnerability Name'].fillna('Unknown CVE')
     df['Name_Join']          = _normalize_device_col(df['Name'])
     df['Affected Products']  = df['Affected Products'].fillna('Unknown Product')
