@@ -183,36 +183,34 @@ The script uses registry-based OS/build detection and treats Update Build Revisi
 ## CVE Risk Exposure & Remediation Dashboard
 
 Path:
-
 `N-able Tools/CVE_Risk_Exposure_&_Remediation/`
 
 ### Overview
 
 A modular Python CVE analysis pipeline for N-able/MSP vulnerability reporting.
 
-It correlates vulnerability exports, RMM device inventory, patch reports, and previous dashboard outputs to produce an actionable Excel workbook.
+It correlates vulnerability exports, RMM device inventory, patch reports, browser audits, and previous dashboard outputs to produce an actionable Excel workbook. 
 
 This tool is intended to answer:
-
 > Are devices actually remediated, or is the patch/vulnerability tooling giving conflicting evidence?
 
 ### Dependencies
 
 #### Production Dependencies
 Install from the included requirements file:
-
 `pip install -r requirements.txt`
 
 Production dependencies include:
 - `pandas`
 - `xlsxwriter`
 - `openpyxl`
+- `customtkinter` — *Modern dark-mode GUI framework.*
 - `tkcalendar`
+- `python-calamine` — *Optional but highly recommended for 4-5x faster Excel parsing.*
 - `pyarrow` (>=14) — *Optional but highly recommended for memory footprint reduction during large dataset merges.*
 
 #### Development Dependencies
 For development, testing, and linting, install the dev requirements:
-
 `pip install -r requirements-dev.txt`
 
 Includes `pytest`, `pytest-cov`, `ruff`, `mypy`, and `pandas-stubs`.
@@ -223,32 +221,33 @@ The tool consists of strictly scoped modules that work together in a centralized
 
 | Module | Role |
 |---|---|
-| `main.py` | Tkinter GUI — collects inputs, spawns background thread |
+| `main.py` | CustomTkinter GUI — collects inputs, spawns background thread |
 | `run_dashboard.py` | CLI/headless entrypoint |
 | `orchestrator.py` | Controller — coordinates all modules, owns execution flow |
-| `data_pipeline.py` | Data engine — load, merge, patch-match, trend arithmetic |
-| `diagnostics.py` | Root-cause classification — patch lag, version drift, mismatches |
+| `data_pipeline.py` | Data engine — highly vectorised load, merge, patch-match, and trend arithmetic |
+| `diagnostics.py` | Root-cause classification — patch lag, version drift, mismatches, and health scoring |
 | `excel_builder.py` | Report writer — all Excel sheet construction and formatting |
 | `snapshot.py` | History — lightweight JSON snapshots for trend tracking |
 | `cve_lookup.py` | CVE enrichment — automated NVD / CVE.org / OSV lookups |
-| `version_sync.py` | Baseline sync — fetches rolling baselines from vendor APIs |
+| `version_sync.py` | Baseline sync — fetches rolling baselines from vendor APIs (Chrome, Firefox, Edge, VLC) |
 | `config.py` | Configuration — loads `config.json` and exposes shared constants |
-| `config.json` | Single source of truth for product mappings and version rules |
+| `config.json` | Single source of truth for product mappings, remediation rules, and version rules |
 
 ### Main Capabilities
 
-- Vulnerability/RMM inventory merge (vectorized for speed)
-- Automated CVE baseline enrichment via public APIs (NVD, CVE.org, OSV)
-- Optional patch report matching
-- Optional patch failure report integration
-- Month-over-month trend comparison (with ghost ticket resolution)
-- Stale device and Not-in-RMM exclusion tracking
-- CVSS threshold filtering (Default: 9.0)
-- Product-level triage tabs
-- Patch diagnostics and root-cause evidence notes
-- Health score and recommended actions
-- Snapshot storage for historical tracking
-- CLI mode for scheduled or headless execution
+- **CustomTkinter GUI:** Modern dark-themed user interface with background thread execution.
+- **High-Performance Merging:** Vectorised Pandas pipeline for instantaneous inventory mapping.
+- Automated CVE baseline enrichment via public APIs (NVD, CVE.org, OSV).
+- Automated stable version syncing for major browsers (`version_sync.py`).
+- Patch report matching & **Patch Failure Report** integration.
+- **Browser Audit Integration:** Imports browser state audits directly into the risk analysis.
+- Month-over-month trend comparison (tracked via JSON snapshots and ghost ticket resolutions).
+- Stale device and Not-in-RMM exclusion tracking.
+- Logged-on user (`Username`) tracking propagated throughout the pipeline.
+- CVSS threshold filtering (Default: 9.0).
+- Product-level triage tabs & Top At-Risk Devices table.
+- Patch diagnostics, root-cause evidence notes, and a graded Health Score.
+- CLI mode for scheduled or headless execution.
 
 ### Patch Evidence Classification
 
@@ -262,26 +261,27 @@ The dashboard separates findings into operationally useful categories:
 | Product not tracked | Device exists in the patch report, but the affected product is not tracked |
 | Installed but version unknown | Patch status exists, but version evidence is insufficient |
 | No patch baseline defined | The tool lacks a fixed baseline for that product/CVE |
+| Patch failure | Patch installation actively failing (identified via failure report) |
 
 ### CLI Usage
 
 Minimal run, skipping RMM merge:
-
 `python run_dashboard.py --input reports/april_cve.xlsx --output output/April_Dashboard.xlsx --skip-rmm`
 
-With RMM inventory, patch matching, and specific date formats:
-
+With RMM inventory, patch matching, threshold adjustments, and specific date formats:
 `python run_dashboard.py --input reports/april_cve.xlsx --rmm reports/device_inventory.xlsx --patch reports/patch_report.csv --output output/April_Dashboard.xlsx --threshold 9.0 --since 01/04/2026`
 
-With previous dashboard comparison and explicit report month label:
+With previous dashboard comparison, baseline sync, and explicit report month label:
+`python run_dashboard.py --input reports/april_cve.xlsx --rmm reports/device_inventory.xlsx --output output/April_Dashboard.xlsx --previous output/March_Dashboard.xlsx --report-month "April 2026" --sync-baselines`
 
-`python run_dashboard.py --input reports/april_cve.xlsx --rmm reports/device_inventory.xlsx --output output/April_Dashboard.xlsx --previous output/March_Dashboard.xlsx --report-month "April 2026"`
+Include patch failures and show all dates (bypassing the since-date cutoff):
+`python run_dashboard.py --input reports/april_cve.xlsx --rmm reports/device_inventory.xlsx --failure-report reports/patch_failures.csv --output output/April_Dashboard.xlsx --all-dates`
 
 ### Output Sheets
 
 | Sheet | Purpose |
 |---|---|
-| Client Summary | Executive overview, risk summary, and data filtering waterfall |
+| Client Summary | Executive overview, Top At-Risk Devices, and transparent data filtering waterfall |
 | Trend Summary | Month-over-month high-level movement |
 | New This Month | New CVE types compared to previous report |
 | Resolved (Patch Confirmed) | CVEs no longer detected or explicitly confirmed patched |
@@ -291,10 +291,15 @@ With previous dashboard comparison and explicit report month label:
 | Patch Match Overview | Patch evidence roll-up |
 | Patch Match Full Data | Detailed patch matching output |
 | Patch Report (Full) | Raw patch report evidence |
+| Patch Failures | Optional breakdown of actively failing patches |
+| Products Not in Patch Scope | Products that appear in CVEs but are untracked by patching |
 | Diagnostics | Patch evidence/root-cause diagnostics |
-| Stale Excluded Devices | Devices excluded by last-response cutoff or missing from RMM |
-| Stale CVEs | Vulnerabilities tied to stale or missing-in-RMM devices |
+| Stale Excluded Devices | Devices excluded by last-response cutoff |
+| Devices Not in RMM | Devices in vulnerability scans but missing from RMM |
+| CVEs on Stale Devices | Vulnerabilities tied strictly to stale devices |
+| CVEs on Devices Not in RMM | Vulnerabilities tied strictly to unmanaged devices |
 | Raw Data | Unmodified merged dataset |
+
 
 ---
 
