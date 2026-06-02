@@ -453,6 +453,11 @@ def load_vulnerability_data(file_path: str) -> pd.DataFrame:
             rename[col] = 'Operating System Role'
     df.rename(columns=rename, inplace=True)
 
+    # Flag whether a real numeric score column existed in the source file.
+    # Checked BEFORE defaults so we can distinguish 'column was present but zero'
+    # (trust it) from 'column was absent, defaulted to 0.0' (fall back to severity).
+    _had_score_col = 'Vulnerability Score' in df.columns
+
     defaults = {
         'Name': 'Unknown Device',          'Vulnerability Name': 'Unknown CVE',
         'Affected Products': 'Unknown Product', 'Vulnerability Score': 0.0,
@@ -462,17 +467,18 @@ def load_vulnerability_data(file_path: str) -> pd.DataFrame:
     for col, default in defaults.items():
         if col not in df.columns: df[col] = default
 
-    # If no numeric score column was found, derive one from Severity text labels.
-    # This handles N-able exports that ship Severity (CRITICAL/IMPORTANT/MODERATE/LOW)
-    # instead of a CVSS float column.
+    # ── Score derivation ────────────────────────────────────────────────────
+    # Step 1: if all scores are zero (no numeric CVSS column in the export),
+    # derive approximate scores from the Severity text label.
+    # This handles N-able exports that ship Severity (CRITICAL/IMPORTANT/
+    # MODERATE/LOW) instead of a CVSS float column.
     _SEVERITY_SCORE_MAP = {
         'critical':  9.0,
         'important': 7.0,
         'moderate':  5.0,
         'low':       2.0,
     }
-    _all_zero = (pd.to_numeric(df['Vulnerability Score'], errors='coerce').fillna(0) == 0).all()
-    if _all_zero and 'Vulnerability Severity' in df.columns:
+    if not _had_score_col and 'Vulnerability Severity' in df.columns:
         df['Vulnerability Score'] = (
             df['Vulnerability Severity']
             .astype(str).str.strip().str.lower()
@@ -480,11 +486,32 @@ def load_vulnerability_data(file_path: str) -> pd.DataFrame:
             .fillna(0.0)
         )
         log.info(
-            "No numeric score column found — derived Vulnerability Score from Severity "
-            "(%d rows mapped, %d unmapped)",
+            'No numeric score column found — derived Vulnerability Score from Severity '
+            '(%d rows mapped, %d unmapped)',
             int((df['Vulnerability Score'] > 0).sum()),
             int((df['Vulnerability Score'] == 0).sum()),
         )
+
+    # Step 2: upgrade severity-band scores to real CVSS floats where
+    # cve_lookup has already cached them in config.json['cvss_score_cache'].
+    # On first run the cache may be empty; it fills automatically as
+    # cve_lookup enriches CVEs in the background.  Falls back to the
+    # severity-band value for any CVE not yet in the cache.
+    try:
+        from config import _CONFIG as _dp_cfg
+        _cvss_cache = _dp_cfg.get('cvss_score_cache', {})
+        if _cvss_cache and 'Vulnerability Name' in df.columns:
+            _cve_ids    = df['Vulnerability Name'].astype(str).apply(extract_cve_id)
+            _real       = _cve_ids.map(_cvss_cache)
+            _has_real   = _real.notna()
+            if _has_real.any():
+                df.loc[_has_real, 'Vulnerability Score'] = _real[_has_real].astype(float)
+                log.info(
+                    'Applied cached CVSS scores to %d/%d rows (%d unique CVEs)',
+                    int(_has_real.sum()), len(df), int(_cve_ids[_has_real].nunique()),
+                )
+    except Exception as _cvss_err:
+        log.debug('CVSS cache apply skipped: %s', _cvss_err)
 
     df['Vulnerability Name'] = df['Vulnerability Name'].fillna('Unknown CVE')
     df['Name_Join']          = _normalize_device_col(df['Name'])

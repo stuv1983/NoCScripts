@@ -206,7 +206,6 @@ def process_reports():
         sync_baselines         = sync_baselines_var.get(),
         report_month           = report_month_var.get().strip(),
         stale_warning_days     = stale_warning_days,
-        skip_raw_data          = skip_raw_data_var.get(),
     )
 
     log.info("Starting dashboard generation: %s", output_path)
@@ -610,7 +609,6 @@ report_month_var = tk.StringVar(value=datetime.now().strftime('%B %Y'))
 prev_report_var = tk.StringVar()
 include_trend_var = tk.BooleanVar()
 sync_baselines_var = tk.BooleanVar()
-skip_raw_data_var  = tk.BooleanVar(value=False)   # skip Raw Data sheet for speed
 patch_var = tk.StringVar()
 failure_var = tk.StringVar()
 browser_audit_var = tk.StringVar()
@@ -726,13 +724,7 @@ ctk.CTkCheckBox(
     filters_card,
     text="Refresh product baselines before run",
     variable=sync_baselines_var,
-).grid(row=row, column=0, sticky="w", padx=16, pady=(2, 6))
-row += 1
-ctk.CTkCheckBox(
-    filters_card,
-    text="Skip Raw Data sheet  (faster for large exports — source file is unchanged)",
-    variable=skip_raw_data_var,
-).grid(row=row, column=0, sticky="w", padx=16, pady=(0, 14))
+).grid(row=row, column=0, sticky="w", padx=16, pady=(2, 14))
 
 # ==========================================================================
 # OPTIONAL DATA CARD

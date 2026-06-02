@@ -41,9 +41,44 @@ from excel_builder import (
     build_raw_data_sheet, build_patch_sheets, build_diagnostics_sheets,
     build_patch_failure_sheet,
     build_products_not_tracked_sheet, build_patch_resolved_sheet,
+    build_device_report_sheet,
 )
 
 log = logging.getLogger(__name__)
+
+
+def _find_cve_repo() -> 'Optional[Path]':
+    """Locate the local cvelistV5 git clone in standard locations."""
+    candidates = [
+        Path(r'C:\NoCScripts\N-able Tools\CVE_Risk_Exposure_&_Remediation\cvelistV5'),
+        Path(__file__).resolve().parent / 'cvelistV5',
+        Path(__file__).resolve().parent.parent / 'cvelistV5',
+    ]
+    return next((p for p in candidates if p.exists()), None)
+
+
+def _pull_cve_repo(repo: 'Optional[Path]') -> None:
+    """Run git pull --ff-only on the cvelistV5 repo (non-fatal on any failure)."""
+    if repo is None:
+        log.debug('cvelistV5 repo not found — skipping git pull')
+        return
+    import subprocess
+    try:
+        r = subprocess.run(
+            ['git', '-C', str(repo), 'pull', '--ff-only'],
+            capture_output=True, text=True, timeout=30,
+        )
+        msg = (r.stdout.strip() or r.stderr.strip() or '(no output)').splitlines()[0]
+        if r.returncode == 0:
+            log.info('cvelistV5 pull: %s', msg)
+        else:
+            log.warning('cvelistV5 pull failed (rc=%d): %s', r.returncode, msg[:120])
+    except subprocess.TimeoutExpired:
+        log.warning('cvelistV5 pull timed out (30s) — continuing with local data')
+    except FileNotFoundError:
+        log.debug('git not on PATH — skipping cvelistV5 pull')
+    except Exception as _e:
+        log.debug('cvelistV5 pull error: %s', _e)
 
 
 def _try_sync_baselines() -> None:
@@ -85,7 +120,6 @@ class DashboardRequest:
     exclude_missing_rmm:  bool           = False
     report_month:         str            = ''
     stale_warning_days:   int            = 14   # flag active devices within this many days of going stale
-    skip_raw_data:        bool           = False  # omit Raw Data sheet (saves ~1.2M cell writes on 80k-row exports)
 
 @dataclass
 class DashboardResult:
@@ -185,16 +219,22 @@ def run(request: DashboardRequest) -> DashboardResult:
         df_vuln = load_vulnerability_data(request.vuln_path)
         log.info("  %d rows loaded", len(df_vuln))
 
+        _cve_repo = _find_cve_repo()
+        _pull_cve_repo(_cve_repo)
+
         try:
             from cve_lookup import enrich_from_detections
-            enriched = enrich_from_detections(df_vuln)
+            enriched = enrich_from_detections(df_vuln, cve_repo_path=_cve_repo)
             if enriched:
                 import json as _json
                 cfg_path = str(Path(__file__).parent / 'config.json')
                 with open(cfg_path, encoding='utf-8') as _fh:
-                    _fresh = _json.load(_fh).get('fixed_version_rules', {})
+                    _fresh = _json.load(_fh)
                 FIXED_VERSION_RULES.clear()
-                FIXED_VERSION_RULES.update(_fresh)
+                FIXED_VERSION_RULES.update(_fresh.get('fixed_version_rules', {}))
+                # Also refresh the in-memory CVSS cache
+                from config import _CONFIG as _orch_cfg
+                _orch_cfg['cvss_score_cache'] = _fresh.get('cvss_score_cache', {})
                 log.info("CVE lookup: %d CVE(s) enriched and version rules updated", enriched)
         except Exception as _e:
             log.debug("CVE lookup auto-enrich skipped: %s", _e)
@@ -646,10 +686,9 @@ def run(request: DashboardRequest) -> DashboardResult:
                         f"actively failing — see 'Patch Failures' sheet"
                     )
 
-            if not request.skip_raw_data:
-                build_raw_data_sheet(writer, raw_df)
-            else:
-                log.info("Raw Data sheet skipped (skip_raw_data=True)")
+            build_raw_data_sheet(writer, raw_df)
+            if df_rmm is not None:
+                build_device_report_sheet(writer, df_rmm)
 
         log.info("Workbook written successfully")
 

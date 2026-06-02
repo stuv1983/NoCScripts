@@ -307,6 +307,78 @@ def _parse_osv(data: dict) -> list[dict]:
     return results
 
 
+def _cve_local_path(cve_id: str, repo_path) -> 'Optional[Path]':
+    """
+    Return the expected path to a CVE JSON file inside a local cvelistV5 clone.
+    Layout:  cves/{year}/{prefix}xxx/CVE-{year}-{num}.json
+    e.g.     cves/2024/1xxx/CVE-2024-1234.json
+             cves/2024/12xxx/CVE-2024-12345.json
+    """
+    import re as _re
+    m = _re.match(r'CVE-(\d{4})-(\d+)', str(cve_id).strip().upper())
+    if not m:
+        return None
+    year, num = m.group(1), m.group(2)
+    prefix = (num[:-3] if len(num) > 3 else '0') + 'xxx'
+    return Path(repo_path) / 'cves' / year / prefix / f'CVE-{year}-{num}.json'
+
+
+def _load_cve_org_local(cve_id: str, repo_path) -> 'Optional[dict]':
+    """
+    Read a CVE JSON 5.0 file from a local cvelistV5 clone.
+    Returns the parsed dict (identical structure to CVE.org API) or None.
+    Falls back silently — callers must handle None and try the API.
+    """
+    if not repo_path:
+        return None
+    p = _cve_local_path(cve_id, repo_path)
+    if p is None:
+        return None
+    try:
+        if not p.exists():
+            return None
+        with open(p, 'r', encoding='utf-8') as _fh:
+            return json.load(_fh)
+    except Exception as _e:
+        log.debug('cve_lookup: local file read failed for %s: %s', cve_id, _e)
+        return None
+
+
+def _extract_cvss_score(cve_org_data: 'Optional[dict]',
+                         nvd_data:     'Optional[dict]') -> 'Optional[float]':
+    """
+    Extract the best available CVSS base score from CVE.org or NVD response.
+    Priority: CVSSv4.0 > CVSSv3.1 > CVSSv3.0 > CVSSv2.0.
+    Checks CVE.org CNA + ADP containers first, then NVD metrics.
+    Returns None if no score found in either source.
+    """
+    if isinstance(cve_org_data, dict):
+        _containers = cve_org_data.get('containers', {})
+        for _src in ([_containers.get('cna', {})] + (_containers.get('adp') or [])):
+            for _m in _src.get('metrics', []):
+                for _key in ('cvssV4_0', 'cvssV3_1', 'cvssV3_0', 'cvssV2_0'):
+                    try:
+                        s = float(_m.get(_key, {}).get('baseScore', ''))
+                        return s
+                    except (TypeError, ValueError):
+                        pass
+    if isinstance(nvd_data, dict):
+        try:
+            _vulns = nvd_data.get('vulnerabilities', [])
+            if _vulns:
+                _mets = _vulns[0].get('cve', {}).get('metrics', {})
+                for _key in ('cvssMetricV40', 'cvssMetricV31', 'cvssMetricV30', 'cvssMetricV2'):
+                    for _ent in _mets.get(_key, []):
+                        try:
+                            s = float(_ent.get('cvssData', {}).get('baseScore', ''))
+                            return s
+                        except (TypeError, ValueError):
+                            pass
+        except Exception:
+            pass
+    return None
+
+
 # ==============================================================================
 # PRODUCT MATCHING
 # ==============================================================================
@@ -727,6 +799,7 @@ def lookup_fixed_version(
     cfg: Optional[dict] = None,
     auto_add_products: bool = False,
     config_path: Optional[str] = None,
+    cve_repo_path=None,
 ) -> dict[str, str]:
     """
     Fetch the fixed version(s) for a CVE from public APIs.
@@ -750,29 +823,39 @@ def lookup_fixed_version(
 
     results: list[dict] = []
 
-    # Source 1: CVE.org
+    # Source 0: local cvelistV5 repo (fastest — file read, no network round trip)
+    cve_org_data = _load_cve_org_local(cve_id, cve_repo_path) if cve_repo_path else None
+    if cve_org_data:
+        results = _parse_cve_org(cve_org_data)
+        if results:
+            log.debug("cve_lookup: %s → local repo (%d entries)", cve_id, len(results))
+
+    # Source 1: CVE.org API (fallback when local repo unavailable or has no entry)
     # Capture separately so the Edge supplement can read cveMetadata.datePublished
     # even when NVD or OSV is used as the version-data fallback.
-    cve_org_data = _get(f'https://cveawg.mitre.org/api/cve/{cve_id}')
+    if not cve_org_data:
+        cve_org_data = _get(f'https://cveawg.mitre.org/api/cve/{cve_id}')
     data = cve_org_data   # alias kept so existing code below is unchanged
-    if cve_org_data:
+    if cve_org_data and not results:
         results = _parse_cve_org(cve_org_data)
         if results:
             log.debug("cve_lookup: %s → CVE.org returned %d affected entries", cve_id, len(results))
 
     # Source 2: NVD (fallback)
+    nvd_data = None   # tracked separately for CVSS extraction
     if not results:
         time.sleep(_DELAY)
-        data = _get(
+        nvd_data = _get(
             f'https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={cve_id}',
             extra_headers=_nvd_headers(config_path),
         )
-        if data:
-            results = _parse_nvd(data)
+        data = nvd_data
+        if nvd_data:
+            results = _parse_nvd(nvd_data)
             if results:
                 log.info("cve_lookup: %s → NVD returned %d CPE entries", cve_id, len(results))
             else:
-                vulns = len(data.get('vulnerabilities', [])) if isinstance(data, dict) else 0
+                vulns = len(nvd_data.get('vulnerabilities', [])) if isinstance(nvd_data, dict) else 0
                 log.info("cve_lookup: NVD request succeeded for %s but no fixed-version CPE ranges were found (%d record(s))", cve_id, vulns)
 
     # Source 3: OSV.dev (fallback)
@@ -784,7 +867,15 @@ def lookup_fixed_version(
             if results:
                 log.debug("cve_lookup: %s → OSV returned %d affected entries", cve_id, len(results))
 
+    # Extract CVSS score from whichever API source had data — available even
+    # when no version ranges were found (e.g. disputed/rejected CVEs).
+    _cvss = _extract_cvss_score(cve_org_data, nvd_data)
+
     if not results:
+        if _cvss is not None:
+            log.debug("cve_lookup: %s — no version data but CVSS %.1f extracted",
+                      cve_id, _cvss)
+            return {'_cvss_score': str(_cvss)}
         log.warning("cve_lookup: no version data found for %s", cve_id)
         return {}
 
@@ -872,6 +963,8 @@ def lookup_fixed_version(
                     cve_id, edge_src,
                 )
 
+    if _cvss is not None:
+        matched['_cvss_score'] = str(_cvss)
     return matched
 
 
@@ -893,7 +986,8 @@ def enrich_config(cve_ids: Optional[list[str]] = None,
                   config_path: Optional[str] = None,
                   dry_run: bool = False,
                   overwrite: bool = False,
-                  auto_add_products: bool = True) -> dict[str, dict[str, str]]:
+                  auto_add_products: bool = True,
+                  cve_repo_path=None) -> dict[str, dict[str, str]]:
     """
     Look up fixed versions for a list of CVEs and write them into config.json.
 
@@ -991,6 +1085,7 @@ def enrich_config(cve_ids: Optional[list[str]] = None,
                 cfg=None,        # auto_add done serially after (thread safety)
                 auto_add_products=False,
                 config_path=str(config_path),
+                cve_repo_path=cve_repo_path,
             )
 
     for cve_id in cve_ids:
@@ -1015,6 +1110,17 @@ def enrich_config(cve_ids: Optional[list[str]] = None,
                 continue
 
             results[cve_id] = matched
+
+            # Cache CVSS score (present even when no version match was found)
+            _cvss_str = matched.get('_cvss_score', '')
+            if _cvss_str:
+                try:
+                    with _cfg_lock:
+                        _csc = cfg.setdefault('cvss_score_cache', {})
+                        _csc[cve_id] = float(_cvss_str)
+                        config_dirty = True
+                except (ValueError, TypeError):
+                    pass
 
             with _cfg_lock:
                 # Auto-add products serially (mutates product_map / cfg)
@@ -1075,7 +1181,8 @@ def enrich_config(cve_ids: Optional[list[str]] = None,
 
 def enrich_from_detections(cve_df: 'pd.DataFrame',
                             config_path: Optional[str] = None,
-                            auto_add_products: bool = True) -> int:
+                            auto_add_products: bool = True,
+                            cve_repo_path=None) -> int:
     """
     Called by the orchestrator with the loaded CVE DataFrame.
     Finds all CVE IDs in the data that don't have a fixed_version_rules entry
@@ -1147,7 +1254,36 @@ def enrich_from_detections(cve_df: 'pd.DataFrame',
             cve_ids           = missing,
             config_path       = config_path,
             auto_add_products = auto_add_products,
+            cve_repo_path     = cve_repo_path,
         )
+
+        # Fast CVSS pre-pass: read local JSON for all CVEs that have version
+        # data cached but no CVSS score yet.  File reads are ~1ms each — far
+        # cheaper than API calls, so we do this for the full dataset.
+        if cve_repo_path:
+            try:
+                with open(config_path, 'r', encoding='utf-8') as _fh:
+                    _cfg2 = json.load(_fh)
+                _csc  = _cfg2.setdefault('cvss_score_cache', {})
+                _need = [c for c in all_cves
+                         if c.upper().startswith('CVE-') and c.upper() not in _csc]
+                _added = 0
+                for _cve in _need:
+                    _data = _load_cve_org_local(_cve.upper(), cve_repo_path)
+                    if _data:
+                        _sc = _extract_cvss_score(_data, None)
+                        if _sc is not None:
+                            _csc[_cve.upper()] = _sc
+                            _added += 1
+                if _added:
+                    _cfg2['cvss_score_cache'] = _csc
+                    with open(config_path, 'w', encoding='utf-8') as _fh:
+                        json.dump(_cfg2, _fh, indent=2)
+                    log.info('cve_lookup: CVSS pre-pass populated %d score(s) from local repo',
+                             _added)
+            except Exception as _pe:
+                log.debug('cve_lookup: CVSS pre-pass failed: %s', _pe)
+
         return len(results)
 
     except Exception as e:

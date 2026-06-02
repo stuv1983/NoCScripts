@@ -727,7 +727,21 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
                   'Vulnerability Severity', 'Vulnerability Score', 'Risk Severity Index',
                   'Has Known Exploit', 'CISA KEV', 'Last Response', 'Days Since Last Response', 'Affected Products',
                   'Baseline Compliance', 'NVD']
-    for product, group in triage_df.groupby('Base Product'):
+
+    def _chromium_sort_key(p: str) -> str:
+        """Sort Chrome first, Edge immediately after (both are Chromium-based).
+        All other products sort by their own name alphabetically."""
+        pl = str(p).lower()
+        if 'chrome' in pl and 'edge' not in pl:
+            return 'google chrome\x00' + pl   # Chrome: sorts at its natural 'G' position
+        if 'edge' in pl:
+            return 'google chrome\x01' + pl   # Edge: immediately after Chrome
+        return pl
+
+    # Build groups once via groupby, then iterate in Chromium-aware order
+    _product_groups = {p: g for p, g in triage_df.groupby('Base Product')}
+    for product in sorted(_product_groups.keys(), key=_chromium_sort_key):
+        group = _product_groups[product]
         sheet_name = product_to_sheet[product]
         group = group.drop_duplicates(subset=['Name', 'Vulnerability Name']).copy()
         group = group.sort_values(
@@ -876,6 +890,31 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
         if 'Name'               in cl: ws.set_column(cl.index('Name'),               cl.index('Name'),               25)
         if 'Device Type'        in cl: ws.set_column(cl.index('Device Type'),        cl.index('Device Type'),        15)
         if 'Baseline Compliance' in cl: ws.set_column(cl.index('Baseline Compliance'), cl.index('Baseline Compliance'), 22)
+        if 'Vulnerability Score' in cl:
+            _vs_idx = cl.index('Vulnerability Score')
+            _vs_col = get_col_letter(_vs_idx)
+            ws.set_column(_vs_idx, _vs_idx, 8)
+            # CVSS score colour coding — added AFTER row-level CFs so row colour
+            # takes precedence on resolved/exploit rows; score colour shows on others.
+            _crit_fmt = wb_.add_format({'bg_color': '#C00000', 'font_color': 'white',
+                                        'bold': True,  'num_format': '0.0', 'align': 'center'})
+            _high_fmt = wb_.add_format({'bg_color': '#ED7D31', 'font_color': 'white',
+                                        'num_format': '0.0', 'align': 'center'})
+            _med_fmt  = wb_.add_format({'bg_color': '#FFF2CC', 'font_color': '#7F6000',
+                                        'num_format': '0.0', 'align': 'center'})
+            _low_fmt  = wb_.add_format({'bg_color': '#E2EFDA',
+                                        'num_format': '0.0', 'align': 'center'})
+            ws.conditional_format(1, _vs_idx, _last, _vs_idx, {
+                'type': 'cell', 'criteria': '>=', 'value': 9.0, 'format': _crit_fmt})
+            ws.conditional_format(1, _vs_idx, _last, _vs_idx, {
+                'type': 'cell', 'criteria': 'between', 'minimum': 7.0, 'maximum': 8.9,
+                'format': _high_fmt})
+            ws.conditional_format(1, _vs_idx, _last, _vs_idx, {
+                'type': 'cell', 'criteria': 'between', 'minimum': 4.0, 'maximum': 6.9,
+                'format': _med_fmt})
+            ws.conditional_format(1, _vs_idx, _last, _vs_idx, {
+                'type': 'cell', 'criteria': 'between', 'minimum': 0.1, 'maximum': 3.9,
+                'format': _low_fmt})
 
         legend_row = len(group) + 3
         l_title = wb_.add_format({'bold': True, 'font_size': 9, 'bg_color': '#F2F2F2', 'border': 1})
@@ -1081,8 +1120,15 @@ def build_patch_resolved_sheet(writer, patch_full_df: 'pd.DataFrame') -> None:
     ws.set_column('I:I', 20)
     ws.set_column('J:J', 22)
 
-    for i in range(1, len(out) + 1):
-        ws.set_row(i, None, grn)
+    # Replace per-row set_row loop with a single conditional_format rule.
+    # set_row() called N times = N xlsxwriter calls; one conditional_format
+    # rule = one XML element regardless of row count — O(1) vs O(n).
+    if len(out):
+        ws.conditional_format(1, 0, len(out), len(out.columns) - 1, {
+            'type':     'formula',
+            'criteria': '=$A2<>""',
+            'format':   grn,
+        })
 
     note_row = len(out) + 2
     unique_cves     = out['Vulnerability Name'].nunique()
@@ -2086,6 +2132,80 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     ws.set_row(row, 30)
 
     log.debug("Summary sheet written")
+
+
+def build_device_report_sheet(writer, df_rmm: 'pd.DataFrame') -> None:
+    """
+    Device Inventory sheet — one row per device with check-in recency.
+    Colour-codes Days Since Last Response so stale devices are immediately visible.
+    """
+    if df_rmm is None or df_rmm.empty:
+        return
+
+    wb  = writer.book
+    hdr = wb.add_format({'bold': True, 'bg_color': '#1F4E79', 'font_color': 'white', 'border': 1})
+    grn = wb.add_format({'bg_color': '#E2EFDA'})
+    amb = wb.add_format({'bg_color': '#FFF2CC', 'font_color': '#7F6000'})
+    red = wb.add_format({'bg_color': '#FCE4D6'})
+    crt = wb.add_format({'bg_color': '#C00000', 'font_color': 'white', 'bold': True})
+    note_fmt = wb.add_format({'italic': True, 'font_color': '#595959', 'font_size': 9})
+
+    # Select and rename columns for the sheet
+    _col_map = {
+        'Device':                   'Device Name',
+        'Device Type':              'Type',
+        'Last Response':            'Last Response',
+        'Days Since Last Response': 'Days Since Last Response',
+        'Username':                 'Username',
+        'Site':                     'Site',
+        'Client':                   'Client',
+        'OS':                       'OS',
+        'Description':              'Description',
+    }
+    _present = [c for c in _col_map if c in df_rmm.columns]
+    out = df_rmm[_present].rename(columns=_col_map).copy()
+
+    # Compute Days Since Last Response if not already present
+    if 'Days Since Last Response' not in out.columns and 'Last Response' in out.columns:
+        _lr = pd.to_datetime(out['Last Response'], errors='coerce')
+        out['Days Since Last Response'] = (pd.Timestamp.now() - _lr).dt.days
+
+    # Sort: most stale first
+    if 'Days Since Last Response' in out.columns:
+        out = out.sort_values('Days Since Last Response', ascending=False, na_position='last')
+
+    out.to_excel(writer, sheet_name='Device Inventory', index=False)
+    ws = writer.sheets['Device Inventory']
+    ws.autofilter(0, 0, len(out), len(out.columns) - 1)
+    ws.set_row(0, None, hdr)
+
+    # Column widths
+    _widths = {'Device Name': 30, 'Type': 13, 'Last Response': 22,
+               'Days Since Last Response': 22, 'Username': 22,
+               'Site': 18, 'Client': 18, 'OS': 30, 'Description': 30}
+    for ci, col in enumerate(out.columns):
+        ws.set_column(ci, ci, _widths.get(col, 16))
+
+    # Colour-code Days Since Last Response
+    if 'Days Since Last Response' in out.columns:
+        _d_idx = out.columns.tolist().index('Days Since Last Response')
+        ws.conditional_format(1, _d_idx, len(out), _d_idx, {
+            'type': 'cell', 'criteria': '>=', 'value': 60, 'format': crt})  # >60 days: critical
+        ws.conditional_format(1, _d_idx, len(out), _d_idx, {
+            'type': 'cell', 'criteria': 'between', 'minimum': 30, 'maximum': 59,
+            'format': red})   # 30-59 days: stale
+        ws.conditional_format(1, _d_idx, len(out), _d_idx, {
+            'type': 'cell', 'criteria': 'between', 'minimum': 14, 'maximum': 29,
+            'format': amb})   # 14-29 days: approaching stale
+        ws.conditional_format(1, _d_idx, len(out), _d_idx, {
+            'type': 'cell', 'criteria': 'between', 'minimum': 0, 'maximum': 13,
+            'format': grn})   # <14 days: healthy
+
+    ws.write(len(out) + 2, 0,
+             f'{len(out)} device(s).  '
+             f'Green < 14 days  |  Amber 14-29 days  |  Red 30-59 days  |  Dark red ≥ 60 days.',
+             note_fmt)
+    log.debug('Device Inventory sheet written: %d devices', len(out))
 
 
 def build_raw_data_sheet(writer, raw_df):
