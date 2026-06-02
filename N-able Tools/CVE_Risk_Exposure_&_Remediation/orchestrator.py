@@ -85,6 +85,7 @@ class DashboardRequest:
     exclude_missing_rmm:  bool           = False
     report_month:         str            = ''
     stale_warning_days:   int            = 14   # flag active devices within this many days of going stale
+    skip_raw_data:        bool           = False  # omit Raw Data sheet (saves ~1.2M cell writes on 80k-row exports)
 
 @dataclass
 class DashboardResult:
@@ -645,7 +646,10 @@ def run(request: DashboardRequest) -> DashboardResult:
                         f"actively failing — see 'Patch Failures' sheet"
                     )
 
-            build_raw_data_sheet(writer, raw_df)
+            if not request.skip_raw_data:
+                build_raw_data_sheet(writer, raw_df)
+            else:
+                log.info("Raw Data sheet skipped (skip_raw_data=True)")
 
         log.info("Workbook written successfully")
 

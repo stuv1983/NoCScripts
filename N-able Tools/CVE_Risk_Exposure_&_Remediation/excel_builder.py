@@ -66,13 +66,11 @@ def _write_cve_links(ws, vuln_name_series, col_idx, link_fmt):
                          link_fmt, string=display)
 
 def _write_nvd_links(ws, vuln_name_series, col_idx, link_fmt):
+    # Plain text instead of hyperlinks: xlsxwriter has a hard limit of 65,530
+    # URLs per worksheet; large sheets (Chrome/Edge 40k+ rows) exceed it.
     for row_i, val in enumerate(vuln_name_series, start=1):
-        m = CVE_PATTERN.search(str(val))
-        if m:
-            cve_id = m.group(1).upper()
-            ws.write_url(row_i, col_idx,
-                         f'https://nvd.nist.gov/vuln/detail/{cve_id}',
-                         link_fmt, string='View')
+        if CVE_PATTERN.search(str(val)):
+            ws.write(row_i, col_idx, 'NVD ↗', link_fmt)
 
 # ── Trend Summary Sheet ───────────────────────────────────────────────────────
 
@@ -240,7 +238,7 @@ def build_trend_detail_sheets(writer, workbook, trend, link_fmt, sheets_subset=N
         if 'Vulnerability Name' in cl:
             vn_idx = cl.index('Vulnerability Name')
             ws.set_column(vn_idx, vn_idx, 25, link_fmt)
-            _write_cve_links(ws, df['Vulnerability Name'], vn_idx, link_fmt)
+            # CVE text already written by to_excel(); set_column applies blue colour
         if 'NVD' in cl:
             nvd_idx = cl.index('NVD')
             ws.set_column(nvd_idx, nvd_idx, 10, link_fmt)
@@ -674,7 +672,7 @@ def build_all_detections_sheet(writer, merged_df, link_fmt, missing_row_fmt):
     if 'Vulnerability Name' in cl:
         vn_idx = cl.index('Vulnerability Name')
         ws.set_column(vn_idx, vn_idx, 25, link_fmt)
-        _write_cve_links(ws, df['Vulnerability Name'], vn_idx, link_fmt)
+        # CVE text already written by to_excel(); set_column applies blue colour
     if 'NVD' in cl:
         nvd_idx = cl.index('NVD')
         ws.set_column(nvd_idx, nvd_idx, 10, link_fmt)
@@ -746,21 +744,33 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
         if not _sheet_pk:
             _sheet_pk = _dp_detect_prod(str(product))
 
-        def _resolved_value(row):
-            # Approaching-stale devices: cannot confirm patch took effect if device
-            # hasn't checked in for >= warning_days. Raw data is source of truth —
-            # force ☐ so these rows never show blue regardless of patch_resolved_pairs.
-            if row['Name'] in approaching_stale_names:
-                return '☐'
-            nk = normalize_device_name(row['Name'])
-            ck = extract_cve_id(row['Vulnerability Name'])
-            if (nk, ck, _sheet_pk) in patch_resolved_pairs:
-                return '☑'
-            if patch_resolved_pairs and len(next(iter(patch_resolved_pairs))) == 2:
-                return '☑' if (nk, ck) in patch_resolved_pairs else '☐'
-            return '☐'
+        # ── Performance: pre-compute normalised keys ONCE per group ──────────────
+        # These are reused by both the Resolved column and the sparse set_row loop,
+        # eliminating the duplicate regex work that apply + iterrows previously caused.
+        _nk_list = [normalize_device_name(str(n)) for n in group['Name']]
+        _ck_list = [extract_cve_id(str(v))        for v in group['Vulnerability Name']]
 
-        group.insert(0, 'Resolved', group.apply(_resolved_value, axis=1))
+        # Build Resolved column via list comprehension (replaces slow apply per row)
+        if not patch_resolved_pairs and not approaching_stale_names:
+            _res_list = ['☐'] * len(group)          # fast path — no patch data at all
+        else:
+            if patch_resolved_pairs:
+                _sample = next(iter(patch_resolved_pairs))
+                if len(_sample) == 3:
+                    _res_list = ['☑' if (nk, ck, _sheet_pk) in patch_resolved_pairs else '☐'
+                                 for nk, ck in zip(_nk_list, _ck_list)]
+                else:
+                    _res_list = ['☑' if (nk, ck) in patch_resolved_pairs else '☐'
+                                 for nk, ck in zip(_nk_list, _ck_list)]
+            else:
+                _res_list = ['☐'] * len(group)
+            if approaching_stale_names:
+                _nm_list = group['Name'].tolist()
+                for _i, _n in enumerate(_nm_list):
+                    if _n in approaching_stale_names:
+                        _res_list[_i] = '☐'
+
+        group.insert(0, 'Resolved', _res_list)
         group['NVD'] = ''
 
         final_cols = [c for c in cols_order if c in group.columns]
@@ -826,41 +836,39 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
             })
 
         # ── Sparse colouring via set_row for Python-computed states ──
-        # Priority (highest to lowest):
-        #   1. Approaching stale — device offline >= warning_days.
-        #      Cannot trust any patch confirmation if the device hasn't checked in.
-        #      Overrides resolved (blue) because the device may not have received the patch.
-        #   2. Known exploit (orange-red) — unresolved high-priority CVE.
-        #   3. Patch gap types (coverage, unmanaged, mismatch, installing).
-        #   4. Resolved ☑ rows not in approaching — handled by conditional_format, skip.
-        # NOTE: set_row takes precedence over conditional_format in xlsxwriter,
-        # so we only call set_row when we intentionally want to override CF.
+        # Only approaching-stale and patch-gap rows need set_row; everything else is
+        # handled by the conditional_format rules above.  Skip the loop entirely when
+        # neither condition is active — that is the common case and saves ~80k iterations.
         _approaching = approaching_stale_names or set()
-        for row_i, (_, row) in enumerate(group[final_cols].iterrows(), start=1):
-            nk = normalize_device_name(str(row.get('Name', '')))
-            ck = extract_cve_id(str(row.get('Vulnerability Name', '')))
-            # Priority 1: approaching-stale overrides everything — device offline >= warning_days.
-            # We cannot confirm the patch actually applied if the device never checked back in.
-            if str(row.get('Name', '')) in _approaching:
-                gap = patch_gap_pairs.get((nk, ck))
-                ws.set_row(row_i, None, _GAP_FMTS.get(gap, approaching_fmt) if gap and gap in _GAP_FMTS else approaching_fmt)
-                continue
-            # Priority 2: skip resolved rows — handled by conditional_format ☑ → blue
-            _row_resolved = str(row.get('Resolved', '')).strip() == '☑'
-            if _row_resolved:
-                continue
-            # Priority 3: known exploit on unresolved row
-            if str(row.get(_exp_col, '')).strip().lower() in _TRUE_VALS:
-                continue
-            # Priority 4: patch gap types
-            gap = patch_gap_pairs.get((nk, ck))
-            if gap and gap in _GAP_FMTS:
-                ws.set_row(row_i, None, _GAP_FMTS[gap])
+        if _approaching or patch_gap_pairs:
+            # Pre-build column arrays so we avoid per-row dict look-ups from iterrows
+            _name_arr    = group['Name'].tolist()    if 'Name'          in group.columns else [''] * len(group)
+            _exp_arr     = (group[_exp_col].astype(str).str.strip().str.lower().tolist()
+                            if _exp_col in group.columns else [''] * len(group))
+            for _ri, (_nk, _ck, _nm, _rv, _ev) in enumerate(
+                zip(_nk_list, _ck_list, _name_arr, _res_list, _exp_arr), start=1
+            ):
+                # Priority 1: approaching-stale overrides everything
+                if _nm in _approaching:
+                    _gap = patch_gap_pairs.get((_nk, _ck))
+                    ws.set_row(_ri, None, _GAP_FMTS.get(_gap, approaching_fmt)
+                               if _gap and _gap in _GAP_FMTS else approaching_fmt)
+                    continue
+                # Priority 2: resolved rows → handled by conditional_format
+                if _rv == '☑':
+                    continue
+                # Priority 3: known exploit → handled by conditional_format
+                if _ev in _TRUE_VALS:
+                    continue
+                # Priority 4: patch gap types
+                _gap = patch_gap_pairs.get((_nk, _ck))
+                if _gap and _gap in _GAP_FMTS:
+                    ws.set_row(_ri, None, _GAP_FMTS[_gap])
 
         if 'Vulnerability Name' in cl:
             vn_idx = cl.index('Vulnerability Name')
             ws.set_column(vn_idx, vn_idx, 25, link_fmt)
-            _write_cve_links(ws, group['Vulnerability Name'], vn_idx, link_fmt)
+            # CVE text already written by to_excel(); set_column applies blue colour
         if 'NVD' in cl:
             nvd_idx = cl.index('NVD')
             ws.set_column(nvd_idx, nvd_idx, 10, link_fmt)
@@ -1449,16 +1457,11 @@ def build_stale_cves_sheet(writer, df, link_fmt, not_in_rmm_cves_df=None) -> Non
             val = row_vals[_ci_src] if _ci_src is not None else ''
             safe = val if not (isinstance(val, float) and pd.isna(val)) else ''
             if col_nm == 'Vulnerability Name' and vn_idx is not None:
-                cve_id = extract_cve_id(str(safe))
-                url = f'https://nvd.nist.gov/vuln/detail/{cve_id}' if cve_id else ''
-                if url: ws.write_url(ri, ci, url, _lfmt, str(safe))
-                else:   ws.write(ri, ci, str(safe), _rfmt)
+                ws.write(ri, ci, str(safe), _rfmt)
             elif col_nm == 'NVD':
                 cve_val = row_vals[vn_idx] if vn_idx is not None else ''
                 cve_id  = extract_cve_id(str(cve_val))
-                url = f'https://nvd.nist.gov/vuln/detail/{cve_id}' if cve_id else ''
-                if url: ws.write_url(ri, nvd_idx, url, _lfmt, 'NVD ↗')
-                else:   ws.write(ri, nvd_idx, '', _rfmt)
+                ws.write(ri, nvd_idx, 'NVD ↗' if cve_id else '', _rfmt)
             else:
                 ws.write(ri, ci, safe, _rfmt)
 
@@ -1674,8 +1677,27 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     _all_cves      = int(_all_df['Vulnerability Name'].nunique()) if 'Vulnerability Name' in _all_df.columns else 0
     _all_devs      = int(_all_df['Name'].nunique())               if 'Name'               in _all_df.columns else 0
     _all_sc        = pd.to_numeric(_all_df.get(score_col, pd.Series(dtype=float)), errors='coerce') if score_col else pd.Series(dtype=float)
-    _all_crit      = int((_all_sc >= 9.0).sum())
-    _all_crit_cves = int(_all_df.loc[_all_sc >= 9.0, 'Vulnerability Name'].nunique()) if 'Vulnerability Name' in _all_df.columns else 0
+
+    # For CVSS 9+ counts use the FULL stale_excluded_df (deduplicated Name+CVE),
+    # NOT _stale_dedup which filters to _p2s_keys (active products only).
+    # A stale device running a product absent from active triage (e.g. curl only
+    # on stale hosts) would otherwise be silently dropped, showing All=0.
+    if stale_excluded_df is not None and not stale_excluded_df.empty:
+        _stale_full_dedup = stale_excluded_df.drop_duplicates(subset=['Name', 'Vulnerability Name']).copy()
+    else:
+        _stale_full_dedup = pd.DataFrame()
+    _stale_full_sc = (
+        pd.to_numeric(_stale_full_dedup[score_col], errors='coerce')
+        if score_col and not _stale_full_dedup.empty and score_col in _stale_full_dedup.columns
+        else pd.Series(dtype=float)
+    )
+    _stale_full_crit      = int((_stale_full_sc >= 9.0).sum())
+    _stale_full_crit_cves = (
+        int(_stale_full_dedup.loc[_stale_full_sc >= 9.0, 'Vulnerability Name'].nunique())
+        if 'Vulnerability Name' in _stale_full_dedup.columns else 0
+    )
+    _all_crit      = crit_rows + _stale_full_crit
+    _all_crit_cves = crit_cves + _stale_full_crit_cves
 
     # stale crit rows from _stale_dedup directly (consistent with _all_rows)
     if not _stale_dedup.empty and score_col and score_col in _stale_dedup.columns:
@@ -1685,8 +1707,8 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
 
     _excl_rows          = len(_stale_dedup) + not_in_rmm_cve_count
     _excl_devs_tot      = _stale_devs + _nirm_devs
-    _excl_crit_tot      = _stale_crit_dedup + _nirm_crit
-    _excl_crit_cves_tot = _stale_crit_cves + _nirm_crit_cves
+    _excl_crit_tot      = _stale_full_crit + _nirm_crit        # full stale, not _p2s_keys-filtered
+    _excl_crit_cves_tot = _stale_full_crit_cves + _nirm_crit_cves
 
     row = 3
     ws.merge_range(row, 0, row, 3, '  Key Metrics', sect_fmt)
@@ -1738,7 +1760,7 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         _live = True
     else:
         _live = False
-        _f_res   = None
+        _f_res   = None   # guard: prevents UnboundLocalError when no product sheets exist
         _f_unres = None
         _f_total = None
 
