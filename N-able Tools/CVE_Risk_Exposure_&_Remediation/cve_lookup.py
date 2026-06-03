@@ -349,34 +349,61 @@ def _extract_cvss_score(cve_org_data: 'Optional[dict]',
     """
     Extract the best available CVSS base score from CVE.org or NVD response.
     Priority: CVSSv4.0 > CVSSv3.1 > CVSSv3.0 > CVSSv2.0.
-    Checks CVE.org CNA + ADP containers first, then NVD metrics.
-    Returns None if no score found in either source.
+    Checks all CVE.org containers (CNA + every ADP) and all NVD metric entries,
+    then returns the highest-version score found across all of them.
+
+    Bug fix: the previous implementation returned on the first score found
+    anywhere, so a CVSSv2 score in the CNA container would win over a CVSSv3.1
+    score in an NVD ADP container.  Now we scan everything and keep the best.
+
+    NVD is only consulted when no v3.x+ score was found in any CVE.org container
+    (NVD is authoritative for CVSS enrichment but the CNA/ADP containers in the
+    local cvelistV5 JSON are checked first as they are already on disk).
     """
+    # Version rank: higher number = preferred
+    _CVE_ORG_RANK = {'cvssV4_0': 4, 'cvssV3_1': 3, 'cvssV3_0': 2, 'cvssV2_0': 1}
+    _NVD_RANK     = {'cvssMetricV40': 4, 'cvssMetricV31': 3,
+                     'cvssMetricV30': 2, 'cvssMetricV2': 1}
+
+    best_score:   Optional[float] = None
+    best_rank:    int             = 0
+
     if isinstance(cve_org_data, dict):
         _containers = cve_org_data.get('containers', {})
-        for _src in ([_containers.get('cna', {})] + (_containers.get('adp') or [])):
+        _sources = [_containers.get('cna') or {}] + list(_containers.get('adp') or [])
+        for _src in _sources:
             for _m in _src.get('metrics', []):
-                for _key in ('cvssV4_0', 'cvssV3_1', 'cvssV3_0', 'cvssV2_0'):
+                for _key, _rank in _CVE_ORG_RANK.items():
+                    if _rank <= best_rank:
+                        continue   # already have something better
                     try:
                         s = float(_m.get(_key, {}).get('baseScore', ''))
-                        return s
+                        best_score = s
+                        best_rank  = _rank
                     except (TypeError, ValueError):
                         pass
-    if isinstance(nvd_data, dict):
+
+    # Only fall back to NVD when we found no v3.x+ score from CVE.org containers.
+    # NVD v3.1 (rank 3) beats CVE.org v2.0 (rank 1); NVD v2 does not beat CVE.org v3.
+    if best_rank < 3 and isinstance(nvd_data, dict):
         try:
             _vulns = nvd_data.get('vulnerabilities', [])
             if _vulns:
                 _mets = _vulns[0].get('cve', {}).get('metrics', {})
-                for _key in ('cvssMetricV40', 'cvssMetricV31', 'cvssMetricV30', 'cvssMetricV2'):
+                for _key, _rank in _NVD_RANK.items():
+                    if _rank <= best_rank:
+                        continue
                     for _ent in _mets.get(_key, []):
                         try:
                             s = float(_ent.get('cvssData', {}).get('baseScore', ''))
-                            return s
+                            best_score = s
+                            best_rank  = _rank
                         except (TypeError, ValueError):
                             pass
         except Exception:
             pass
-    return None
+
+    return best_score
 
 
 # ==============================================================================
@@ -1244,22 +1271,20 @@ def enrich_from_detections(cve_df: 'pd.DataFrame',
         if cached_skip:
             log.info("cve_lookup: skipping %d CVE(s) in no-data cache", cached_skip)
 
-        if not missing:
-            log.debug("cve_lookup: all %d CVEs already have version data", len(all_cves))
-            return 0
-
-        log.info("cve_lookup: %d of %d CVE(s) without version data — looking up",
-                 len(missing), len(all_cves))
-        results = enrich_config(
-            cve_ids           = missing,
-            config_path       = config_path,
-            auto_add_products = auto_add_products,
-            cve_repo_path     = cve_repo_path,
-        )
-
-        # Fast CVSS pre-pass: read local JSON for all CVEs that have version
-        # data cached but no CVSS score yet.  File reads are ~1ms each — far
-        # cheaper than API calls, so we do this for the full dataset.
+        # Fast CVSS pre-pass: read local JSON for every CVE not yet in the CVSS
+        # score cache.  This runs BEFORE the API enrichment loop and is completely
+        # independent of the no-data cache.
+        #
+        # Bug fix: the previous code placed the pre-pass AFTER the early-return
+        # guard ("if not missing: return 0") and only ran it when there were CVEs
+        # needing version-data enrichment.  CVEs blocked by the no-data cache
+        # (API returned nothing within the last 30 days) never reached the pre-pass,
+        # so their CVSS scores were never read from the local repo even when the file
+        # was present.  That caused LOW/MODERATE severity-band scores (2.0 / 5.0)
+        # to persist in the report instead of the real NVD values.
+        #
+        # The pre-pass is now unconditional when a repo path is available: file reads
+        # are ~1ms each — the cost of scanning 1 000 CVEs is ~1 second total.
         if cve_repo_path:
             try:
                 with open(config_path, 'r', encoding='utf-8') as _fh:
@@ -1281,8 +1306,24 @@ def enrich_from_detections(cve_df: 'pd.DataFrame',
                         json.dump(_cfg2, _fh, indent=2)
                     log.info('cve_lookup: CVSS pre-pass populated %d score(s) from local repo',
                              _added)
+                else:
+                    log.debug('cve_lookup: CVSS pre-pass — no new scores (all %d CVEs already cached)',
+                              len(all_cves))
             except Exception as _pe:
                 log.debug('cve_lookup: CVSS pre-pass failed: %s', _pe)
+
+        if not missing:
+            log.debug("cve_lookup: all %d CVEs already have version data", len(all_cves))
+            return 0
+
+        log.info("cve_lookup: %d of %d CVE(s) without version data — looking up",
+                 len(missing), len(all_cves))
+        results = enrich_config(
+            cve_ids           = missing,
+            config_path       = config_path,
+            auto_add_products = auto_add_products,
+            cve_repo_path     = cve_repo_path,
+        )
 
         return len(results)
 
