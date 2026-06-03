@@ -257,7 +257,6 @@ Progress bar moved into a fixed-height `tk.Frame` with `pack_propagate(False)`. 
 
 **File:** `data_pipeline.py`
 
-
 Removed redundant duplicate `_sr` assignment in `process_patch_match()` that ran before the `_patch_status` rename (result was immediately overwritten by the post-rename assignment).
 
 ---
@@ -468,6 +467,170 @@ Fix in `excel_builder.py`: the overview tile now uses the same source as Client 
 
 ---
 
+### v0.20 — CVE Enrichment: Local cvelistV5 Repo Integration
+
+**Files:** `cve_lookup.py`, `orchestrator.py`
+
+#### Local Repo as Source 0
+
+The CVE lookup source order was extended with a new "Source 0" that reads directly from a local clone of the MITRE `cvelistV5` git repository, bypassing all network calls for already-cloned CVEs.
+
+`cve_lookup.py` — `_cve_local_path()`: constructs the expected filesystem path for a CVE JSON 5.0 file using the repo's directory layout (`cves/{year}/{prefix}xxx/CVE-{year}-{num}.json`). `_load_cve_org_local()`: opens the file and returns the parsed dict — identical structure to the CVE.org API response, so `_parse_cve_org()` handles both paths without branching.
+
+Full lookup order in `lookup_fixed_version()`:
+1. **Local cvelistV5 repo** — file read, no network round trip
+2. **CVE.org API** — only hit when local file is missing or has no version data
+3. **NVD API 2.0** — fallback when CVE.org returns nothing useful
+4. **OSV.dev** — last resort, especially for open-source packages
+
+Both `enrich_config()` and `enrich_from_detections()` accept a `cve_repo_path` parameter and pass it through to `lookup_fixed_version`. If the path is absent or the file doesn't exist, the function falls back silently — no error, no changed behaviour.
+
+#### CVSS Score Pre-pass
+
+`cve_lookup.py` — `enrich_from_detections()`: added a bulk CVSS pre-pass at the end of each enrichment run. After enriching version data, the function iterates all CVEs in the detection frame that are not yet in `cvss_score_cache`, reads each local JSON file (if the repo is present), and calls `_extract_cvss_score()` to populate the cache. Because each file read is ~1 ms, this pre-pass covers hundreds of CVEs in seconds without any network calls. Results are written back to `config.json` in a single write.
+
+`data_pipeline.py` — `load_vulnerability_data()`: Step 2 of score derivation (lines 500–514) applies the CVSS cache to the loaded DataFrame. When the pre-pass has already populated scores for CVEs that were previously derived from severity labels (CRITICAL/IMPORTANT/MODERATE/LOW), those approximate scores are upgraded to real CVSS floats automatically on the next run.
+
+#### Auto-repo Discovery in Orchestrator
+
+`orchestrator.py` — `_find_cve_repo()`: searches three candidate paths in order:
+1. Hardcoded project path (`C:\NoCScripts\...\cvelistV5`)
+2. Script's parent directory (`Path(__file__).parent / 'cvelistV5'`)
+3. Parent of script's parent (`Path(__file__).parent.parent / 'cvelistV5'`)
+
+Returns the first path that `exists()`, or `None`. `_pull_cve_repo()` runs `git pull --ff-only` on the found repo before each enrichment pass, with a 30-second timeout. Handles: `git` not on PATH, timeout, arbitrary exceptions — all non-fatal, logged at `WARNING` or `DEBUG`.
+
+The repo path is passed to `enrich_from_detections(df_vuln, cve_repo_path=_cve_repo)` so every run automatically uses local data where available.
+
+---
+
+### v0.21 — CVE Enrichment: Edge Chromium Supplement & Auto Product Map
+
+**Files:** `cve_lookup.py`
+
+#### Edge Chromium Version Resolution
+
+Chromium CVEs (filed against Google Chrome by the CNA) previously stored a Chrome fixed version under `chrome` but had no corresponding Edge entry. Microsoft Edge is a Chromium derivative on a separate version train — the Chrome version is incorrect for Edge compliance checks.
+
+`cve_lookup.py` — when `lookup_fixed_version` matches a CVE to `'chrome'` and `'edge'` is present in `product_map`, a supplementary Edge lookup runs:
+
+1. **CVE listed in Microsoft Edge release notes** — queries `edgeupdates.microsoft.com/api/products`, finds the Stable channel, walks releases sorted oldest-first, returns the first release that explicitly lists the CVE ID. Most authoritative source.
+2. **Chromium milestone fallback** — extracts the Chrome major version from the Chrome fixed version, finds the earliest Edge Stable release on that Chromium milestone whose release date is on or after the CVE publish date (date guard prevents attributing a pre-publication Edge release as the fix).
+3. **No result stored** — if neither method resolves a version, the `edge` key is omitted. No guessing.
+
+The Edge API response is cached module-level (`_EDGE_CACHE`) so it is fetched at most once per run regardless of how many Chromium CVEs are processed.
+
+Chrome and Edge canonical keys always receive independently determined versions — the Chrome version is never copied to `edge`.
+
+#### Auto Product Map
+
+`cve_lookup.py` — `_auto_update_product_map()`: when `auto_add_products=True` (the default), vendor/product pairs from CVE data that have no matching `product_map` entry are automatically registered. Two helper functions drive this:
+
+- `_derive_canonical()`: produces a stable lowercase alphanum+underscore key from the MITRE vendor/product string. Handles known divergences (e.g. `'haxx curl'` → `'curl'`, `'adobe acrobat'` → `'acrobat'`) via a `_KNOWN_CANONICAL` lookup before falling back to generic slug derivation.
+- `_derive_search_key()`: produces the substring that will match both the CVE export's `Affected Products` column and the patch report's `Patch` column — strips version numbers, architecture tags, and noise words so the key stays stable across releases.
+
+New entries are inserted before the first `'windows'` catch-all in `product_map` so specificity order is preserved. The canonical key is also seeded into `fixed_version_rules` so subsequent runs can store version data against it.
+
+#### Per-thread Session Pooling
+
+`cve_lookup.py` — replaced the module-level `_SESSION` global with `threading.local()` storage. Each worker thread in the `ThreadPoolExecutor` inside `enrich_config` now owns its own `requests.Session` and connection pool, eliminating pool exhaustion and state leakage under concurrent lookups.
+
+---
+
+### v0.22 — Config Health Check
+
+**File:** `orchestrator.py`
+
+Added `_config_health_check(cfg)` — runs at the start of every `run()` call and appends issues to `DashboardResult.warnings` without blocking execution.
+
+Checks performed:
+- **Duplicate `product_map` keys** — the same search string appearing more than once causes non-deterministic product matching (first-match wins, duplicates are dead entries).
+- **Orphaned `fixed_version_rules` entries** — a product key in `fixed_version_rules` with no corresponding `product_map` entry means its version rules can never be applied; the pipeline will never route a CVE to that key.
+- **Unparseable `_baseline` versions** — a `_baseline` value that fails the `^\d+(?:\.\d+){1,5}$` regex will cause `_version_gte` to return `None` for every comparison, silently classifying all devices as `'Version comparison failed'` instead of compliant or non-compliant.
+- **Chrome/Edge version collision** — if the same CVE ID has an identical version string under both `chrome` and `edge` in `fixed_version_rules`, it means the Chrome version was incorrectly copied to Edge. Chrome and Edge are on different version trains and must always differ.
+
+Issues are logged at `WARNING` level and surfaced to the GUI via `DashboardResult.warnings`.
+
+---
+
+### v0.23 — Dual-pass Stale Filter
+
+**File:** `orchestrator.py`
+
+The previous stale filter used a single date cutoff: devices last seen before `cutoff_date` were excluded. This correctly caught devices inactive since before the reporting period but missed devices that had gone offline during the period and were now ≥ 30 days stale by the time the report was generated.
+
+**Fix:** The orchestrator now runs two stale passes before building `stale_excluded`:
+
+- **Pass 1 — date-stale:** last `_Sort_Time` < `cutoff_date` AND `Last Response != 'Not Found in RMM'`. Unchanged from previous behaviour.
+- **Pass 2 — days-stale:** `Days Since Last Response >= 30` AND `Last Response != 'Not Found in RMM'` AND device not already caught by Pass 1. Uses `pd.to_numeric(..., errors='coerce')` so sentinel `'—'` values don't raise.
+
+Both passes are concatenated into `stale_excluded`. The union of their device names is removed from `merged_df` in a single filter. The log line reports both counts separately: `%d stale excluded (%d by date-filter, %d by %d-day rule)`.
+
+The stale Excluded Devices sheet `Reason` column distinguishes the two causes: `⏱ Date-Stale` vs `⏱ Days-Stale`.
+
+---
+
+### v0.24 — Raw Scanner Override for Checkbox Integrity
+
+**File:** `orchestrator.py`
+
+**Problem:** The patch tool's `patch_resolved_pairs` set could contain `(device, cve, product)` 3-tuples for CVEs that the N-able scanner still marks UNRESOLVED. When these pairs survived into `build_product_sheets`, the row rendered as a blue ☑ (resolved) even though the scanner disagreed. A stale cache entry, a product-name formatting difference, or a mismatched patch record could all produce false positives.
+
+**Fix:** A "bulletproof scanner override" step runs in the orchestrator immediately after `patch_resolved_pairs` is built, reading directly from `raw_df` (the pre-filter, pre-join source of truth):
+
+- **Step 1 — strip false positives:** builds `_unresolved_pairs_2d` as a set of `(device, cve)` 2-tuples from all rows where the scanner status is `UNRESOLVED`. Any 3-tuple in `patch_resolved_pairs` whose `(device, cve)` appears in `_unresolved_pairs_2d` is removed. Product-string formatting differences can never cause a miss because the comparison is 2-tuple, not 3-tuple.
+- **Step 2 — inject raw RESOLVED pairs:** builds `_raw_inject_pairs` from all rows where scanner status is `RESOLVED` and adds them to `patch_resolved_pairs`, skipping any pair where the scanner also shows `UNRESOLVED` on the same device+CVE. This ensures CVEs marked RESOLVED by N-able render as ☑ even without patch tool data.
+
+Rule: **UNRESOLVED always wins.** If the scanner shows UNRESOLVED for a (device, cve), no patch evidence — regardless of source — can override it to blue.
+
+---
+
+### v0.25 — Device Inventory Sheet
+
+**File:** `excel_builder.py`
+
+Added `build_device_report_sheet()` — writes all RMM devices to a `Device Inventory` sheet, one row per device, sorted by `Days Since Last Response` ascending (most recently seen first).
+
+Columns: Device Name, Device Type, OS, Last Response, Days Since Last Response, Username, Site, Serial Number, Manufacturer, Model. Columns are only written when present in `df_rmm` — the function does not raise on missing columns.
+
+Colour coding by recency:
+- **Green** (`#E8F5E9`) — seen within 7 days
+- **Amber** (`#FFF9C4`) — 8–14 days
+- **Red** (`#FFEBEE`) — 15–29 days
+- **Dark red** (`#FFCDD2`) — 30+ days (stale threshold)
+
+Called from orchestrator unconditionally when `df_rmm is not None`.
+
+---
+
+### v0.26 — Patch Failure Report Sheet
+
+**Files:** `data_pipeline.py`, `excel_builder.py`, `orchestrator.py`
+
+Added support for an optional N-able Patch Failure Report as a third input file, surfacing devices where patch delivery is actively failing alongside the CVE exposure data.
+
+`data_pipeline.py` — `load_patch_failure_report()`: reads the failure report, normalises device names, and returns a cleaned DataFrame. `build_patch_failure_lookup()`: aggregates by device, counts failures, and identifies the most common failure description per device.
+
+`excel_builder.py` — `build_patch_failure_sheet()`: writes a `Patch Failures` sheet showing all failure records with device, patch name, failure reason, and failure count. Devices that also appear in `triage_df` (i.e. have active CVEs) are highlighted to surface the intersection of "patch failing" and "CVE exposed".
+
+`orchestrator.py` — `DashboardRequest` gains `failure_report_path` and `include_failure_report` fields. When a failure report is loaded, the top 3 devices by failure count are appended to `DashboardResult.warnings`. If any failure devices also carry unresolved CVEs, a second warning is appended with the CVE and device counts and a pointer to the Patch Failures sheet.
+
+`main.py` — Patch Failure Report file picker added to the Advanced dialog alongside the existing Patch Report picker.
+
+---
+
+### v0.27 — Browser Audit Integration
+
+**Files:** `data_pipeline.py`, `orchestrator.py`
+
+Added optional ingestion of a browser audit export (per-device installed browser version inventory) to enrich the version drift diagnostics sheet.
+
+`data_pipeline.py` — `load_browser_audit()`: reads the audit file, auto-detects browser sheets by name (Chrome, Edge, Firefox), normalises column names, and returns a unified DataFrame with a `Browser` column. `merge_browser_audit_into_drift()`: merges per-device audit data into the existing `version_drift_df` from `compute_patch_diagnostics`, adding an `Audit Note` column that flags per-user/AppData installs and 32-bit installs on 64-bit OS. These are common causes of version drift that patch tools miss because they scan system-level installs only.
+
+`orchestrator.py` — `DashboardRequest` gains `browser_audit_path` and `include_browser_audit` fields. When included, `merge_browser_audit_into_drift` is called after `compute_patch_diagnostics` and the result replaces `diagnostics['version_drift_df']`. Load errors are caught and appended to `warnings` rather than failing the run.
+
+---
+
 ## Known Architecture Decisions
 
 - **`not_in_rmm_df` excluded from trend arithmetic** — Not-in-RMM rows are excluded from `_active_trend_scope` via the `Last Response != 'Not Found in RMM'` filter regardless of whether an RMM inventory was provided. This is intentional: devices with no confirmed identity in the managed estate must not generate phantom New/Resolved/Persisting signals.
@@ -476,28 +639,41 @@ Fix in `excel_builder.py`: the overview tile now uses the same source as Client 
 
 - **`Status_p` naming preserved for display** — The patch report's `Status` column is renamed to `_patch_status` before the merge to avoid collision with the CVE `Status` column, then renamed back to `Status_p` before the internal column drop so the Excel output column name users see is unchanged.
 
----
+- **CVSS cache can overwrite source-file scores** — `load_vulnerability_data` applies the `cvss_score_cache` from `config.json` after loading, upgrading severity-band estimates to real CVSS floats. If the source file already contains real numeric scores, the cache still runs and may overwrite them with cached values from a prior enrichment run. This is intentional for files using severity labels; it is worth noting for files that already carry real scores.
 
+- **`approaching_stale_names` disabled** — The approaching-stale warning (amber highlight for devices within `stale_warning_days` of the staleness threshold) is implemented and wired through to `build_product_sheets` and `build_client_summary_sheet` but is currently commented out in the orchestrator pending further testing. The `stale_warning_days` field on `DashboardRequest` defaults to 14 and is accepted by all downstream functions.
+
+- **Resolved count off-by-one in trend comparison** — A known discrepancy of 1 in the "CVE types resolved" trend metric can occur when a CVE's cached CVSS score changes between the previous and current run. If a CVE was UNRESOLVED in the previous report at one score and is RESOLVED in the current report at a different score, the trend comparison logic may not correctly attribute it as resolved. The counts for New and Persisting CVEs are unaffected. Investigation is deferred; the root cause is in `compute_trends` score re-evaluation against the previous report's raw data.
+
+---
 
 ## Files Changed Per Release
 
-| Release | `main.py` | `orchestrator.py` | `data_pipeline.py` | `excel_builder.py` | `diagnostics.py` | `snapshot.py` | `run_dashboard.py` |
-|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| v0.2 | ✓ | ✓ | ✓ | ✓ | — | — | — |
-| v0.3 | ✓ | ✓ | ✓ | — | — | — | ✓ |
-| v0.4 | — | ✓ | ✓ | ✓ | ✓ | — | — |
-| v0.5 | — | ✓ | ✓ | — | — | ✓ | — |
-| v0.6 | — | ✓ | — | ✓ | — | — | — |
-| v0.7 | — | ✓ | — | ✓ | — | — | — |
-| v0.8 | — | — | ✓ | ✓ | — | — | — |
-| v0.9 | ✓ | — | — | — | — | — | — |
-| v0.10 | — | — | — | — | — | — | ✓ |
-| v0.11 | — | — | ✓ | — | — | — | — |
-| v0.12 | — | ✓ | ✓ | — | — | — | — |
-| v0.13 | — | — | ✓ | ✓ | — | — | — |
-| v0.14 | — | ✓ | ✓ | — | ✓ | — | — |
-| v0.15 | ✓ | — | — | — | — | — | — |
-| v0.16 | — | — | ✓ | ✓ | — | — | — |
-| v0.17 | — | — | — | ✓ | — | — | — |
-| v0.18 | — | ✓ | — | ✓ | — | — | — |
-| v0.19 | — | ✓ | — | ✓ | — | — | — |
+| Release | `main.py` | `orchestrator.py` | `data_pipeline.py` | `excel_builder.py` | `diagnostics.py` | `snapshot.py` | `run_dashboard.py` | `cve_lookup.py` |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| v0.2 | ✓ | ✓ | ✓ | ✓ | — | — | — | — |
+| v0.3 | ✓ | ✓ | ✓ | — | — | — | ✓ | — |
+| v0.4 | — | ✓ | ✓ | ✓ | ✓ | — | — | — |
+| v0.5 | — | ✓ | ✓ | — | — | ✓ | — | — |
+| v0.6 | — | ✓ | — | ✓ | — | — | — | — |
+| v0.7 | — | ✓ | — | ✓ | — | — | — | — |
+| v0.8 | — | — | ✓ | ✓ | — | — | — | — |
+| v0.9 | ✓ | — | — | — | — | — | — | — |
+| v0.10 | — | — | — | — | — | — | ✓ | — |
+| v0.11 | — | — | ✓ | — | — | — | — | — |
+| v0.12 | — | ✓ | ✓ | — | — | — | — | — |
+| v0.13 | — | — | ✓ | ✓ | — | — | — | — |
+| v0.14 | — | ✓ | ✓ | — | ✓ | — | — | — |
+| v0.15 | ✓ | — | — | — | — | — | — | — |
+| v0.16 | — | — | ✓ | ✓ | — | — | — | — |
+| v0.17 | — | — | — | ✓ | — | — | — | — |
+| v0.18 | — | ✓ | — | ✓ | — | — | — | — |
+| v0.19 | — | ✓ | — | ✓ | — | — | — | — |
+| v0.20 | — | ✓ | ✓ | — | — | — | — | ✓ |
+| v0.21 | — | — | — | — | — | — | — | ✓ |
+| v0.22 | — | ✓ | — | — | — | — | — | — |
+| v0.23 | — | ✓ | — | — | — | — | — | — |
+| v0.24 | — | ✓ | — | — | — | — | — | — |
+| v0.25 | — | ✓ | — | ✓ | — | — | — | — |
+| v0.26 | ✓ | ✓ | ✓ | ✓ | — | — | — | — |
+| v0.27 | — | ✓ | ✓ | — | — | — | — | — |
