@@ -261,8 +261,29 @@ def load_inventory(path, stale_days):
     client_name = inv["Customer name"].dropna().iloc[0] if "Customer name" in inv.columns and not inv["Customer name"].dropna().empty else ""
     return inv.copy(), inv[~stale_mask].copy(), inv[stale_mask].copy(), str(client_name).strip()
 
+def _read_csv_safe(path):
+    """
+    Read an N-able task-report CSV robustly.
+
+    The 'Output' column contains free-text that may include embedded newlines,
+    semicolons, and even extra commas inside a quoted field.  pandas' default
+    C parser raises ParserError when it encounters more fields than expected on
+    one of those internal lines.  The Python engine handles RFC-4180 quoting
+    correctly and is used as a fallback when the C engine fails.
+    """
+    read_kwargs = dict(
+        encoding="utf-8-sig",   # strip BOM if present (common in N-able exports)
+        on_bad_lines="warn",    # skip truly malformed lines rather than aborting
+    )
+    try:
+        return pd.read_csv(path, engine="c", **read_kwargs)
+    except Exception:
+        # Python engine is slower but handles multi-line quoted fields correctly
+        return pd.read_csv(path, engine="python", **read_kwargs)
+
+
 def load_audit(paths):
-    combined = pd.concat([pd.read_csv(p) for p in paths], ignore_index=True)
+    combined = pd.concat([_read_csv_safe(p) for p in paths], ignore_index=True)
     combined.columns = combined.columns.str.strip()
 
     required = {"Task", "Status", "Device", "Date", "Output", "Client", "Site"}
