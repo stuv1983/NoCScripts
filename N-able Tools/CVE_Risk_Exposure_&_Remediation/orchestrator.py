@@ -28,6 +28,7 @@ from data_pipeline import (
     normalize_device_name, extract_cve_id, clean_sheet_name,
     load_patch_failure_report, build_patch_failure_lookup,
     load_browser_audit, merge_browser_audit_into_drift,
+    _drop_internal,
 )
 from diagnostics import compute_patch_diagnostics, classify_root_cause
 import snapshot as snap_store
@@ -38,7 +39,7 @@ from excel_builder import (
     build_all_detections_sheet,
     build_product_sheets, build_stale_excluded_sheet,
     build_stale_cves_sheet,
-    build_raw_data_sheet, build_patch_sheets, build_diagnostics_sheets,
+    build_patch_sheets, build_diagnostics_sheets,
     build_patch_failure_sheet,
     build_products_not_tracked_sheet, build_patch_resolved_sheet,
     build_device_report_sheet,
@@ -686,7 +687,19 @@ def run(request: DashboardRequest) -> DashboardResult:
                         f"actively failing — see 'Patch Failures' sheet"
                     )
 
-            build_raw_data_sheet(writer, raw_df)
+            # Raw Data is written as a CSV sidecar alongside the Excel file
+            # instead of a sheet.  Writing 83k × 19 cols to xlsxwriter was the
+            # single largest write-time cost (~35s).  The CSV is used identically
+            # by load_previous_report next month — it accepts both .xlsx and .csv.
+            _raw_csv_path = (
+                Path(request.output_path).parent
+                / (Path(request.output_path).stem + '_RawData.csv')
+            )
+            try:
+                _drop_internal(raw_df).to_csv(_raw_csv_path, index=False)
+                log.info('Raw data written to %s (%d rows)', _raw_csv_path.name, len(raw_df))
+            except Exception as _csv_err:
+                log.warning('Could not write raw data CSV: %s', _csv_err)
             if df_rmm is not None:
                 build_device_report_sheet(writer, df_rmm)
 

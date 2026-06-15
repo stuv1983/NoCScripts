@@ -744,7 +744,7 @@ prev_report_entry, prev_report_browse_btn = _file_row(
     optional_card,
     row,
     prev_report_var,
-    lambda: select_file(prev_report_var, [("Excel Files", "*.xlsx")]),
+    lambda: select_file(prev_report_var, [("Previous Report", "*.xlsx *.csv"), ("Excel Files", "*.xlsx"), ("CSV RawData", "*.csv")]),
     state="disabled",
 )
 row += 1
