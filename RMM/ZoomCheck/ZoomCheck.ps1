@@ -4,13 +4,19 @@
     Finds all Zoom installations on this machine and reports location + version.
 .DESCRIPTION
     Searches Program Files, Program Files (x86), and every user's AppData
-    (both Roaming and Local) for Zoom.exe, then reads the file version from
-    each hit. No admin rights required for the current user's AppData; elevated
-    rights are needed to read other users' profiles.
+    (both Roaming and Local) for Zoom.exe, Zoom.msi, and other Zoom-related files,
+    then reads the file version from each hit.
 #>
 
 [CmdletBinding()]
 param()
+
+# --- Get device name for audit purposes ------------------------------------
+$deviceName = $env:COMPUTERNAME
+$auditTimestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+Write-Host "=== Zoom Audit Report ===" -ForegroundColor Green
+Write-Host "Device Name: $deviceName" -ForegroundColor Green
+Write-Host "Timestamp: $auditTimestamp`n" -ForegroundColor Green
 
 # --- Search roots ----------------------------------------------------------
 $searchPaths = [System.Collections.Generic.List[string]]::new()
@@ -33,13 +39,14 @@ if (Test-Path $profileRoot) {
 $searchPaths.Add("$env:APPDATA\Zoom")
 $searchPaths.Add("$env:LOCALAPPDATA\Zoom")
 
-# --- Find Zoom.exe in every root -------------------------------------------
+# --- Find Zoom files (exe, msi) in every root --------------------------------
 $found = [System.Collections.Generic.List[PSCustomObject]]::new()
 $seen  = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
 foreach ($root in ($searchPaths | Sort-Object -Unique)) {
     if (-not (Test-Path $root -ErrorAction SilentlyContinue)) { continue }
 
+    # Search for Zoom.exe (case-insensitive)
     $exes = Get-ChildItem -Path $root -Filter 'Zoom.exe' -Recurse -ErrorAction SilentlyContinue
     foreach ($exe in $exes) {
         if (-not $seen.Add($exe.FullName)) { continue }   # skip duplicates
@@ -51,8 +58,28 @@ foreach ($root in ($searchPaths | Sort-Object -Unique)) {
         }
 
         $found.Add([PSCustomObject]@{
-            Version  = if ($ver) { $ver } else { 'Unknown' }
-            Path     = $exe.FullName
+            DeviceName = $deviceName
+            Type       = 'Executable'
+            FileName   = $exe.Name
+            Version    = if ($ver) { $ver } else { 'Unknown' }
+            Path       = $exe.FullName
+            CreatedTime = $exe.CreationTime
+        })
+    }
+
+    # Search for Zoom.msi or zoom.msi installers
+    $msis = Get-ChildItem -Path $root -Filter '*.msi' -Recurse -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '(?i)zoom' }
+    foreach ($msi in $msis) {
+        if (-not $seen.Add($msi.FullName)) { continue }
+
+        $found.Add([PSCustomObject]@{
+            DeviceName = $deviceName
+            Type       = 'MSI Installer'
+            FileName   = $msi.Name
+            Version    = $msi.VersionInfo.FileVersion
+            Path       = $msi.FullName
+            CreatedTime = $msi.CreationTime
         })
     }
 }
@@ -61,12 +88,19 @@ foreach ($root in ($searchPaths | Sort-Object -Unique)) {
 if ($found.Count -eq 0) {
     Write-Host "No Zoom installations found." -ForegroundColor Yellow
 } else {
-    Write-Host "`nZoom installations found: $($found.Count)" -ForegroundColor Cyan
-    $found | Sort-Object Path | Format-Table -AutoSize
+    Write-Host "`n>> File System Findings: $($found.Count) Zoom installation(s) found`n" -ForegroundColor Cyan
+    $found | Sort-Object Path | Format-Table -AutoSize @(
+        'DeviceName',
+        'Type',
+        'FileName',
+        'Version',
+        'Path',
+        'CreatedTime'
+    )
 }
 
 # --- Registry uninstall keys ------------------------------------------------
-Write-Host "`nRegistry uninstall keys:" -ForegroundColor Cyan
+Write-Host ">> Registry Uninstall Keys:`n" -ForegroundColor Cyan
 
 $regRoots = @(
     # Machine-wide (64-bit)
@@ -108,6 +142,7 @@ $regResults = foreach ($root in $allRegRoots) {
             } else { '' }
 
             [PSCustomObject]@{
+                DeviceName     = $deviceName
                 DisplayName    = $props.DisplayName
                 DisplayVersion = $props.DisplayVersion
                 RegistryKey    = $_.PSPath -replace 'Microsoft\.PowerShell\.Core\\Registry::', ''
@@ -121,5 +156,8 @@ $regResults = foreach ($root in $allRegRoots) {
 if (-not $regResults) {
     Write-Host "No Zoom uninstall keys found in registry." -ForegroundColor Yellow
 } else {
+    Write-Host "$($regResults | Measure-Object | Select-Object -ExpandProperty Count) registry entry(ies) found:`n" -ForegroundColor Cyan
     $regResults | Sort-Object DisplayName | Format-List
 }
+
+Write-Host "`n=== End of Audit Report ===" -ForegroundColor Green
