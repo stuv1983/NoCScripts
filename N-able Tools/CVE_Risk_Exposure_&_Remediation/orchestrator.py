@@ -376,7 +376,7 @@ def run(request: DashboardRequest) -> DashboardResult:
         redetected_count = 0
         if request.include_trend and request.prev_report_path:
             log.info("Loading previous report for trend: %s", request.prev_report_path)
-            prev_df, prev_resolved_pairs = load_previous_report(request.prev_report_path)
+            prev_df, prev_resolved_pairs, prev_source_type = load_previous_report(request.prev_report_path)
             prev_report_name = Path(request.prev_report_path).name
             inventory_set    = (set(df_rmm['Device_Join'].unique())
                                 if df_rmm is not None else None)
@@ -387,7 +387,8 @@ def run(request: DashboardRequest) -> DashboardResult:
             trend_data       = compute_trends(merged_df, prev_df, request.threshold,
                                               inventory_devices=inventory_set,
                                               stale_devices=stale_names,
-                                              prev_resolved_pairs=prev_resolved_pairs)
+                                              prev_resolved_pairs=prev_resolved_pairs,
+                                              prev_source_type=prev_source_type)
             m = trend_data['metrics']
             log.info(
                 "Trend: %d new CVEs, %d resolved, %d persisting (common-product scope)",

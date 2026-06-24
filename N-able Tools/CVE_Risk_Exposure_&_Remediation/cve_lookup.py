@@ -851,8 +851,10 @@ def lookup_fixed_version(
     results: list[dict] = []
 
     # Source 0: local cvelistV5 repo (fastest — file read, no network round trip)
+    _local_file_found = False
     cve_org_data = _load_cve_org_local(cve_id, cve_repo_path) if cve_repo_path else None
     if cve_org_data:
+        _local_file_found = True
         results = _parse_cve_org(cve_org_data)
         if results:
             log.debug("cve_lookup: %s → local repo (%d entries)", cve_id, len(results))
@@ -869,8 +871,13 @@ def lookup_fixed_version(
             log.debug("cve_lookup: %s → CVE.org returned %d affected entries", cve_id, len(results))
 
     # Source 2: NVD (fallback)
+    # SKIP when the local cvelistV5 repo already had a file for this CVE.
+    # The local repo is mirrored from the same upstream as NVD's CVE data;
+    # if the local file had no version ranges, NVD almost certainly won't
+    # either — and hitting NVD for every such CVE burns 8s × retries per
+    # request due to NVD's rate limits and frequent timeouts.
     nvd_data = None   # tracked separately for CVSS extraction
-    if not results:
+    if not results and not _local_file_found:
         time.sleep(_DELAY)
         nvd_data = _get(
             f'https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={cve_id}',
@@ -884,9 +891,12 @@ def lookup_fixed_version(
             else:
                 vulns = len(nvd_data.get('vulnerabilities', [])) if isinstance(nvd_data, dict) else 0
                 log.info("cve_lookup: NVD request succeeded for %s but no fixed-version CPE ranges were found (%d record(s))", cve_id, vulns)
+    elif not results and _local_file_found:
+        log.debug("cve_lookup: %s — local repo file had no version data, skipping NVD (same source)", cve_id)
 
     # Source 3: OSV.dev (fallback)
-    if not results:
+    # Also skip when local repo had the file — same rationale as NVD.
+    if not results and not _local_file_found:
         time.sleep(_DELAY)
         data = _get(f'https://api.osv.dev/v1/vulns/{cve_id}')
         if data:
@@ -1270,6 +1280,47 @@ def enrich_from_detections(cve_df: 'pd.DataFrame',
                           if c.upper().startswith('CVE-') and _fresh(c.upper()))
         if cached_skip:
             log.info("cve_lookup: skipping %d CVE(s) in no-data cache", cached_skip)
+
+        # ── Local-repo pre-screen ───────────────────────────────────────────────
+        # For every CVE in `missing`, check whether the local cvelistV5 file
+        # exists but contains no version ranges.  These CVEs have no product
+        # version data in the authoritative source — hitting NVD/OSV won't help.
+        # Cache them as no-data immediately so future runs skip them entirely,
+        # AND remove them from the `missing` list so we never make a network call.
+        #
+        # CVEs whose local file is absent (truly unknown to the local repo) are
+        # left in `missing` so the network fallback can still find them.
+        if cve_repo_path and missing:
+            _pre_no_data: list[str] = []
+            for _cve in missing:
+                _local = _load_cve_org_local(_cve.upper(), cve_repo_path)
+                if _local is not None:           # file exists in local repo
+                    _local_results = _parse_cve_org(_local)
+                    if not _local_results:       # but has no version ranges
+                        _pre_no_data.append(_cve.upper())
+
+            if _pre_no_data:
+                # Write the pre-screened no-data entries to config.json cache
+                try:
+                    with open(config_path, 'r', encoding='utf-8') as _fh2:
+                        _cfg_nd = json.load(_fh2)
+                    _ndc = _cfg_nd.setdefault('cve_no_data_cache', {})
+                    for _cve in _pre_no_data:
+                        _ndc[_cve] = _dt.datetime.utcnow().strftime('%Y-%m-%d')
+                    _cfg_nd['cve_no_data_cache'] = _ndc
+                    with open(config_path, 'w', encoding='utf-8') as _fh2:
+                        json.dump(_cfg_nd, _fh2, indent=2)
+                    log.info(
+                        "cve_lookup: pre-screened %d CVE(s) — local repo has no version data, "
+                        "cached as no-data (skipping NVD/OSV)",
+                        len(_pre_no_data),
+                    )
+                except Exception as _pse:
+                    log.debug("cve_lookup: pre-screen cache write failed: %s", _pse)
+
+                # Remove from the network lookup queue
+                _pre_set = set(_pre_no_data)
+                missing  = [c for c in missing if c.upper() not in _pre_set]
 
         # Fast CVSS pre-pass: read local JSON for every CVE not yet in the CVSS
         # score cache.  This runs BEFORE the API enrichment loop and is completely

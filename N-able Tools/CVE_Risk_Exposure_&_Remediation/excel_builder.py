@@ -2047,20 +2047,12 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     ws.set_column('C:C', 18); ws.set_column('D:D', 14); ws.set_column('E:E', 16)
     ws.set_column('F:F', 24); ws.set_column('G:G', 20)
 
-    # CVSS Score Split
-    row+=1
-    ws.merge_range(row,0,row,3,'  CVSS Score Split  (active detection rows)',sect_fmt); row+=1
-    ws.write(row,0,'CVSS Score',hdr_fmt); ws.write(row,1,'Detection Rows',hdr_fmt)
-    ws.write(row,2,'% of Total',hdr_fmt); ws.write(row,3,'Unique CVEs',hdr_fmt); row+=1
-    score_split_start=row; score_split_data=[]
-    if score_col:
-        sg = triage_df.groupby(triage_df[score_col].round(1)).agg(rows=('Vulnerability Name','count'),cves=('Vulnerability Name','nunique')).sort_index(ascending=False)
-        for sv,sr in sg.iterrows():
-            pct=sr['rows']/total_rows if total_rows else 0
-            ws.write(row,0,float(sv),lbl_fmt); ws.write(row,1,int(sr['rows']),val_fmt)
-            ws.write(row,2,pct,val_pct); ws.write(row,3,int(sr['cves']),val_fmt)
-            score_split_data.append((float(sv),int(sr['rows']),int(sr['cves']))); row+=1
-    score_split_end=row-1
+    # CVSS Score Split -- TODO: re-enable when layout is agreed
+    # (block commented out; score_split_data/start/end stubs kept for
+#  any downstream code that references these variables)
+    score_split_start = row
+    score_split_data  = []
+    score_split_end   = row - 1
 
     # Month-over-Month
     mom_start_row=None; mom_data=[]
