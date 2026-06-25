@@ -7,7 +7,6 @@ import logging
 import os
 import re
 from datetime import datetime
-from pathlib import Path
 from typing import Optional, Set, Tuple
 
 import pandas as pd
@@ -1064,6 +1063,31 @@ def process_patch_match(patch_path, cve_df, min_score=9.0):
 # ==============================================================================
 
 def load_previous_report(file_path):
+    """
+    Load a previous period's data for trend comparison.
+
+    Accepts two file types:
+
+    1.  Dashboard output (produced by this tool)
+        Identified by the presence of a 'Raw Data' or 'All Detections' sheet.
+        The Raw Data sheet is the authoritative source — it contains ALL rows
+        (resolved + unresolved) so set arithmetic is accurate.
+
+    2.  Raw CVE export (direct N-able export, single sheet)
+        These exports may contain only UNRESOLVED rows (large datasets are
+        often filtered before export to keep file size manageable).
+        We detect this and set a flag so compute_trends can apply the correct
+        assumption: any device+CVE pair that appeared in the previous export
+        but is absent from the current one is treated as RESOLVED.
+
+    Returns
+    -------
+    (df, resolved_pairs, source_type)
+        df             — DataFrame with _Name_Key, _CVE_Key, Vulnerability Score
+        resolved_pairs — set of (device, cve_id) tuples from dashboard checkboxes
+                         (empty set for raw exports — no checkbox data available)
+        source_type    — 'dashboard' | 'raw_export'
+    """
     try:
         _fpath_lower = str(file_path).lower()
         _is_csv = _fpath_lower.endswith('.csv')
