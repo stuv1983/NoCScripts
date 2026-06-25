@@ -963,8 +963,11 @@ def lookup_fixed_version(
         log.info("cve_lookup: %s → %s",
                  cve_id, ', '.join(f'{k}={v}' for k, v in matched.items()))
     elif not (auto_add_products and unmatched):
-        # Only warn if we didn't handle the unmatched entries ourselves
-        log.warning("cve_lookup: %s — data found but no product_map matches", cve_id)
+        # Only log if we didn't handle the unmatched entries ourselves.
+        # Demoted to DEBUG: these are CVEs for products not in product_map
+        # (e.g. Windows, Office, Dell). They get cached after first run so
+        # subsequent runs skip them silently. Warning is noise for end users.
+        log.debug("cve_lookup: %s — data found but no product_map matches", cve_id)
 
     # ── Edge Chromium supplement ───────────────────────────────────────────────
     # When a CVE matched 'chrome' (upstream CNA records only list Google Chrome),

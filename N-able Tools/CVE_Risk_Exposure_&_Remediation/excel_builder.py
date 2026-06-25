@@ -16,6 +16,135 @@ from data_pipeline import (
 
 log = logging.getLogger(__name__)
 
+# ── Patching Health Score ──────────────────────────────────────────────────────
+
+def compute_patching_health_score(
+    triage_dedup: 'pd.DataFrame',
+    is_res: 'pd.Series',
+    is_unr: 'pd.Series',
+    trend_data: 'Optional[dict]' = None,
+) -> dict:
+    """
+    Compute a 0–100 Patching Health Score from the active (triage) scope.
+
+    Scoring model
+    -------------
+    Component                            Weight   Basis
+    ──────────────────────────────────── ──────   ─────────────────────────────────────
+    Resolution rate                        60 pts  % of detection rows marked Resolved
+    Critical (CVSS 9+) coverage            20 pts  % of CVSS 9+ rows that are Resolved
+    Known-exploit coverage                 20 pts  % of known-exploit rows Resolved
+    ──────────────────────────────────── ──────
+    Subtotal (before penalties)           100 pts
+
+    Penalties (deducted from subtotal, floor = 0)
+    ─────────────────────────────────────────────
+    Persisting CVEs (from trend data)   up to –5 pts  (–0.5 per persisting CVE type, cap –5)
+    Unresolved CISA KEV CVEs            up to –5 pts  (–1 per unresolved KEV CVE type,  cap –5)
+
+    Grade bands
+    ───────────
+    A  90–100   Excellent — nearly all CVEs remediated
+    B  75–89    Good      — strong coverage, minor gaps
+    C  60–74    Fair      — meaningful progress, notable gaps remain
+    D  40–59    Poor      — significant unresolved exposure
+    F   0–39    Critical  — majority of CVEs unpatched, immediate action needed
+    """
+    total_rows = len(triage_dedup)
+    if total_rows == 0:
+        return {
+            'score': 0, 'grade': 'N/A', 'grade_colour': '#D9D9D9',
+            'components': {}, 'penalties': {}, 'resolution_rate': 0.0,
+        }
+
+    # Component 1: Resolution rate (60 pts)
+    res_count = int(is_res.sum())
+    res_rate  = res_count / total_rows
+    pts_res   = round(res_rate * 60, 2)
+
+    # Component 2: Critical CVE coverage — CVSS 9+ (20 pts)
+    score_col = 'Vulnerability Score' if 'Vulnerability Score' in triage_dedup.columns else None
+    if score_col:
+        _sc_num    = pd.to_numeric(triage_dedup[score_col], errors='coerce')
+        crit_mask  = _sc_num >= 9.0
+        crit_total = int(crit_mask.sum())
+        crit_res   = int((crit_mask & is_res).sum())
+        crit_rate  = crit_res / crit_total if crit_total else 1.0
+    else:
+        crit_total = 0; crit_res = 0; crit_rate = 1.0
+    pts_crit = round(crit_rate * 20, 2)
+
+    # Component 3: Known-exploit coverage (20 pts)
+    exp_col = 'Has Known Exploit' if 'Has Known Exploit' in triage_dedup.columns else None
+    if exp_col:
+        exp_mask   = triage_dedup[exp_col].astype(str).str.strip().str.lower().isin(
+            ['yes', 'true', '1', 'y'])
+        exp_total  = int(exp_mask.sum())
+        exp_res    = int((exp_mask & is_res).sum())
+        exp_rate   = exp_res / exp_total if exp_total else 1.0
+    else:
+        exp_total = 0; exp_res = 0; exp_rate = 1.0
+    pts_exp = round(exp_rate * 20, 2)
+
+    subtotal = pts_res + pts_crit + pts_exp
+
+    # Penalty 1: Persisting CVE types from trend comparison
+    persisting_count = 0
+    if trend_data and isinstance(trend_data.get('metrics'), dict):
+        persisting_count = int(trend_data['metrics'].get('persisting_cve_count', 0))
+    pen_persisting = min(persisting_count * 0.5, 5.0)
+
+    # Penalty 2: Unresolved CISA KEV CVEs
+    kev_unres_cves = 0
+    kev_col = 'CISA KEV' if 'CISA KEV' in triage_dedup.columns else None
+    if kev_col and 'Vulnerability Name' in triage_dedup.columns:
+        kev_mask     = triage_dedup[kev_col].astype(str).str.strip().str.lower().isin(
+            ['yes', 'true', '1', 'y'])
+        kev_unres_df = triage_dedup[kev_mask & is_unr]
+        kev_unres_cves = int(kev_unres_df['Vulnerability Name'].nunique())
+    pen_kev = min(kev_unres_cves * 1.0, 5.0)
+
+    total_penalty = pen_persisting + pen_kev
+    raw_score     = max(0.0, subtotal - total_penalty)
+    score         = int(round(raw_score))
+
+    if score >= 90:
+        grade = 'A'; grade_colour = '#375623'
+    elif score >= 75:
+        grade = 'B'; grade_colour = '#70AD47'
+    elif score >= 60:
+        grade = 'C'; grade_colour = '#ED7D31'
+    elif score >= 40:
+        grade = 'D'; grade_colour = '#C00000'
+    else:
+        grade = 'F'; grade_colour = '#7B0000'
+
+    return {
+        'score':           score,
+        'grade':           grade,
+        'grade_colour':    grade_colour,
+        'resolution_rate': res_rate,
+        'components': {
+            'resolution': {
+                'rate': res_rate, 'pts': pts_res, 'weight': 60,
+                'resolved': res_count, 'total': total_rows,
+            },
+            'critical_coverage': {
+                'rate': crit_rate, 'pts': pts_crit, 'weight': 20,
+                'resolved': crit_res, 'total': crit_total,
+            },
+            'exploit_coverage': {
+                'rate': exp_rate, 'pts': pts_exp, 'weight': 20,
+                'resolved': exp_res, 'total': exp_total,
+            },
+        },
+        'penalties': {
+            'persisting_cves': {'count': persisting_count, 'pts': pen_persisting},
+            'kev_unresolved':  {'count': kev_unres_cves,   'pts': pen_kev},
+        },
+    }
+
+
 # EXCEL SHEET BUILDERS
 # ==============================================================================
 
@@ -788,10 +917,18 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
         group['NVD'] = ''
 
         final_cols = [c for c in cols_order if c in group.columns]
-        group[final_cols].to_excel(writer, sheet_name=sheet_name, index=False)
+        _out = group[final_cols]
 
-        ws  = writer.sheets[sheet_name]
+        # Direct write_row bypasses pandas to_excel overhead (~1.6× faster).
+        # Register the sheet in writer.sheets so all subsequent set_column /
+        # conditional_format / autofilter calls work exactly as before.
         wb_ = writer.book
+        ws  = wb_.add_worksheet(sheet_name)
+        writer.sheets[sheet_name] = ws
+        ws.write_row(0, 0, final_cols)
+        for _ri, _row in enumerate(_out.itertuples(index=False, name=None), start=1):
+            ws.write_row(_ri, 0, _row)
+
         ws.autofilter(0, 0, len(group), len(final_cols) - 1)
 
         styles_           = get_workbook_styles(wb_)
@@ -1532,7 +1669,8 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
                                report_month='',
                                approaching_stale_names: Optional[Set[str]] = None,
                                stale_warning_days: int = 14,
-                               product_to_sheet: Optional[dict] = None):
+                               product_to_sheet: Optional[dict] = None,
+                               include_health_score: bool = False):
     """
     Client Summary sheet.
 
@@ -1756,7 +1894,125 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     _excl_crit_tot      = _stale_full_crit + _nirm_crit        # full stale, not _p2s_keys-filtered
     _excl_crit_cves_tot = _stale_full_crit_cves + _nirm_crit_cves
 
-    row = 3
+    # ── Patching Health Score (beta) ──────────────────────────────────────────
+    # Only rendered when include_health_score=True (opt-in checkbox in the GUI).
+    if include_health_score:
+        _phs        = compute_patching_health_score(triage_dedup, _is_res, _is_unr, trend_data=trend_data)
+        _phs_score  = _phs['score']
+        _phs_grade  = _phs['grade']
+        _phs_colour = _phs['grade_colour']
+        _phs_comps  = _phs['components']
+        _phs_pens   = _phs['penalties']
+
+        _score_box_fmt = workbook.add_format({
+            'bold': True, 'font_size': 36, 'align': 'center', 'valign': 'vcenter',
+            'font_color': 'white', 'bg_color': _phs_colour, 'border': 2,
+        })
+        _grade_box_fmt = workbook.add_format({
+            'bold': True, 'font_size': 28, 'align': 'center', 'valign': 'vcenter',
+            'font_color': 'white', 'bg_color': _phs_colour, 'border': 2,
+        })
+        _score_lbl_fmt = workbook.add_format({
+            'bold': True, 'font_size': 10, 'align': 'center', 'valign': 'vcenter',
+            'font_color': '#595959', 'bg_color': '#F9F9F9', 'border': 1,
+        })
+        _comp_hdr_fmt = workbook.add_format({
+            'bold': True, 'font_size': 9, 'bg_color': '#D6E4F0', 'border': 1, 'align': 'center',
+        })
+        _comp_lbl_fmt = workbook.add_format({
+            'font_size': 9, 'bg_color': '#F2F2F2', 'border': 1,
+        })
+        _comp_pct_fmt = workbook.add_format({
+            'font_size': 9, 'num_format': '0%', 'align': 'right', 'border': 1,
+        })
+        _comp_pts_fmt = workbook.add_format({
+            'font_size': 9, 'num_format': '0.0', 'align': 'right', 'border': 1, 'font_color': '#1F3864',
+        })
+        _pen_neg_fmt = workbook.add_format({
+            'font_size': 9, 'num_format': '0.0', 'align': 'right', 'border': 1, 'font_color': '#C00000',
+        })
+        _pen_zero_fmt = workbook.add_format({
+            'font_size': 9, 'align': 'right', 'border': 1, 'font_color': '#595959',
+        })
+        _phs_final_lbl_fmt = workbook.add_format({
+            'bold': True, 'font_size': 9, 'bg_color': _phs_colour,
+            'font_color': 'white', 'border': 1,
+        })
+        _phs_final_val_fmt = workbook.add_format({
+            'bold': True, 'font_size': 9, 'num_format': '0', 'align': 'right',
+            'bg_color': _phs_colour, 'font_color': 'white', 'border': 1,
+        })
+        _score_note_fmt = workbook.add_format({
+            'italic': True, 'font_size': 8, 'font_color': '#595959', 'text_wrap': True,
+        })
+        _beta_fmt = workbook.add_format({
+            'italic': True, 'font_size': 8, 'font_color': '#7F6000',
+            'bg_color': '#FFF2CC', 'border': 1,
+        })
+
+        row = 3
+        ws.set_row(row,     44)
+        ws.set_row(row + 1, 14)
+        ws.merge_range(row, 0, row + 1, 1, _phs_score,                       _score_box_fmt)
+        ws.merge_range(row, 2, row + 1, 2, _phs_grade,                       _grade_box_fmt)
+        ws.merge_range(row, 3, row + 1, 3, 'Patching Health Score  (0\u2013100)', _score_lbl_fmt)
+        row += 2
+
+        ws.write(row, 0, 'Score Component',  _comp_hdr_fmt)
+        ws.write(row, 1, 'Coverage Rate',    _comp_hdr_fmt)
+        ws.write(row, 2, 'Points Earned',    _comp_hdr_fmt)
+        ws.write(row, 3, '/ Max',            _comp_hdr_fmt)
+        row += 1
+
+        for _lbl, _key, _max in [
+            ('Resolution rate',                  'resolution',       60),
+            ('Critical CVE coverage (CVSS \u22659)', 'critical_coverage', 20),
+            ('Known-exploit coverage',            'exploit_coverage', 20),
+        ]:
+            _c = _phs_comps.get(_key, {})
+            ws.write(row, 0, _lbl,                   _comp_lbl_fmt)
+            ws.write(row, 1, _c.get('rate', 1.0),    _comp_pct_fmt)
+            ws.write(row, 2, _c.get('pts',  _max),   _comp_pts_fmt)
+            ws.write(row, 3, f'/ {_max}',            _comp_lbl_fmt)
+            row += 1
+
+        for _plbl, _pkey, _punit in [
+            ('Persisting CVE types (\u22120.5 each, max \u22125)', 'persisting_cves', 'CVE types'),
+            ('Unresolved CISA KEV CVEs (\u22121 each, max \u22125)',  'kev_unresolved',  'KEV CVEs'),
+        ]:
+            _pen = _phs_pens.get(_pkey, {})
+            _ppts  = _pen.get('pts', 0)
+            _pcnt  = _pen.get('count', 0)
+            ws.write(row, 0, _plbl,               _comp_lbl_fmt)
+            ws.write(row, 1, f'{_pcnt} {_punit}', _comp_lbl_fmt)
+            ws.write(row, 2, -_ppts if _ppts > 0 else None, _pen_neg_fmt if _ppts > 0 else _pen_zero_fmt)
+            ws.write(row, 3, 'penalty',           _comp_lbl_fmt)
+            row += 1
+
+        ws.merge_range(row, 0, row, 1, f'Patching Health Score  (Grade {_phs_grade})', _phs_final_lbl_fmt)
+        ws.write(row, 2, _phs_score, _phs_final_val_fmt)
+        ws.write(row, 3, '/ 100',    _phs_final_lbl_fmt)
+        row += 1
+
+        ws.merge_range(row, 0, row, 3,
+            'Grade bands:  A \u2265 90  |  B \u2265 75  |  C \u2265 60  |  D \u2265 40  |  F < 40  \u00b7  '
+            'Score = Resolution rate (60 pts) + Critical CVE coverage (20 pts) + '
+            'Known-exploit coverage (20 pts) \u2212 penalties.  '
+            'Active scope only (stale / not-in-RMM excluded).',
+            _score_note_fmt)
+        ws.set_row(row, 28)
+        row += 1
+
+        ws.merge_range(row, 0, row, 3,
+            '\u26a0  Beta feature \u2014 scoring methodology may change. '
+            'Do not use for formal reporting without validation.',
+            _beta_fmt)
+        row += 2
+
+    else:
+        # Health score disabled — Key Metrics starts at row 3
+        row = 3
+
     ws.merge_range(row, 0, row, 3, '  Key Metrics', sect_fmt)
     row += 1
 

@@ -206,6 +206,7 @@ def process_reports():
         sync_baselines         = sync_baselines_var.get(),
         report_month           = report_month_var.get().strip(),
         stale_warning_days     = stale_warning_days,
+        include_health_score   = include_health_score_var.get(),
     )
 
     log.info("Starting dashboard generation: %s", output_path)
@@ -615,6 +616,7 @@ browser_audit_var = tk.StringVar()
 include_patch_var = tk.BooleanVar()
 include_failure_var = tk.BooleanVar()
 include_browser_audit_var = tk.BooleanVar()
+include_health_score_var = tk.BooleanVar()
 patch_status_var = tk.StringVar(value="Patch evidence: not configured")
 status_var = tk.StringVar(value="Ready")
 
@@ -724,7 +726,21 @@ ctk.CTkCheckBox(
     filters_card,
     text="Refresh product baselines before run",
     variable=sync_baselines_var,
-).grid(row=row, column=0, sticky="w", padx=16, pady=(2, 14))
+).grid(row=row, column=0, sticky="w", padx=16, pady=(2, 4))
+row += 1
+
+ctk.CTkCheckBox(
+    filters_card,
+    text="Show Patching Health Score on Summary sheet  ⚠ Beta",
+    variable=include_health_score_var,
+).grid(row=row, column=0, sticky="w", padx=16, pady=(0, 4))
+ctk.CTkLabel(
+    filters_card,
+    text="  Scoring methodology is experimental — not for formal reporting",
+    font=("", 11),
+    text_color="#7F6000",
+).grid(row=row, column=1, sticky="w", padx=(0, 16), pady=(0, 4))
+row += 1
 
 # ==========================================================================
 # OPTIONAL DATA CARD
@@ -744,7 +760,7 @@ prev_report_entry, prev_report_browse_btn = _file_row(
     optional_card,
     row,
     prev_report_var,
-    lambda: select_file(prev_report_var, [("Excel Files", "*.xlsx")]),
+    lambda: select_file(prev_report_var, [("Previous Report", "*.xlsx *.csv"), ("Excel Files", "*.xlsx"), ("CSV RawData", "*.csv")]),
     state="disabled",
 )
 row += 1

@@ -585,7 +585,7 @@ def load_rmm_data(file_path):
 
     return df.drop_duplicates(subset=['Device_Join'], keep='first')
 
-def merge_data(df_vuln, df_rmm, skip_rmm, exclude_missing_rmm=True):
+def merge_data(df_vuln, df_rmm, skip_rmm, exclude_missing_rmm=True, as_of_date=None):
     vuln_has_lr = 'Last Response' in df_vuln.columns
     vuln_has_dt = 'Device Type'   in df_vuln.columns
 
@@ -712,7 +712,9 @@ def merge_data(df_vuln, df_rmm, skip_rmm, exclude_missing_rmm=True):
                     break
 
     # Days Since Last Response — reuse already-parsed series, no second parse
-    _now      = pd.Timestamp.now()
+    # Use the supplied as_of_date (report generation date) so the count is
+    # frozen at the time the report was built, not recalculated on every run.
+    _now      = pd.Timestamp(as_of_date) if as_of_date is not None else pd.Timestamp.now()
     _no_data  = _sentinel_mask | (merged['_Sort_Time'] <= _epoch)
     _days_num = (_now - merged['_Sort_Time']).dt.days.clip(lower=0).astype(object)
     _days_num[_no_data] = '—'
@@ -1087,7 +1089,21 @@ def load_previous_report(file_path):
         source_type    — 'dashboard' | 'raw_export'
     """
     try:
-        xl = pd.ExcelFile(file_path, engine=_XLSX_ENGINE)
+        _fpath_lower = str(file_path).lower()
+        _is_csv = _fpath_lower.endswith('.csv')
+
+        if _is_csv:
+            # CSV path — read directly, skip ExcelFile entirely
+            try:
+                df_raw = pd.read_csv(file_path, dtype_backend='pyarrow')
+            except TypeError:
+                df_raw = pd.read_csv(file_path)
+            # Wrap in a minimal object so the rest of the function can share
+            # the same rename + validation logic via the Path B code below.
+            xl     = None
+            fname  = os.path.basename(file_path)
+        else:
+            xl = pd.ExcelFile(file_path, engine=_XLSX_ENGINE)
     except PermissionError:
         fname = os.path.basename(file_path)
         raise ValueError(f"'{fname}' is currently open in Excel.\n\nPlease close the file in Excel and try again.")
@@ -1099,12 +1115,45 @@ def load_previous_report(file_path):
         raise ValueError(f"Could not open '{fname}'.\n\nDetails: {e}")
 
     fname = os.path.basename(file_path)
-    _DASHBOARD_SHEETS = {'Raw Data', 'All Detections'}
-    _is_dashboard = bool(_DASHBOARD_SHEETS & set(xl.sheet_names))
+
+    # CSV files go straight to Path B (raw export) — no sheet detection needed
+    if _is_csv:
+        df = df_raw
+        # Fall through to the Path B rename + validation logic below
+        _force_raw_export = True
+    else:
+        _force_raw_export = False
+
+    if not _force_raw_export:
+        # 'Summary' is the Client Summary sheet — always present in new outputs.
+        # 'Raw Data' / 'All Detections' kept for backwards compatibility with older
+        # dashboards that still contain those sheets.
+        _DASHBOARD_SHEETS = {'Raw Data', 'All Detections', 'Summary'}
+        _is_dashboard = bool(_DASHBOARD_SHEETS & set(xl.sheet_names))
+    else:
+        _is_dashboard = False
 
     # ── Path A: Dashboard output ───────────────────────────────────────────────
     if _is_dashboard:
-        target = next((s for s in ('Raw Data', 'All Detections') if s in xl.sheet_names), xl.sheet_names[0])
+        _data_sheets = [s for s in ('Raw Data', 'All Detections') if s in xl.sheet_names]
+        if not _data_sheets:
+            # New-style dashboard (Raw Data sheet removed). Fall through so the
+            # the correct previous-report input — fall through to Path B so the
+            # caller gets a clear error rather than parsing 'Summary' as row data.
+            log.warning(
+                "load_previous_report: '%s' looks like a dashboard but has no "
+                "Raw Data / All Detections sheet.  Supply the previous month's "
+                "raw N-able CVE export as the previous report input instead.",
+                fname,
+            )
+            raise ValueError(
+                f"'{fname}' is a dashboard with no Raw Data sheet — it cannot be used directly\n"
+                "for trend comparison.\n\n"
+                "Use the previous month's raw N-able CVE detections export instead.\n"
+                "Any CVEs that were unresolved last month but are absent from the current\n"
+                "export will automatically be treated as resolved."
+            )
+        target = _data_sheets[0]
         df = xl.parse(target)
 
         missing = {'Name', 'Vulnerability Name'} - set(df.columns)
@@ -1195,32 +1244,34 @@ def load_previous_report(file_path):
         return df, resolved_pairs, 'dashboard'
 
     # ── Path B: Raw CVE export ─────────────────────────────────────────────────
-    # No dashboard sheets found.  Treat the first sheet as a raw export.
-    # These exports typically contain only UNRESOLVED rows (N-able filters
-    # resolved detections out by default, and large exports may be manually
-    # filtered to keep file size manageable).
+    # No dashboard sheets found.  Treat the first sheet (or the CSV itself) as
+    # a raw N-able CVE detections export.
     #
-    # Key implication for trend arithmetic:
-    #   _active_trend_scope already filters to UNRESOLVED rows.  Because a raw
-    #   export already IS the unresolved set, filtering by Threat Status would
-    #   work correctly *if* the column is present.  If it is absent (the export
-    #   was pre-filtered and the column dropped), we treat all rows as unresolved.
+    # N-able exports are inconsistent — some include both RESOLVED and UNRESOLVED
+    # rows (a 'Threat Status' or 'Status' column will be present); others are
+    # pre-filtered to UNRESOLVED only (no status column).
+    #
+    # Both cases are handled by _active_trend_scope:
+    #   • Status column present  → filter to UNRESOLVED rows only
+    #   • No status column       → treat all rows as unresolved
     #
     # "Missing from previous = resolved" assumption:
     #   Any (device, CVE) pair present in the previous raw export but absent
-    #   from the current report is classified as RESOLVED, which is the same
-    #   logic _active_trend_scope applies to dashboard Raw Data.  There is no
-    #   additional logic needed here — compute_trends handles it via set diff.
+    #   from the current report is classified as RESOLVED — compute_trends
+    #   handles this via set diff, no extra logic needed here.
 
-    # Detect whether it looks like an inventory/device report (wrong file)
-    _is_inventory = any(
-        'inventory' in s.lower() or 'device' in s.lower()
-        for s in xl.sheet_names
-    )
-
-    # Parse the first sheet
-    target = xl.sheet_names[0]
-    df = xl.parse(target)
+    # Detect whether it looks like an inventory/device report (wrong file type)
+    if _force_raw_export:
+        # CSV — no sheets to inspect; df already loaded above
+        _is_inventory = False
+        target = fname
+    else:
+        _is_inventory = any(
+            'inventory' in s.lower() or 'device' in s.lower()
+            for s in xl.sheet_names
+        )
+        target = xl.sheet_names[0]
+        df = xl.parse(target)
 
     # Apply the same column rename logic as load_vulnerability_data so column
     # names are normalised before the missing-column check.
@@ -1266,7 +1317,7 @@ def load_previous_report(file_path):
                 "  • A raw CVE detections export from N-able (must have Name/Asset Name "
                 "and Vulnerability Name/CVE ID columns)."
             )
-        _sheets_str = ', '.join(xl.sheet_names[:6]) + (' ...' if len(xl.sheet_names) > 6 else '')
+        _sheets_str = (', '.join(xl.sheet_names[:6]) + (' ...' if len(xl.sheet_names) > 6 else ''))  if xl is not None else '(CSV file — no sheets)'
         raise ValueError(f"Cannot use '{fname}' as a previous report.\n\n{_hint}\n\nSheets found: {_sheets_str}")
 
     # Derive Vulnerability Score from Severity if no numeric score column present
@@ -1324,12 +1375,33 @@ def _active_trend_scope(df: pd.DataFrame, threshold: float,
            else 'Status'   if 'Status'        in out.columns
            else None)
     if _sc:
-        # Status column present — filter to UNRESOLVED only as normal
+        # Status column present — filter to UNRESOLVED only.
+        # Handles both dashboard data and mixed N-able raw exports that include
+        # RESOLVED rows alongside UNRESOLVED ones.
+        _before = len(out)
         out = out[out[_sc].astype(str).str.strip().str.upper().eq('UNRESOLVED')].copy()
-    elif not is_raw_export:
+        if is_raw_export:
+            _resolved_count = _before - len(out)
+            if _resolved_count:
+                log.info(
+                    "_active_trend_scope: raw export has '%s' column — dropped %d RESOLVED row(s), "                    "keeping %d UNRESOLVED.",
+                    _sc, _resolved_count, len(out),
+                )
+            else:
+                log.debug(
+                    "_active_trend_scope: raw export has '%s' column, all %d rows are UNRESOLVED.",
+                    _sc, len(out),
+                )
+    elif is_raw_export:
+        # No status column — export was already filtered to unresolved before export.
+        # Treat all rows as unresolved (missing-from-current = resolved assumption applies).
+        log.info(
+            "_active_trend_scope: raw export has no status column — treating all %d rows "            "as UNRESOLVED. Any absent from current report will be counted as resolved.",
+            len(out),
+        )
+    else:
         # No status column in a dashboard file is unusual — log it but continue
         log.debug("_active_trend_scope: no Threat Status / Status column found")
-    # else: raw export with no status column — all rows are already unresolved, no filter needed
 
     if inventory_devices:
         out = out[out['_Name_Key'].isin(inventory_devices)].copy()

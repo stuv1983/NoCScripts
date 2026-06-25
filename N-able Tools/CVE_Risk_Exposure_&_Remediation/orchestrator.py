@@ -35,12 +35,12 @@ from excel_builder import (
     get_workbook_styles,
     build_client_summary_sheet,
     build_trend_summary_sheet, build_trend_detail_sheets,
-    build_all_detections_sheet,
     build_product_sheets, build_stale_excluded_sheet,
     build_stale_cves_sheet,
-    build_raw_data_sheet, build_patch_sheets, build_diagnostics_sheets,
+    build_patch_sheets, build_diagnostics_sheets,
     build_patch_failure_sheet,
-    build_products_not_tracked_sheet, build_patch_resolved_sheet,
+    build_products_not_tracked_sheet,
+    # build_patch_resolved_sheet,   # commented out — large sheet, slow to write
     build_device_report_sheet,
 )
 
@@ -120,6 +120,7 @@ class DashboardRequest:
     exclude_missing_rmm:  bool           = False
     report_month:         str            = ''
     stale_warning_days:   int            = 14   # flag active devices within this many days of going stale
+    include_health_score: bool           = False  # beta — show Patching Health Score on Summary sheet
 
 @dataclass
 class DashboardResult:
@@ -559,7 +560,7 @@ def run(request: DashboardRequest) -> DashboardResult:
                 warnings.append(f"Could not process patch failure report: {exc}")
 
         log.info("Writing workbook: %s", request.output_path)
-        with pd.ExcelWriter(request.output_path, engine='xlsxwriter') as writer:
+        with pd.ExcelWriter(request.output_path, engine='xlsxwriter') as writer:  # do NOT use constant_memory=True — corrupts data in xlsxwriter 3.x
             wb = writer.book
             styles     = get_workbook_styles(wb)
             link_fmt   = styles['link']
@@ -583,6 +584,7 @@ def run(request: DashboardRequest) -> DashboardResult:
                 approaching_stale_names=approaching_stale_names,
                 stale_warning_days=request.stale_warning_days,
                 product_to_sheet=product_to_sheet,
+                include_health_score=request.include_health_score,
             )
             if trend_data:
                 build_trend_summary_sheet(wb, trend_data, request.threshold,
@@ -651,7 +653,7 @@ def run(request: DashboardRequest) -> DashboardResult:
                         [_patch_full_aug, _raw_for_sheet], ignore_index=True, sort=False
                     ).drop_duplicates(subset=['Name', 'Vulnerability Name'], keep='first')
 
-                build_patch_resolved_sheet(writer, _patch_full_aug)
+                # build_patch_resolved_sheet(writer, _patch_full_aug)  # commented out — large sheet dominates write time
                 if any(not diagnostics[k].empty for k in diagnostics
                        if isinstance(diagnostics[k], pd.DataFrame)):
                     build_diagnostics_sheets(writer, diagnostics)
@@ -663,7 +665,7 @@ def run(request: DashboardRequest) -> DashboardResult:
                 _raw_for_sheet2['Patch Evidence Status'] = 'Patch confirmed - pending rescan'
                 if 'Patch Match Result' not in _raw_for_sheet2.columns:
                     _raw_for_sheet2['Patch Match Result'] = 'Resolved in N-able (Status=RESOLVED)'
-                build_patch_resolved_sheet(writer, _raw_for_sheet2)
+                # build_patch_resolved_sheet(writer, _raw_for_sheet2)  # commented out
 
             if failure_df is not None and failure_lookup:
                 inventory_devices = (
@@ -687,11 +689,12 @@ def run(request: DashboardRequest) -> DashboardResult:
                         f"actively failing — see 'Patch Failures' sheet"
                     )
 
-            build_raw_data_sheet(writer, raw_df)
+            # Raw Data sheet removed — CSV written below instead.
             if df_rmm is not None:
                 build_device_report_sheet(writer, df_rmm)
 
         log.info("Workbook written successfully")
+
 
         rc_summary: dict[str, int] = {}
         rc_df = diagnostics.get('root_cause_df', pd.DataFrame())
