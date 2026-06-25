@@ -1670,7 +1670,8 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
                                approaching_stale_names: Optional[Set[str]] = None,
                                stale_warning_days: int = 14,
                                product_to_sheet: Optional[dict] = None,
-                               include_health_score: bool = False):
+                               include_health_score: bool = False,
+                               patch_resolved_pairs: Optional[set] = None):
     """
     Client Summary sheet.
 
@@ -1734,18 +1735,80 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     else:
         triage_dedup = triage_df.drop_duplicates(subset=['Name', 'Vulnerability Name']).copy()
 
-    _sc = ('Threat Status' if 'Threat Status' in triage_dedup.columns
-           else 'Status'   if 'Status'        in triage_dedup.columns else None)
     _approaching_set = approaching_stale_names or set()
-    # Mirror the _resolved_value logic used in product sheets:
-    # approaching-stale devices are forced to ☐ (unresolved) regardless of Threat Status,
-    # because we cannot confirm a patch applied if the device hasn't checked in.
-    _is_approaching_row = (triage_dedup['Name'].isin(_approaching_set)
-                           if 'Name' in triage_dedup.columns
-                           else pd.Series([False] * len(triage_dedup), index=triage_dedup.index))
-    _raw_resolved = (triage_dedup[_sc].astype(str).str.strip().str.upper() == 'RESOLVED'
-                     if _sc else pd.Series([False] * len(triage_dedup), index=triage_dedup.index))
-    _is_res = _raw_resolved & ~_is_approaching_row   # approaching rows always count as unresolved
+
+    # ── Compute resolved/unresolved by replaying the exact same ☑/☐ logic
+    # that build_product_sheets writes into column A of each product sheet.
+    # This guarantees the cached values supplied to write_formula() match what
+    # the live COUNTIF formulas will compute.
+    #
+    # Resolution sources (mirror build_product_sheets priority):
+    #   1. patch_resolved_pairs — explicit patch evidence overrides everything
+    #   2. Threat Status / Status column == 'RESOLVED' — N-able export status
+    #   3. Neither → ☐ (unresolved)
+    # approaching-stale devices are always forced to ☐ regardless of source.
+    from data_pipeline import _detect_product as _dp_detect_prod_sum, normalize_device_name as _ndv_sum, extract_cve_id as _eci_sum
+    _p2s_sum   = product_to_sheet or {}
+    _sc_col    = ('Threat Status' if 'Threat Status' in triage_dedup.columns
+                  else 'Status'   if 'Status'        in triage_dedup.columns else None)
+    _res_flags = []   # True = ☑ for each row in triage_dedup
+
+    if 'Base Product' in triage_dedup.columns and _p2s_sum:
+        for _bp, _grp in triage_dedup.groupby('Base Product', sort=False):
+            if _bp not in _p2s_sum:
+                _res_flags.extend([False] * len(_grp))
+                continue
+            # Determine the product key this sheet uses (mirrors build_product_sheets logic)
+            _raw_pnames = _grp['Affected Products'].dropna().astype(str).unique().tolist() if 'Affected Products' in _grp.columns else []
+            _sheet_pk = ''
+            for _rpn in _raw_pnames:
+                _pk = _dp_detect_prod_sum(_rpn)
+                if _pk:
+                    _sheet_pk = _pk
+                    break
+            if not _sheet_pk:
+                _sheet_pk = _dp_detect_prod_sum(str(_bp))
+
+            _nk = [_ndv_sum(str(n)) for n in _grp['Name']]
+            _ck = [_eci_sum(str(v)) for v in _grp['Vulnerability Name']]
+            _nm = _grp['Name'].tolist()
+
+            # Source 1: patch_resolved_pairs (explicit patch evidence)
+            if patch_resolved_pairs:
+                _sample = next(iter(patch_resolved_pairs))
+                if len(_sample) == 3:
+                    _flags = [(nk, ck, _sheet_pk) in patch_resolved_pairs for nk, ck in zip(_nk, _ck)]
+                else:
+                    _flags = [(nk, ck) in patch_resolved_pairs for nk, ck in zip(_nk, _ck)]
+            else:
+                _flags = [False] * len(_grp)
+
+            # Source 2: Threat Status / Status column — rows not already resolved by patch data
+            if _sc_col and _sc_col in _grp.columns:
+                _status_resolved = _grp[_sc_col].astype(str).str.strip().str.upper().eq('RESOLVED').tolist()
+                _flags = [_flags[i] or _status_resolved[i] for i in range(len(_flags))]
+
+            # Approaching-stale devices are always ☐
+            if _approaching_set:
+                _flags = [False if _nm[i] in _approaching_set else _flags[i] for i in range(len(_flags))]
+            _res_flags.extend(_flags)
+    else:
+        # No product grouping — fall back to Threat Status column only
+        _is_approaching_row = (triage_dedup['Name'].isin(_approaching_set)
+                               if 'Name' in triage_dedup.columns
+                               else pd.Series([False] * len(triage_dedup), index=triage_dedup.index))
+        _raw_resolved = (triage_dedup[_sc_col].astype(str).str.strip().str.upper() == 'RESOLVED'
+                         if _sc_col else pd.Series([False] * len(triage_dedup), index=triage_dedup.index))
+        _res_flags = (_raw_resolved & ~_is_approaching_row).tolist()
+
+    if len(_res_flags) == len(triage_dedup):
+        _is_res = pd.Series(_res_flags, index=triage_dedup.index)
+    else:
+        # Length mismatch (groupby skipped some rows) — fall back to status column
+        _is_approaching_row_fb = triage_dedup['Name'].isin(_approaching_set) if 'Name' in triage_dedup.columns else pd.Series([False]*len(triage_dedup), index=triage_dedup.index)
+        _raw_resolved_fb = (triage_dedup[_sc_col].astype(str).str.strip().str.upper() == 'RESOLVED'
+                            if _sc_col else pd.Series([False]*len(triage_dedup), index=triage_dedup.index))
+        _is_res = _raw_resolved_fb & ~_is_approaching_row_fb
     _is_unr = ~_is_res
 
     total_rows     = len(triage_dedup)

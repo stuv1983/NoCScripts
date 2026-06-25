@@ -1066,14 +1066,8 @@ def load_previous_report(file_path):
     """
     Load a previous period's data for trend comparison.
 
-    Accepts two file types:
 
-    1.  Dashboard output (produced by this tool)
-        Identified by the presence of a 'Raw Data' or 'All Detections' sheet.
-        The Raw Data sheet is the authoritative source — it contains ALL rows
-        (resolved + unresolved) so set arithmetic is accurate.
-
-    2.  Raw CVE export (direct N-able export, single sheet)
+        Raw CVE export (direct N-able export, single sheet)
         These exports may contain only UNRESOLVED rows (large datasets are
         often filtered before export to keep file size manageable).
         We detect this and set a flag so compute_trends can apply the correct
@@ -1133,7 +1127,7 @@ def load_previous_report(file_path):
     else:
         _is_dashboard = False
 
-    # ── Path A: Dashboard output ───────────────────────────────────────────────
+    # ── Dashboard output ───────────────────────────────────────────────
     if _is_dashboard:
         _data_sheets = [s for s in ('Raw Data', 'All Detections') if s in xl.sheet_names]
         if not _data_sheets:
@@ -1243,10 +1237,8 @@ def load_previous_report(file_path):
         # Raw Data is the single source of truth — do NOT attach _Checkbox_Resolved.
         return df, resolved_pairs, 'dashboard'
 
-    # ── Path B: Raw CVE export ─────────────────────────────────────────────────
-    # No dashboard sheets found.  Treat the first sheet (or the CSV itself) as
-    # a raw N-able CVE detections export.
-    #
+
+    # ── Raw CVE export ───────────────────────────────────────────────
     # N-able exports are inconsistent — some include both RESOLVED and UNRESOLVED
     # rows (a 'Threat Status' or 'Status' column will be present); others are
     # pre-filtered to UNRESOLVED only (no status column).

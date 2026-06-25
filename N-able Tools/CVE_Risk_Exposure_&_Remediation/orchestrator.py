@@ -331,9 +331,6 @@ def run(request: DashboardRequest) -> DashboardResult:
             log.warning(msg)
             return DashboardResult(success=False, message=msg)
 
-        # These are views — confirmed by audit that excel_builder.py only reads
-        # from them via .loc[mask, col] (nunique/count), never writes.
-        # Adding a write to any of these later will raise SettingWithCopyWarning.
         filtered_df = merged_df[merged_df['Vulnerability Score'] >= request.threshold]
         triage_df   = filtered_df[filtered_df['Last Response'] != 'Not Found in RMM']
 
@@ -477,11 +474,6 @@ def run(request: DashboardRequest) -> DashboardResult:
                         f"see 'Patch Evidence Notes' sheet"
                     )
 
-        # ── Bulletproof raw scanner override ────────────────────────────────────
-        # Read directly from raw_df (pre-filter, pre-join source of truth) so no
-        # date-filter or RMM-join step can silently drop an UNRESOLVED row and let
-        # a false-positive blue ☑ survive.  2-tuple (device, cve) matching means
-        # product-name formatting differences can never cause a miss.
         from data_pipeline import _detect_product as _dp_detect_raw
         _unresolved_pairs_2d: set = set()
         _raw_inject_pairs:    set = set()
@@ -506,7 +498,6 @@ def run(request: DashboardRequest) -> DashboardResult:
 
         # Step 1: strip false positives from patch tool memory.
         # If the scanner says UNRESOLVED for (device, cve), remove every matching
-        # 3-tuple from patch_resolved_pairs regardless of product string.
         if _unresolved_pairs_2d and patch_resolved_pairs:
             to_remove = {p for p in patch_resolved_pairs if (p[0], p[1]) in _unresolved_pairs_2d}
             if to_remove:
@@ -536,12 +527,6 @@ def run(request: DashboardRequest) -> DashboardResult:
                 triage_df['Vulnerability Name'].apply(extract_cve_id),
                 triage_df['Affected Products'].astype(str).apply(_dp_detect),
             ))
-            # Count UNIQUE (device, cve) pairs confirmed — not 3-tuples.
-            # patch_resolved_pairs uses (device, cve, product) 3-tuples so the
-            # same device+CVE pair can appear multiple times (once per product
-            # that matches it, e.g. Chrome AND Edge both resolving CVE-2024-X).
-            # Counting 3-tuples produces a number larger than n_total (which is
-            # 2-tuple unique pairs), causing Unresolved = Total - Resolved < 0.
             _confirmed_3tuples = patch_resolved_pairs & triage_keys
             patch_confirmed_count = len({(d, v) for d, v, _ in _confirmed_3tuples})
 
