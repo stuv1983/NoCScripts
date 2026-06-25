@@ -1,8 +1,10 @@
 """
-config.py — loads config.json and exposes all shared constants.
+config.py — loads config.json and exposes shared constants.
 
 config.json is the single source of truth for product mappings and version rules.
 No product data lives in this file or any other Python file.
+
+Author : Stu Villanti <s.villanti@kenstra.com>
 """
 
 import json

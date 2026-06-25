@@ -4,12 +4,11 @@ orchestrator.py — pipeline coordinator.
 Receives a DashboardRequest, runs the pipeline, writes the workbook,
 and returns a DashboardResult.
 
-No tkinter.  No filedialog.  Fully testable headless.
+No tkinter. No filedialog. Fully testable headless.
 Business logic lives in: data_pipeline, diagnostics, snapshot, excel_builder.
 
+Author : Stu Villanti <s.villanti@kenstra.com>
 """
-# Copyright (c) 2026 stuart villanti, Inc. All rights reserved.
-# This code is licensed under the MIT License. See LICENSE in the project root for license terms.
 
 from __future__ import annotations
 

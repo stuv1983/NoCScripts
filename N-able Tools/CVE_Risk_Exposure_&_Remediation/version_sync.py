@@ -1,9 +1,9 @@
 """
-version_sync.py — automatically fetch current stable browser/app versions
-                  and update _baseline in config.json.
+version_sync.py — fetch current stable browser/app versions and update
+                  _baseline in config.json.
 
 Run manually:    python version_sync.py
-Or call from code:  from version_sync import sync_baselines; sync_baselines()
+Or from code:    from version_sync import sync_baselines; sync_baselines()
 
 On each successful fetch the _baseline value in config.json is updated in-place.
 Per-CVE rules are left untouched.
@@ -14,6 +14,8 @@ Chrome   versionhistory.googleapis.com  (Google's own API, no key required)
 Firefox  product-details.mozilla.org    (Mozilla's public JSON feed)
 Edge     edgeupdates.microsoft.com      (Microsoft's public update API)
 VLC      api.github.com/repos/videolan  (GitHub releases API)
+
+Author : Stu Villanti <s.villanti@kenstra.com>
 """
 
 from __future__ import annotations
@@ -29,7 +31,7 @@ from typing import Callable, Optional
 
 log = logging.getLogger(__name__)
 
-_UA = 'Mozilla/5.0 N-able-CVE-Dashboard/1.0 (automated; contact your-email@example.com)'
+_UA = 'Mozilla/5.0 N-able-CVE-Dashboard/1.0 (automated; contact s.villanti@kenstra.com)'
 _TIMEOUT = 10  # seconds
 _RETRY   = 3
 

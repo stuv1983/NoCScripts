@@ -1,14 +1,14 @@
 """
-tests/test_patch_resolution.py
-
-Unit tests for the Chrome/Edge patch resolution logic in data_pipeline.py.
+tests/test_patch_resolution.py — unit tests for Chrome/Edge patch resolution logic.
 
 Each test corresponds to a real scenario that has caused incorrect results
-in production.  The test name documents the scenario so failures are
-immediately understandable without reading the code.
+in production. Test names document the scenario so failures are immediately
+understandable without reading the code.
 
 Run with:
     pytest tests/test_patch_resolution.py -v
+
+Author : Stu Villanti <s.villanti@kenstra.com>
 """
 
 import os

@@ -10,6 +10,8 @@ Responsibilities:
     - Relay results / errors back to the GUI via root.after()
 
 Zero business logic. Zero data processing. Zero Excel writing.
+
+Author : Stu Villanti <s.villanti@kenstra.com>
 """
 
 import logging

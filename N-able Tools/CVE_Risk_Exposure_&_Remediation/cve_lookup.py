@@ -1,42 +1,35 @@
 """
-cve_lookup.py — fetch fixed version data from public CVE APIs and
-                automatically populate config.json fixed_version_rules.
+cve_lookup.py — fetch fixed-version data from public CVE APIs and populate
+                config.json fixed_version_rules.
 
 Sources (tried in order, first success wins):
-    1. CVE.org JSON API   — cveawg.mitre.org/api/cve/{id}
-                            Uses CVE JSON 5.0 schema — most authoritative source
+    1. CVE.org JSON API   — cveawg.mitre.org/api/cve/{id}          (CVE JSON 5.0)
     2. NVD API 2.0        — services.nvd.nist.gov/rest/json/cves/2.0
-                            Returns CPE match criteria with version ranges
     3. OSV.dev API        — api.osv.dev/v1/vulns/{id}
-                            Best for open-source packages (Chrome, Firefox etc.)
 
-Run manually:
+Usage:
     python cve_lookup.py CVE-2026-5288 CVE-2026-5289
     python cve_lookup.py --auto           # fetch all CVEs in config.json rules
     python cve_lookup.py --dry-run CVE-2026-5288
     python cve_lookup.py --test-nvd-api
 
-NVD API key support:
+NVD API key:
     Preferred: set environment variable NVD_API_KEY
     Optional:  config.json -> { "api": { "nvd_api_key": "..." } }
 
 Or from code:
     from cve_lookup import lookup_fixed_version, enrich_config
 
-What it does
-------------
-For each CVE it finds the minimum fixed version (the first version that
-contains the fix) and writes it into config.json fixed_version_rules under
-the matching canonical product key.
+For each CVE, finds the minimum fixed version and writes it into config.json
+fixed_version_rules under the matching canonical product key.
 
-The product key is determined by matching the CVE's vendor/product string
-against config.json product_map — the same matching logic used by the pipeline.
-
-Example config.json update:
+Example output in config.json:
     "chrome": {
-        "CVE-2026-5288": "136.0.7103.116",   ← added automatically
+        "CVE-2026-5288": "136.0.7103.116",
         "_baseline": "148.0.7778.97"
     }
+
+Author : Stu Villanti <s.villanti@kenstra.com>
 """
 
 from __future__ import annotations
@@ -54,7 +47,7 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
-_UA      = 'Mozilla/5.0 N-able-CVE-Dashboard/1.0 (automated; contact your-email@example.com)'
+_UA      = 'Mozilla/5.0 N-able-CVE-Dashboard/1.0 (automated; contact s.villanti@kenstra.com)'
 _TIMEOUT    = 8    # connect + read timeout per request attempt
 _RETRY      = 2    # reduced: 2 retries × 3 sources × 98 CVEs = still slow if all fail
 _DELAY   = 0.5   # seconds between API calls — be a polite client

@@ -2,9 +2,11 @@
 diagnostics.py — patch failure classification and remediation guidance.
 
 Classifies each unresolved device-CVE pair into one of five defensible states
-based only on data that is actually present in the patch report.  No guessing.
+based only on data present in the patch report.
 
 Internal cause codes are kept for logic; Excel output uses plain "Patch Evidence Notes".
+
+Author : Stu Villanti <s.villanti@kenstra.com>
 """
 
 from __future__ import annotations

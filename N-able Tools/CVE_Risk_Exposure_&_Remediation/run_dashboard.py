@@ -27,6 +27,8 @@ python run_dashboard.py \\
     --rmm      reports/device_inventory.xlsx \\
     --output   output/April_Dashboard.xlsx \\
     --previous output/March_Dashboard.xlsx
+
+Author : Stu Villanti <s.villanti@kenstra.com>
 """
 
 import argparse

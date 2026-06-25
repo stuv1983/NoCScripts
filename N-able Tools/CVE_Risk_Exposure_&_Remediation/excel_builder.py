@@ -1,6 +1,8 @@
 """
-excel_builder.py — all xlsxwriter sheet-building functions.
+excel_builder.py — xlsxwriter sheet-building functions.
 No pandas data loading. No GUI. Receives DataFrames, writes sheets.
+
+Author : Stu Villanti <s.villanti@kenstra.com>
 """
 
 import logging

@@ -5,9 +5,9 @@ Directory layout
 ----------------
 <output_dir>/
     snapshots/
-        index.json           master index of all runs (appended on each save)
-        2026-04.json         monthly aggregate (latest run per month)
-        2026-04-25T12-30.json  full per-run record
+        index.json              master index of all runs (appended on each save)
+        2026-04.json            monthly aggregate (latest run per month)
+        2026-04-25T12-30.json   full per-run record
 
 Design goals
 ------------
@@ -15,6 +15,8 @@ Design goals
 - Allow trend reconstruction from snapshots alone
 - Stay readable (JSON, not binary) and queryable without a database
 - Non-fatal: snapshot failures are logged as warnings, never crash the run
+
+Author : Stu Villanti <s.villanti@kenstra.com>
 """
 
 from __future__ import annotations
