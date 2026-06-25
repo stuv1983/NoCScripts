@@ -28,6 +28,7 @@ from data_pipeline import (
     normalize_device_name, extract_cve_id, clean_sheet_name,
     load_patch_failure_report, build_patch_failure_lookup,
     load_browser_audit, merge_browser_audit_into_drift,
+    _drop_internal,
 )
 from diagnostics import compute_patch_diagnostics, classify_root_cause
 import snapshot as snap_store
@@ -689,7 +690,7 @@ def run(request: DashboardRequest) -> DashboardResult:
                         f"actively failing — see 'Patch Failures' sheet"
                     )
 
-            # Raw Data sheet removed — CSV written below instead.
+            build_raw_data_sheet(writer, raw_df)
             if df_rmm is not None:
                 build_device_report_sheet(writer, df_rmm)
 
