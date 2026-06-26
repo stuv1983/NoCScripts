@@ -333,6 +333,14 @@ def run(request: DashboardRequest) -> DashboardResult:
         filtered_df = merged_df[merged_df['Vulnerability Score'] >= request.threshold]
         triage_df   = filtered_df[filtered_df['Last Response'] != 'Not Found in RMM']
 
+        # Health-score scope: always >= 7.0 so the critical-coverage component (CVSS >= 9)
+        # has a genuine non-critical baseline. When threshold is already below 7.0 this
+        # produces the same frame as triage_df.
+        _health_floor        = min(request.threshold, 7.0)
+        health_score_threshold = _health_floor
+        health_filtered      = merged_df[merged_df['Vulnerability Score'] >= _health_floor]
+        health_triage_df     = health_filtered[health_filtered['Last Response'] != 'Not Found in RMM']
+
         # Build a dedicated DataFrame for not-in-RMM devices so we can pass rows
         # (not just a count) into the stale sheet builders for audit tracking.
         not_in_rmm_df   = filtered_df[filtered_df['Last Response'] == 'Not Found in RMM']
@@ -477,26 +485,41 @@ def run(request: DashboardRequest) -> DashboardResult:
         _unresolved_pairs_2d: set = set()
         _raw_inject_pairs:    set = set()
 
+        # Determine once whether the current export carries a status column.
+        # When it does, build_product_sheets source 2 reads it directly per-row —
+        # injecting all RESOLVED rows into patch_resolved_pairs would be redundant
+        # and at large scale (70k+ rows) causes O(n×m) set lookups that stall writes.
+        _export_has_status_col = any(c in raw_df.columns
+                                     for c in ('Threat Status', 'Status', 'threat status', 'status'))
+
         for _col in ('Threat Status', 'Status', 'threat status', 'status'):
             if _col not in raw_df.columns:
                 continue
             _col_upper = raw_df[_col].astype(str).str.strip().str.upper()
+
+            # UNRESOLVED set: always built — used to override stale patch-evidence pairs
             _raw_unr = raw_df[_col_upper == 'UNRESOLVED']
             if not _raw_unr.empty:
                 _unresolved_pairs_2d |= set(zip(
                     _raw_unr['Name'].apply(normalize_device_name),
                     _raw_unr['Vulnerability Name'].apply(extract_cve_id),
                 ))
-            _raw_res = raw_df[_col_upper == 'RESOLVED']
-            if not _raw_res.empty:
-                _raw_inject_pairs |= set(zip(
-                    _raw_res['Name'].apply(normalize_device_name),
-                    _raw_res['Vulnerability Name'].apply(extract_cve_id),
-                    _raw_res['Affected Products'].astype(str).apply(_dp_detect_raw),
-                ))
+
+            # RESOLVED injection: only when there is no status column on the export.
+            # If the export has a status column, product sheets already read it as source 2.
+            # Injecting here would inflate patch_resolved_pairs to tens of thousands of
+            # entries and make every per-row set lookup in build_product_sheets O(n).
+            if not _export_has_status_col:
+                _raw_res = raw_df[_col_upper == 'RESOLVED']
+                if not _raw_res.empty:
+                    _raw_inject_pairs |= set(zip(
+                        _raw_res['Name'].apply(normalize_device_name),
+                        _raw_res['Vulnerability Name'].apply(extract_cve_id),
+                        _raw_res['Affected Products'].astype(str).apply(_dp_detect_raw),
+                    ))
 
         # Step 1: strip false positives from patch tool memory.
-        # If the scanner says UNRESOLVED for (device, cve), remove every matching
+        # If the scanner says UNRESOLVED for (device, cve), remove every matching pair.
         if _unresolved_pairs_2d and patch_resolved_pairs:
             to_remove = {p for p in patch_resolved_pairs if (p[0], p[1]) in _unresolved_pairs_2d}
             if to_remove:
@@ -507,8 +530,8 @@ def run(request: DashboardRequest) -> DashboardResult:
                     len(to_remove),
                 )
 
-        # Step 2: inject raw RESOLVED pairs, skipping any (device, cve) that is
-        # still UNRESOLVED in the scanner (UNRESOLVED always wins).
+        # Step 2: inject raw RESOLVED pairs — only runs when export has no status column
+        # (otherwise source 2 in build_product_sheets handles it per-row at zero overhead).
         if _raw_inject_pairs:
             clean = {p for p in _raw_inject_pairs if (p[0], p[1]) not in _unresolved_pairs_2d}
             skipped = len(_raw_inject_pairs) - len(clean)
@@ -517,6 +540,9 @@ def run(request: DashboardRequest) -> DashboardResult:
             _before = len(patch_resolved_pairs)
             patch_resolved_pairs |= clean
             log.info("Raw RESOLVED injection: %d pair(s) added", len(patch_resolved_pairs) - _before)
+        elif _export_has_status_col:
+            log.debug("Raw RESOLVED injection skipped — export has status column; "
+                      "product sheets read it directly (avoids large-set performance issue)")
 
         patch_confirmed_count = 0
         if patch_resolved_pairs:
@@ -569,6 +595,10 @@ def run(request: DashboardRequest) -> DashboardResult:
                 stale_warning_days=request.stale_warning_days,
                 product_to_sheet=product_to_sheet,
                 include_health_score=request.include_health_score,
+                patch_resolved_pairs=patch_resolved_pairs,
+                health_triage_df=health_triage_df,
+                health_score_threshold=health_score_threshold,
+                has_patch_report=patch_data is not None,
             )
             if trend_data:
                 build_trend_summary_sheet(wb, trend_data, request.threshold,
@@ -583,7 +613,9 @@ def run(request: DashboardRequest) -> DashboardResult:
                                   patch_resolved_pairs=patch_resolved_pairs,
                                   patch_gap_pairs=patch_gap_pairs,
                                   approaching_stale_names=approaching_stale_names,
-                                  stale_warning_days=request.stale_warning_days)
+                                  stale_warning_days=request.stale_warning_days,
+                                  health_triage_df=health_triage_df,
+                                  trend_data=trend_data)
 
             if not stale_excluded.empty or not not_in_rmm_df.empty:
                 build_stale_excluded_sheet(writer, stale_excluded,

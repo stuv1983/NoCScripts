@@ -21,53 +21,66 @@ log = logging.getLogger(__name__)
 # ── Patching Health Score ──────────────────────────────────────────────────────
 
 def compute_patching_health_score(
-    triage_dedup: 'pd.DataFrame',
+    score_scope_dedup: 'pd.DataFrame',
     is_res: 'pd.Series',
     is_unr: 'pd.Series',
     trend_data: 'Optional[dict]' = None,
+    has_patch_report: bool = False,
+    score_scope_threshold: float = 7.0,
 ) -> dict:
     """
-    Compute a 0–100 Patching Health Score from the active (triage) scope.
+    Compute a 0–100 Patching Health Score.
+
+    score_scope_dedup is the health-score scope (CVSS ≥ 7.0 by default), which is broader
+    than the display threshold (usually CVSS ≥ 9.0).  This keeps Component 1 (resolution
+    rate) and Component 2 (critical CVSS ≥ 9 coverage) genuinely distinct.
 
     Scoring model
-    -------------
+    ───────────────────────────────────────────────────────────────────────────
     Component                            Weight   Basis
-    ──────────────────────────────────── ──────   ─────────────────────────────────────
-    Resolution rate                        60 pts  % of detection rows marked Resolved
-    Critical (CVSS 9+) coverage            20 pts  % of CVSS 9+ rows that are Resolved
+    ──────────────────────────────────────── ──────   ─────────────────────────────────────
+    Resolution rate                        60 pts  % of CVSS ≥ 7.0 scope rows Resolved
+    Critical (CVSS ≥ 9) coverage           20 pts  % of CVSS 9+ rows Resolved
     Known-exploit coverage                 20 pts  % of known-exploit rows Resolved
-    ──────────────────────────────────── ──────
+    ──────────────────────────────────────── ──────
     Subtotal (before penalties)           100 pts
 
-    Penalties (deducted from subtotal, floor = 0)
+    Penalties (deducted, floor = 0)
     ─────────────────────────────────────────────
-    Persisting CVEs (from trend data)   up to –5 pts  (–0.5 per persisting CVE type, cap –5)
+    Persisting CVEs                     up to –5 pts  (–0.5 per persisting CVE type, cap –5)
     Unresolved CISA KEV CVEs            up to –5 pts  (–1 per unresolved KEV CVE type,  cap –5)
+
+    Hard grade caps (applied to numeric score before grade assignment)
+    ─────────────────────────────────────────────
+    KEV ≥ 3, or KEV > 0 with no patch report  → max score 74 (C ceiling)
+    KEV > 0                                    → max score 89 (B ceiling)
 
     Grade bands
     ───────────
-    A  90–100   Excellent — nearly all CVEs remediated
-    B  75–89    Good      — strong coverage, minor gaps
-    C  60–74    Fair      — meaningful progress, notable gaps remain
-    D  40–59    Poor      — significant unresolved exposure
-    F   0–39    Critical  — majority of CVEs unpatched, immediate action needed
+    A  90–100  Excellent — nearly all CVEs remediated
+    B  75–89   Good      — strong coverage, minor gaps
+    C  60–74   Fair      — meaningful progress, notable gaps remain
+    D  40–59   Poor      — significant unresolved exposure
+    F   0–39   Critical  — majority of CVEs unpatched, immediate action needed
     """
-    total_rows = len(triage_dedup)
+    total_rows = len(score_scope_dedup)
     if total_rows == 0:
         return {
             'score': 0, 'grade': 'N/A', 'grade_colour': '#D9D9D9',
             'components': {}, 'penalties': {}, 'resolution_rate': 0.0,
+            'confidence': {'has_patch_report': has_patch_report,
+                           'score_scope_threshold': score_scope_threshold},
         }
 
-    # Component 1: Resolution rate (60 pts)
+    # Component 1: Resolution rate (60 pts) across the full health scope
     res_count = int(is_res.sum())
     res_rate  = res_count / total_rows
     pts_res   = round(res_rate * 60, 2)
 
-    # Component 2: Critical CVE coverage — CVSS 9+ (20 pts)
-    score_col = 'Vulnerability Score' if 'Vulnerability Score' in triage_dedup.columns else None
+    # Component 2: Critical CVE coverage — CVSS 9+ subset (20 pts)
+    score_col = 'Vulnerability Score' if 'Vulnerability Score' in score_scope_dedup.columns else None
     if score_col:
-        _sc_num    = pd.to_numeric(triage_dedup[score_col], errors='coerce')
+        _sc_num    = pd.to_numeric(score_scope_dedup[score_col], errors='coerce')
         crit_mask  = _sc_num >= 9.0
         crit_total = int(crit_mask.sum())
         crit_res   = int((crit_mask & is_res).sum())
@@ -77,9 +90,9 @@ def compute_patching_health_score(
     pts_crit = round(crit_rate * 20, 2)
 
     # Component 3: Known-exploit coverage (20 pts)
-    exp_col = 'Has Known Exploit' if 'Has Known Exploit' in triage_dedup.columns else None
+    exp_col = 'Has Known Exploit' if 'Has Known Exploit' in score_scope_dedup.columns else None
     if exp_col:
-        exp_mask   = triage_dedup[exp_col].astype(str).str.strip().str.lower().isin(
+        exp_mask   = score_scope_dedup[exp_col].astype(str).str.strip().str.lower().isin(
             ['yes', 'true', '1', 'y'])
         exp_total  = int(exp_mask.sum())
         exp_res    = int((exp_mask & is_res).sum())
@@ -96,19 +109,27 @@ def compute_patching_health_score(
         persisting_count = int(trend_data['metrics'].get('persisting_cve_count', 0))
     pen_persisting = min(persisting_count * 0.5, 5.0)
 
-    # Penalty 2: Unresolved CISA KEV CVEs
+    # Penalty 2: Unresolved CISA KEV CVEs — counted on the health-score scope (CVSS ≥ 7.0).
+    # Using the broader scope is intentional: a KEV at CVSS 7.x is still active exploitation
+    # risk and should cap the grade regardless of the display threshold.
     kev_unres_cves = 0
-    kev_col = 'CISA KEV' if 'CISA KEV' in triage_dedup.columns else None
-    if kev_col and 'Vulnerability Name' in triage_dedup.columns:
-        kev_mask     = triage_dedup[kev_col].astype(str).str.strip().str.lower().isin(
+    kev_col = 'CISA KEV' if 'CISA KEV' in score_scope_dedup.columns else None
+    if kev_col and 'Vulnerability Name' in score_scope_dedup.columns:
+        kev_mask       = score_scope_dedup[kev_col].astype(str).str.strip().str.lower().isin(
             ['yes', 'true', '1', 'y'])
-        kev_unres_df = triage_dedup[kev_mask & is_unr]
+        kev_unres_df   = score_scope_dedup[kev_mask & is_unr]
         kev_unres_cves = int(kev_unres_df['Vulnerability Name'].nunique())
     pen_kev = min(kev_unres_cves * 1.0, 5.0)
 
     total_penalty = pen_persisting + pen_kev
     raw_score     = max(0.0, subtotal - total_penalty)
     score         = int(round(raw_score))
+
+    # Hard grade caps — applied to the numeric score so displayed number and grade always agree.
+    if kev_unres_cves >= 3 or (kev_unres_cves > 0 and not has_patch_report):
+        score = min(score, 74)   # KEV exposure without patch evidence → C ceiling
+    elif kev_unres_cves > 0:
+        score = min(score, 89)   # any unresolved KEV → B ceiling
 
     if score >= 90:
         grade = 'A'; grade_colour = '#375623'
@@ -144,7 +165,61 @@ def compute_patching_health_score(
             'persisting_cves': {'count': persisting_count, 'pts': pen_persisting},
             'kev_unresolved':  {'count': kev_unres_cves,   'pts': pen_kev},
         },
+        'confidence': {
+            'has_patch_report':      has_patch_report,
+            'score_scope_threshold': score_scope_threshold,
+        },
     }
+
+
+def compute_score_lift(
+    row: dict,
+    total_rows: int,
+    crit_total: int,
+    exp_total: int,
+    kev_unresolved_rows_by_cve: 'dict[str, int]',
+    persisting_cves: 'set[str]',
+) -> float:
+    """
+    Estimate health-score points recoverable by resolving this single row.
+
+    Returns 0.0 for already-resolved rows.  All denominators come from the
+    fleet-wide health scope (pre-computed in build_product_sheets) so values
+    are comparable across all product sheets.
+
+    Score lift components
+    ─────────────────────────────────────────────
+    Base resolution      60 / total_rows       every unresolved row
+    Critical coverage   +20 / crit_total       only CVSS ≥ 9 rows
+    Known exploit       +20 / exp_total        only rows with Has Known Exploit = Yes
+    KEV penalty         +1.0                   only if this clears the LAST unresolved
+                                                instance of this KEV CVE type
+    Persisting penalty  +0.5                   only for CVE IDs in the persisting set
+    """
+    if str(row.get('Resolved', '')).strip() == '☑':
+        return 0.0
+
+    cve_id = extract_cve_id(str(row.get('Vulnerability Name', '')))
+    lift   = 0.0
+
+    if total_rows:
+        lift += 60.0 / total_rows
+
+    score = pd.to_numeric(row.get('Vulnerability Score', 0), errors='coerce')
+    if crit_total and pd.notna(score) and score >= 9.0:
+        lift += 20.0 / crit_total
+
+    if exp_total and str(row.get('Has Known Exploit', '')).strip().lower() in ('yes', 'y', 'true', '1'):
+        lift += 20.0 / exp_total
+
+    if str(row.get('CISA KEV', '')).strip().lower() in ('yes', 'y', 'true', '1'):
+        if kev_unresolved_rows_by_cve.get(cve_id, 0) == 1:
+            lift += 1.0
+
+    if cve_id in persisting_cves:
+        lift += 0.5
+
+    return round(lift, 2)
 
 
 # EXCEL SHEET BUILDERS
@@ -846,7 +921,9 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
                           patch_resolved_pairs=None,
                           patch_gap_pairs: Optional[Dict[Tuple[str, str], str]] = None,
                           approaching_stale_names: Optional[Set[str]] = None,
-                          stale_warning_days: int = 14):
+                          stale_warning_days: int = 14,
+                          health_triage_df: 'Optional[pd.DataFrame]' = None,
+                          trend_data: Optional[dict] = None):
     if patch_resolved_pairs is None:
         patch_resolved_pairs = set()
     if patch_gap_pairs is None:
@@ -854,7 +931,35 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
     if approaching_stale_names is None:
         approaching_stale_names = set()
 
-    cols_order = ['Resolved', 'Vulnerability Name', 'Name', 'Device Type',
+    # ── Fleet-level Score Lift context ────────────────────────────────────────────────────────
+    # Pre-compute totals from the health scope once before the per-product loop
+    # so every sheet divides by the same fleet-wide denominators.
+    _sl_scope = health_triage_df if (health_triage_df is not None and not health_triage_df.empty) else triage_df
+    _sl_dedup = _sl_scope.drop_duplicates(subset=['Name', 'Vulnerability Name'])
+    _sl_sc_col    = 'Vulnerability Score' if 'Vulnerability Score' in _sl_dedup.columns else None
+    _sl_total     = len(_sl_dedup)
+    _sl_crit_total = int((pd.to_numeric(_sl_dedup[_sl_sc_col], errors='coerce') >= 9.0).sum()) if _sl_sc_col else 0
+    _sl_exp_col   = 'Has Known Exploit' if 'Has Known Exploit' in _sl_dedup.columns else None
+    _sl_exp_total = int(_sl_dedup[_sl_exp_col].astype(str).str.strip().str.lower().isin(['yes','y','true','1']).sum()) if _sl_exp_col else 0
+
+    # Unresolved KEV row counts per CVE ID for penalty-recovery lift
+    _sl_status_col = ('Threat Status' if 'Threat Status' in _sl_dedup.columns
+                      else 'Status'   if 'Status'        in _sl_dedup.columns else None)
+    _sl_is_unr = (~(_sl_dedup[_sl_status_col].astype(str).str.strip().str.upper() == 'RESOLVED')
+                  if _sl_status_col
+                  else pd.Series([True] * len(_sl_dedup), index=_sl_dedup.index))
+    _kev_unres_by_cve: dict = {}
+    if 'CISA KEV' in _sl_dedup.columns and 'Vulnerability Name' in _sl_dedup.columns:
+        _kev_mask = _sl_dedup['CISA KEV'].astype(str).str.strip().str.lower().isin(['yes','y','true','1'])
+        for _cve_raw in _sl_dedup.loc[_kev_mask & _sl_is_unr, 'Vulnerability Name']:
+            _cid = extract_cve_id(str(_cve_raw))
+            _kev_unres_by_cve[_cid] = _kev_unres_by_cve.get(_cid, 0) + 1
+
+    _persisting_cves: set = set()
+    if trend_data is not None:
+        _persisting_cves = trend_data.get('persisting_cve_ids', set()) or set()
+
+    cols_order = ['Resolved', 'Score Lift', 'Vulnerability Name', 'Name', 'Device Type',
                   'Vulnerability Severity', 'Vulnerability Score', 'Risk Severity Index',
                   'Has Known Exploit', 'CISA KEV', 'Last Response', 'Days Since Last Response', 'Affected Products',
                   'Baseline Compliance', 'NVD']
@@ -875,8 +980,7 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
         group = _product_groups[product]
         sheet_name = product_to_sheet[product]
         group = group.drop_duplicates(subset=['Name', 'Vulnerability Name']).copy()
-        group = group.sort_values(
-            by=['Vulnerability Score', '_Sort_Time', 'Name'], ascending=[False, False, True])
+        # Primary sort applied after Score Lift is computed (below)
 
         from data_pipeline import _detect_product as _dp_detect_prod
         _raw_pnames = group['Affected Products'].dropna().astype(str).unique().tolist()
@@ -895,27 +999,51 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
         _nk_list = [normalize_device_name(str(n)) for n in group['Name']]
         _ck_list = [extract_cve_id(str(v))        for v in group['Vulnerability Name']]
 
-        # Build Resolved column via list comprehension (replaces slow apply per row)
-        if not patch_resolved_pairs and not approaching_stale_names:
-            _res_list = ['☐'] * len(group)          # fast path — no patch data at all
-        else:
-            if patch_resolved_pairs:
-                _sample = next(iter(patch_resolved_pairs))
-                if len(_sample) == 3:
-                    _res_list = ['☑' if (nk, ck, _sheet_pk) in patch_resolved_pairs else '☐'
-                                 for nk, ck in zip(_nk_list, _ck_list)]
-                else:
-                    _res_list = ['☑' if (nk, ck) in patch_resolved_pairs else '☐'
-                                 for nk, ck in zip(_nk_list, _ck_list)]
+        # ── Resolved column — two-source priority ──────────────────────────────────────────
+        # Source 1: patch_resolved_pairs — explicit patch evidence.
+        # Source 2: Threat Status / Status == 'RESOLVED' — N-able export status.
+        # Source 3: approaching-stale devices are always forced to ☐.
+        _status_col = ('Threat Status' if 'Threat Status' in group.columns
+                       else 'Status'   if 'Status'        in group.columns else None)
+
+        if patch_resolved_pairs:
+            _sample = next(iter(patch_resolved_pairs))
+            if len(_sample) == 3:
+                _res_bool = [(nk, ck, _sheet_pk) in patch_resolved_pairs
+                             for nk, ck in zip(_nk_list, _ck_list)]
             else:
-                _res_list = ['☐'] * len(group)
-            if approaching_stale_names:
-                _nm_list = group['Name'].tolist()
-                for _i, _n in enumerate(_nm_list):
-                    if _n in approaching_stale_names:
-                        _res_list[_i] = '☐'
+                _res_bool = [(nk, ck) in patch_resolved_pairs
+                             for nk, ck in zip(_nk_list, _ck_list)]
+        else:
+            _res_bool = [False] * len(group)
+
+        if _status_col:
+            _status_resolved = (group[_status_col].astype(str)
+                                .str.strip().str.upper().eq('RESOLVED').tolist())
+            _res_bool = [_res_bool[i] or _status_resolved[i] for i in range(len(_res_bool))]
+
+        if approaching_stale_names:
+            _nm_list = group['Name'].tolist()
+            _res_bool = [False if _nm_list[i] in approaching_stale_names else _res_bool[i]
+                         for i in range(len(_res_bool))]
+
+        _res_list = ['☑' if x else '☐' for x in _res_bool]
 
         group.insert(0, 'Resolved', _res_list)
+
+        # ── Score Lift ─────────────────────────────────────────────────────────────────
+        _group_rows = group.to_dict('records')
+        _sl_list = [
+            compute_score_lift(r, _sl_total, _sl_crit_total, _sl_exp_total,
+                               _kev_unres_by_cve, _persisting_cves)
+            for r in _group_rows
+        ]
+        group.insert(1, 'Score Lift', _sl_list)
+
+        group = group.sort_values(
+            by=['Score Lift', 'Vulnerability Score', '_Sort_Time', 'Name'],
+            ascending=[False, False, False, True],
+        )
         group['NVD'] = ''
 
         final_cols = [c for c in cols_order if c in group.columns]
@@ -1673,13 +1801,21 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
                                stale_warning_days: int = 14,
                                product_to_sheet: Optional[dict] = None,
                                include_health_score: bool = False,
-                               patch_resolved_pairs: Optional[set] = None):
+                               patch_resolved_pairs: Optional[set] = None,
+                               health_triage_df: 'Optional[pd.DataFrame]' = None,
+                               health_score_threshold: float = 7.0,
+                               has_patch_report: bool = False):
     """
     Client Summary sheet.
 
-    filtered_df  — score-filtered rows including not-in-RMM & stale (waterfall baseline).
-    triage_df    — active scope only (stale + not-in-RMM removed). All Key Metrics use this.
-    threshold    — CVSS floor shown in the waterfall header.
+    filtered_df            — score-filtered rows including not-in-RMM & stale (waterfall baseline).
+    triage_df              — active scope only (stale + not-in-RMM removed). All Key Metrics use this.
+    threshold              — CVSS floor shown in the waterfall header.
+    patch_resolved_pairs   — same set passed to build_product_sheets so Summary and product tabs agree.
+    health_triage_df       — broader scope (CVSS ≥ health_score_threshold) for health score only.
+    health_score_threshold — actual CVSS floor used for health_triage_df (passed explicitly to keep
+                             the footnote honest when the caller used a threshold below 7.0).
+    has_patch_report       — tightens the KEV grade cap when no patch evidence is available.
     """
     ws = workbook.add_worksheet('Summary')
     if not report_month:
@@ -1962,12 +2098,62 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     # ── Patching Health Score (beta) ──────────────────────────────────────────
     # Only rendered when include_health_score=True (opt-in checkbox in the GUI).
     if include_health_score:
-        _phs        = compute_patching_health_score(triage_dedup, _is_res, _is_unr, trend_data=trend_data)
+        # Build a separate dedup from health_triage_df (CVSS ≥ 7.0 by default) so the
+        # critical-coverage component (CVSS ≥ 9) is genuinely distinct from resolution rate.
+        # Falls back to triage_dedup when no broader scope was supplied.
+        _health_raw = health_triage_df if (health_triage_df is not None and not health_triage_df.empty) else None
+        if _health_raw is not None:
+            _p2s_hs = set((product_to_sheet or {}).keys())
+            if 'Base Product' in _health_raw.columns and _p2s_hs:
+                _hs_frames = [grp.drop_duplicates(subset=['Name', 'Vulnerability Name'])
+                              for bp, grp in _health_raw.groupby('Base Product') if bp in _p2s_hs]
+            else:
+                _hs_frames = [grp.drop_duplicates(subset=['Name', 'Vulnerability Name'])
+                              for _, grp in (_health_raw.groupby('Base Product')
+                                             if 'Base Product' in _health_raw.columns
+                                             else [(None, _health_raw)])]
+            _score_scope = (pd.concat(_hs_frames, ignore_index=True) if _hs_frames
+                            else _health_raw.drop_duplicates(subset=['Name', 'Vulnerability Name']).copy())
+
+            # Resolved flags: patch evidence (2-tuple) | status column | suppress approaching-stale
+            from data_pipeline import normalize_device_name as _ndv_hs, extract_cve_id as _eci_hs
+            _hs_sc_col = ('Threat Status' if 'Threat Status' in _score_scope.columns
+                          else 'Status'   if 'Status'        in _score_scope.columns else None)
+            _hs_status_res = (_score_scope[_hs_sc_col].astype(str).str.strip().str.upper() == 'RESOLVED'
+                              if _hs_sc_col
+                              else pd.Series([False] * len(_score_scope), index=_score_scope.index))
+            if patch_resolved_pairs:
+                _pair_2d = {(p[0], p[1]) for p in patch_resolved_pairs}
+                _hs_nk = _score_scope['Name'].astype(str).apply(_ndv_hs)
+                _hs_ck = _score_scope['Vulnerability Name'].astype(str).apply(_eci_hs)
+                _hs_patch = pd.Series([(nk, ck) in _pair_2d for nk, ck in zip(_hs_nk, _hs_ck)],
+                                      index=_score_scope.index)
+                _hs_combined = _hs_patch | _hs_status_res
+            else:
+                _hs_combined = _hs_status_res
+            if _approaching_set and 'Name' in _score_scope.columns:
+                _hs_combined = _hs_combined & ~_score_scope['Name'].isin(_approaching_set)
+            _hs_is_res = _hs_combined
+            _hs_is_unr = ~_hs_is_res
+            _score_scope_threshold = health_score_threshold
+        else:
+            _score_scope = triage_dedup
+            _hs_is_res   = _is_res
+            _hs_is_unr   = _is_unr
+            _score_scope_threshold = threshold
+
+        _phs = compute_patching_health_score(
+            _score_scope, _hs_is_res, _hs_is_unr,
+            trend_data=trend_data,
+            has_patch_report=has_patch_report,
+            score_scope_threshold=_score_scope_threshold,
+        )
         _phs_score  = _phs['score']
         _phs_grade  = _phs['grade']
         _phs_colour = _phs['grade_colour']
         _phs_comps  = _phs['components']
         _phs_pens   = _phs['penalties']
+        _phs_conf   = _phs.get('confidence', {})
 
         _score_box_fmt = workbook.add_format({
             'bold': True, 'font_size': 36, 'align': 'center', 'valign': 'vcenter',
@@ -2059,17 +2245,28 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         ws.write(row, 3, '/ 100',    _phs_final_lbl_fmt)
         row += 1
 
+        _scope_note = (
+            f'Score calculated from CVSS ≥ {_score_scope_threshold:.1f} active scope'
+            if _score_scope_threshold < threshold
+            else 'Score calculated from active scope'
+        )
+        _kev_cap_note = ''
+        _kev_cnt = _phs_pens.get('kev_unresolved', {}).get('count', 0)
+        if not _phs_conf.get('has_patch_report') and _kev_cnt > 0:
+            _kev_cap_note = '  ·  No patch report: KEV grade cap active.'
+        elif _kev_cnt > 0:
+            _kev_cap_note = '  ·  Unresolved KEV CVEs: grade cap active.'
         ws.merge_range(row, 0, row, 3,
-            'Grade bands:  A \u2265 90  |  B \u2265 75  |  C \u2265 60  |  D \u2265 40  |  F < 40  \u00b7  '
+            'Grade bands:  A ≥ 90  |  B ≥ 75  |  C ≥ 60  |  D ≥ 40  |  F < 40  ·  '
             'Score = Resolution rate (60 pts) + Critical CVE coverage (20 pts) + '
-            'Known-exploit coverage (20 pts) \u2212 penalties.  '
-            'Active scope only (stale / not-in-RMM excluded).',
+            'Known-exploit coverage (20 pts) − penalties.  '
+            f'{_scope_note} (stale / not-in-RMM excluded).{_kev_cap_note}',
             _score_note_fmt)
         ws.set_row(row, 28)
         row += 1
 
         ws.merge_range(row, 0, row, 3,
-            '\u26a0  Beta feature \u2014 scoring methodology may change. '
+            '⚠  Beta feature — scoring methodology may change. '
             'Do not use for formal reporting without validation.',
             _beta_fmt)
         row += 2

@@ -1564,6 +1564,7 @@ def compute_trends(current_df, previous_df, threshold,
         'new_cve_types_df':        new_cve_types_df,
         'resolved_df':             resolved_df,
         'persisting_df':           persisting_df,
+        'persisting_cve_ids':      persisting_cve_ids,   # set[str] — CVE IDs in both current and previous scope
         'product_trend':           product_trend,
         'redetected_count':        redetected_count,
     }
