@@ -488,7 +488,9 @@ def run(request: DashboardRequest) -> DashboardResult:
         # Determine once whether the current export carries a status column.
         # When it does, build_product_sheets source 2 reads it directly per-row —
         # injecting all RESOLVED rows into patch_resolved_pairs would be redundant
-        # and at large scale (70k+ rows) causes O(n×m) set lookups that stall writes.
+        # and at large scale (70k+ rows) creates a large redundant set and forces
+        # repeated per-row membership checks during product-sheet rendering that
+        # dominate write time.
         _export_has_status_col = any(c in raw_df.columns
                                      for c in ('Threat Status', 'Status', 'threat status', 'status'))
 
@@ -508,7 +510,7 @@ def run(request: DashboardRequest) -> DashboardResult:
             # RESOLVED injection: only when there is no status column on the export.
             # If the export has a status column, product sheets already read it as source 2.
             # Injecting here would inflate patch_resolved_pairs to tens of thousands of
-            # entries and make every per-row set lookup in build_product_sheets O(n).
+            # entries forces repeated per-row membership checks in build_product_sheets.
             if not _export_has_status_col:
                 _raw_res = raw_df[_col_upper == 'RESOLVED']
                 if not _raw_res.empty:

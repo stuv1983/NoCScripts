@@ -959,6 +959,18 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
     if trend_data is not None:
         _persisting_cves = trend_data.get('persisting_cve_ids', set()) or set()
 
+    # ── Pre-split patch_resolved_pairs by product key ───────────────────────────
+    # When patch evidence is present, splitting once here means each product sheet
+    # only checks its own small subset rather than the full global set.  This keeps
+    # membership checks cheap even if patch_resolved_pairs grows large in future.
+    _patch_2d:  set  = set()                  # 2-tuple pairs (device_key, cve_id)
+    _patch_3d:  dict = {}                     # product_key → {(device_key, cve_id)}
+    for _p in patch_resolved_pairs:
+        if len(_p) == 3:
+            _patch_3d.setdefault(_p[2], set()).add((_p[0], _p[1]))
+        else:
+            _patch_2d.add((_p[0], _p[1]))
+
     cols_order = ['Resolved', 'Score Lift', 'Vulnerability Name', 'Name', 'Device Type',
                   'Vulnerability Severity', 'Vulnerability Score', 'Risk Severity Index',
                   'Has Known Exploit', 'CISA KEV', 'Last Response', 'Days Since Last Response', 'Affected Products',
@@ -1000,20 +1012,20 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
         _ck_list = [extract_cve_id(str(v))        for v in group['Vulnerability Name']]
 
         # ── Resolved column — two-source priority ──────────────────────────────────────────
-        # Source 1: patch_resolved_pairs — explicit patch evidence.
+        # Source 1: patch evidence — uses pre-split sets so each group only checks its
+        #           own product subset (_patch_3d[_sheet_pk]) or the shared 2-tuple set
+        #           (_patch_2d).  Both are small regardless of overall patch_resolved_pairs size.
         # Source 2: Threat Status / Status == 'RESOLVED' — N-able export status.
         # Source 3: approaching-stale devices are always forced to ☐.
         _status_col = ('Threat Status' if 'Threat Status' in group.columns
                        else 'Status'   if 'Status'        in group.columns else None)
 
-        if patch_resolved_pairs:
-            _sample = next(iter(patch_resolved_pairs))
-            if len(_sample) == 3:
-                _res_bool = [(nk, ck, _sheet_pk) in patch_resolved_pairs
-                             for nk, ck in zip(_nk_list, _ck_list)]
-            else:
-                _res_bool = [(nk, ck) in patch_resolved_pairs
-                             for nk, ck in zip(_nk_list, _ck_list)]
+        _product_patch = _patch_3d.get(_sheet_pk, set())
+        if _product_patch or _patch_2d:
+            _res_bool = [
+                (_product_patch and (nk, ck) in _product_patch) or (bool(_patch_2d) and (nk, ck) in _patch_2d)
+                for nk, ck in zip(_nk_list, _ck_list)
+            ]
         else:
             _res_bool = [False] * len(group)
 
