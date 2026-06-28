@@ -917,6 +917,119 @@ def build_all_detections_sheet(writer, merged_df, link_fmt, missing_row_fmt):
             'format': wb.add_format({'bg_color': '#E2EFDA'}),
         })
 
+def _build_patch_confirmed_sheet(writer, sheet_name: str, product: str,
+                                  out_df: 'pd.DataFrame', col_names: list) -> None:
+    """
+    Write a lightweight "Patch Confirmed" sheet for a product where every
+    detected CVE is already resolved (all rows are checkmark).
+
+    Layout is intentionally minimal:
+      - Same column order as a full triage sheet (col A = Resolved = checkmark)
+        so Summary COUNTIF / COUNTIFS formulas count correctly.
+      - Green header banner with a clear "all resolved" message.
+      - Data rows written read-only (no dropdown validation — nothing to change).
+      - No Score Lift column, no unresolved colouring, no legend.
+
+    This keeps the workbook truthful and formula-safe without the bulk of a
+    full triage sheet.
+    """
+    wb  = writer.book
+    ws  = wb.add_worksheet(sheet_name)
+    writer.sheets[sheet_name] = ws
+
+    # Banner
+    banner_fmt = wb.add_format({
+        'bold': True, 'font_size': 13,
+        'bg_color': '#375623', 'font_color': 'white',
+        'border': 1, 'align': 'left', 'valign': 'vcenter',
+    })
+    note_fmt = wb.add_format({
+        'italic': True, 'font_size': 9,
+        'font_color': '#375623', 'bg_color': '#E2EFDA', 'border': 1,
+    })
+    n_cols = min(len(col_names) - 1, 9)
+    ws.merge_range(0, 0, 0, n_cols,
+                   f'\u2705  {product}  \u2014  All CVEs Patch Confirmed', banner_fmt)
+    ws.set_row(0, 28)
+    ws.merge_range(1, 0, 1, n_cols,
+                   'Every detected CVE for this product has patch evidence or is marked RESOLVED '
+                   'in N-able.  No action required.  Rows are read-only (\u2611 pre-filled).  '
+                   'This sheet is included so Summary health-score formulas count these '
+                   'resolutions correctly.',
+                   note_fmt)
+    ws.set_row(1, 28)
+
+    # Column header row (row index 2)
+    hdr_fmt = wb.add_format({
+        'bold': True, 'bg_color': '#375623', 'font_color': 'white', 'border': 1,
+    })
+    for ci, col in enumerate(col_names):
+        ws.write(2, ci, col, hdr_fmt)
+
+    # Data rows (start at row index 3)
+    grn_fmt = wb.add_format({'bg_color': '#E2EFDA', 'border': 1})
+    grn_chk = wb.add_format({'bg_color': '#E2EFDA', 'border': 1,
+                              'bold': True, 'align': 'center'})
+    link_fmt_cell = wb.add_format({
+        'font_color': '#0563C1', 'underline': True,
+        'bg_color': '#E2EFDA', 'border': 1,
+    })
+
+    resolved_idx = col_names.index('Resolved') if 'Resolved' in col_names else None
+    vuln_idx     = col_names.index('Vulnerability Name') if 'Vulnerability Name' in col_names else None
+
+    for ri, row_tuple in enumerate(out_df.itertuples(index=False, name=None), start=3):
+        for ci, val in enumerate(row_tuple):
+            if ci == resolved_idx:
+                ws.write(ri, ci, '\u2611', grn_chk)
+            elif ci == vuln_idx:
+                val_str = str(val) if val is not None else ''
+                m = CVE_PATTERN.search(val_str)
+                if m:
+                    cve_id  = m.group(1).upper()
+                    display = val_str[:255] if len(val_str) <= 255 else val_str[:252] + '...'
+                    ws.write_url(ri, ci,
+                                 f'https://www.cve.org/CVERecord?id={cve_id}',
+                                 link_fmt_cell, string=display)
+                else:
+                    ws.write(ri, ci, val_str, grn_fmt)
+            else:
+                ws.write(ri, ci, val if val is not None else '', grn_fmt)
+
+    n_data = len(out_df)
+
+    # Column widths (mirrors full triage sheet)
+    _widths = {
+        'Resolved':                  10,
+        'Score Lift':                10,
+        'Vulnerability Name':        25,
+        'Name':                      25,
+        'Device Type':               15,
+        'Vulnerability Severity':    20,
+        'Vulnerability Score':        8,
+        'Risk Severity Index':       18,
+        'Has Known Exploit':         18,
+        'CISA KEV':                  12,
+        'Last Response':             22,
+        'Days Since Last Response':  22,
+        'Affected Products':         30,
+        'Baseline Compliance':       22,
+        'NVD':                       10,
+    }
+    for ci, col in enumerate(col_names):
+        ws.set_column(ci, ci, _widths.get(col, 16))
+
+    # Footer note
+    foot_fmt = wb.add_format({'italic': True, 'font_color': '#595959', 'font_size': 8})
+    ws.write(n_data + 4, 0,
+             f'\u2139  {n_data} row(s) \u2014 all patch confirmed.  '
+             'Sheet is read-only; use the full triage sheets for '
+             'products with remaining unresolved CVEs.',
+             foot_fmt)
+
+    log.debug("Patch Confirmed sheet written for '%s': %d row(s)", product, n_data)
+
+
 def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
                           patch_resolved_pairs=None,
                           patch_gap_pairs: Optional[Dict[Tuple[str, str], str]] = None,
@@ -986,8 +1099,12 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
             return 'google chrome\x01' + pl   # Edge: immediately after Chrome
         return pl
 
-    # Build groups once via groupby, then iterate in Chromium-aware order
+    # Build groups once via groupby, then iterate in Chromium-aware order.
+    # Fully-confirmed products are deferred so their sheets appear after all
+    # active (partially-unresolved) product sheets and before the stale sheets.
     _product_groups = {p: g for p, g in triage_df.groupby('Base Product')}
+    _deferred_confirmed: list = []   # (sheet_name, product, out_df, final_cols)
+
     for product in sorted(_product_groups.keys(), key=_chromium_sort_key):
         group = _product_groups[product]
         sheet_name = product_to_sheet[product]
@@ -1040,6 +1157,19 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
                          for i in range(len(_res_bool))]
 
         _res_list = ['☑' if x else '☐' for x in _res_bool]
+
+        # ── Fully-patched: defer to end of product sheets ──────────────────────
+        # Accumulate confirmed products and write them after all active (partially-
+        # unresolved) sheets so the tab order is: active products → confirmed
+        # products → stale/NIRM sheets.  Sheet registration is deferred so
+        # xlsxwriter writes tabs in the correct order.
+        if all(v == '☑' for v in _res_list):
+            group.insert(0, 'Resolved', _res_list)
+            group['NVD'] = ''
+            final_cols = [c for c in cols_order if c in group.columns]
+            _out = group[final_cols]
+            _deferred_confirmed.append((sheet_name, product, _out, final_cols))
+            continue
 
         group.insert(0, 'Resolved', _res_list)
 
@@ -1220,6 +1350,18 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
             ws.write(legend_row + i, 0, f'  ({label})', fmt)
             ws.write(legend_row + i, 1, desc, l_cell)
             ws.set_row(legend_row + i, None, fmt)
+
+    # ── Flush deferred confirmed sheets (after all active product sheets) ──────
+    # These appear at the end of the product-sheet group, immediately before the
+    # stale/NIRM sheets that the orchestrator writes next.
+    for _sn, _prod, _out_df, _fcols in _deferred_confirmed:
+        _build_patch_confirmed_sheet(writer, _sn, _prod, _out_df, _fcols)
+    if _deferred_confirmed:
+        log.debug(
+            "Patch Confirmed sheets written: %d product(s) — %s",
+            len(_deferred_confirmed),
+            ', '.join(p for _, p, __, ___ in _deferred_confirmed),
+        )
 
 def build_diagnostics_sheets(writer, diagnostics: dict) -> None:
     wb = writer.book
@@ -2167,13 +2309,134 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         _phs_pens   = _phs['penalties']
         _phs_conf   = _phs.get('confidence', {})
 
+        # ── Live-formula helpers ───────────────────────────────────────────────
+        # Product sheets have a fixed column layout (set in cols_order):
+        #   A(0)=Resolved  B(1)=Score Lift  C(2)=Vulnerability Name  D(3)=Name
+        #   E(4)=Device Type  F(5)=Vulnerability Severity  G(6)=Vulnerability Score
+        #   H(7)=Risk Severity Index  I(8)=Has Known Exploit  J(9)=CISA KEV
+        #
+        # We build cross-sheet COUNTIFS formulas so the three score components
+        # update automatically when ☐/☑ are toggled in any product sheet.
+        # Penalties (persisting CVEs, unresolved KEVs) depend on external data
+        # (trend comparison, KEV database) and cannot be recalculated in-sheet;
+        # they remain static and are labelled "(fixed at generation)".
+        _p2s_hs_vals = list((product_to_sheet or {}).values())   # list of sheet name strings
+        _hs_live = bool(_p2s_hs_vals)
+
+        if _hs_live:
+            # ── Component 1: Resolution rate across ALL product sheets ──────────
+            # Totals = ☑ + ☐ (avoids counting header/legend rows that COUNTA would hit)
+            _f_hs_res   = ' + '.join([f"COUNTIF('{s}'!A:A,\"☑\")" for s in _p2s_hs_vals])
+            _f_hs_unres = ' + '.join([f"COUNTIF('{s}'!A:A,\"☐\")" for s in _p2s_hs_vals])
+            _f_hs_total = f'({_f_hs_res}) + ({_f_hs_unres})'
+
+            # ── Component 2: Critical CVE coverage (CVSS ≥ 9) ─────────────────
+            # Count rows where Resolved=☑ AND Vulnerability Score ≥ 9  (col G)
+            # Count rows where (☑ OR ☐)   AND Vulnerability Score ≥ 9  → total critical rows
+            _f_crit_res = ' + '.join(
+                [f"COUNTIFS('{s}'!A:A,\"☑\",'{s}'!G:G,\">=\"&9)" for s in _p2s_hs_vals]
+            )
+            _f_crit_total = ' + '.join(
+                [f"COUNTIFS('{s}'!G:G,\">=\"&9,'{s}'!A:A,\"<>\")" for s in _p2s_hs_vals]
+            )
+            # Subtract 1 per sheet for the header row that COUNTIFS would include via "<>"
+            # Header cell in col G is text ("Vulnerability Score") so ">="&9 already
+            # excludes it — no correction needed for crit_total.
+            # For the "<>" total we do need to subtract the header rows:
+            _f_crit_total = (
+                ' + '.join([f"COUNTIFS('{s}'!G:G,\">=\"&9,'{s}'!A:A,\"☑\")"
+                            for s in _p2s_hs_vals])
+                + ' + '
+                + ' + '.join([f"COUNTIFS('{s}'!G:G,\">=\"&9,'{s}'!A:A,\"☐\")"
+                              for s in _p2s_hs_vals])
+            )
+
+            # ── Component 3: Known-exploit coverage (col I = Has Known Exploit) ─
+            _f_exp_res = ' + '.join(
+                [f"COUNTIFS('{s}'!A:A,\"☑\",'{s}'!I:I,\"Yes\")" for s in _p2s_hs_vals]
+            )
+            _f_exp_total = (
+                ' + '.join([f"COUNTIFS('{s}'!I:I,\"Yes\",'{s}'!A:A,\"☑\")"
+                            for s in _p2s_hs_vals])
+                + ' + '
+                + ' + '.join([f"COUNTIFS('{s}'!I:I,\"Yes\",'{s}'!A:A,\"☐\")"
+                              for s in _p2s_hs_vals])
+            )
+
+            # Static penalty values (cannot be recalculated from the sheet columns)
+            _pen_persist_pts = _phs_pens.get('persisting_cves', {}).get('pts', 0.0)
+            _pen_kev_pts     = _phs_pens.get('kev_unresolved',  {}).get('pts', 0.0)
+            _total_pen       = _pen_persist_pts + _pen_kev_pts
+
+            # -- Live score formula -------------------------------------------------
+            # Mirrors compute_patching_health_score:
+            #   pts_res  = IF(total>0, res/total, 0) * 60
+            #   pts_crit = IF(crit_total>0, crit_res/crit_total, 1) * 20
+            #   pts_exp  = IF(exp_total>0,  exp_res/exp_total,   1) * 20
+            #   score    = MAX(0, INT(ROUND(pts_res + pts_crit + pts_exp - penalties, 0)))
+            #
+            # IMPORTANT: embedding _f_score into _f_grade would repeat the full
+            # cross-sheet COUNTIF expression 4+ times, easily exceeding Excel's
+            # 8,192-char formula limit and corrupting the XLSX XML.
+            # Fix: write the score into a hidden helper cell (col E, row 4 --
+            # outside the visible 4-col A-D layout) and reference $E$4 everywhere.
+            _f_pts_res  = f'IF(({_f_hs_total})>0,({_f_hs_res})/({_f_hs_total}),0)*60'
+            _f_pts_crit = f'IF(({_f_crit_total})>0,({_f_crit_res})/({_f_crit_total}),1)*20'
+            _f_pts_exp  = f'IF(({_f_exp_total})>0,({_f_exp_res})/({_f_exp_total}),1)*20'
+            _f_raw      = f'({_f_pts_res})+({_f_pts_crit})+({_f_pts_exp})-{_total_pen}'
+            _f_score    = f'MAX(0,INT(ROUND({_f_raw},0)))'
+
+            # Helper cell E4 (row=3, col=4): holds the live numeric score.
+            # Grade IFS and final score row both reference $E$4 -- short formulas.
+            _helper_row = 3
+            _helper_col = 4
+            _helper_ref = '$E$4'
+            _f_grade = (
+                f'IFS({_helper_ref}>=90,"A",{_helper_ref}>=75,"B",'
+                f'{_helper_ref}>=60,"C",{_helper_ref}>=40,"D",TRUE,"F")'
+            )
+            _f_score_ref = f'={_helper_ref}'
+
+            # Excel's stored formula limit is 8,192 characters. With many product
+            # sheets the live cross-sheet COUNTIFS for the health score can exceed
+            # that limit, which causes Excel to show "We found a problem with some
+            # content" and repair/remove the formulas when opening the workbook.
+            # When any health-score formula is too long, fall back to the static
+            # generation-time values rather than writing an invalid workbook.
+            _candidate_live_formulas = [
+                _f_score,
+                _f_grade,
+                _f_score_ref,
+                f'IF(({_f_hs_total})>0,({_f_hs_res})/({_f_hs_total}),1)',
+                _f_pts_res,
+                f'IF(({_f_crit_total})>0,({_f_crit_res})/({_f_crit_total}),1)',
+                _f_pts_crit,
+                f'IF(({_f_exp_total})>0,({_f_exp_res})/({_f_exp_total}),1)',
+                _f_pts_exp,
+            ]
+            _max_formula_len = max(len(str(f or '')) + 1 for f in _candidate_live_formulas)
+            if _max_formula_len > 8192:
+                log.warning(
+                    "Patching Health Score live formulas disabled: longest formula is %d "
+                    "characters, above Excel's 8,192 character limit. Static score values "
+                    "will be written instead.",
+                    _max_formula_len,
+                )
+                _hs_live = False
+
+        # ── Format objects ──────────────────────────────────────────────────────
+        # Score box and grade box: colour is driven by static _phs_colour at
+        # generation time (correct for the initial state).  After toggling ☑/☐
+        # the numeric score and grade letter update live; the background colour
+        # is updated via conditional formatting rules added below.
+        _live_score_bg   = '#1F4E79'   # neutral dark blue for the live score container
         _score_box_fmt = workbook.add_format({
             'bold': True, 'font_size': 36, 'align': 'center', 'valign': 'vcenter',
-            'font_color': 'white', 'bg_color': _phs_colour, 'border': 2,
+            'font_color': 'white', 'bg_color': _live_score_bg, 'border': 2,
         })
         _grade_box_fmt = workbook.add_format({
             'bold': True, 'font_size': 28, 'align': 'center', 'valign': 'vcenter',
-            'font_color': 'white', 'bg_color': _phs_colour, 'border': 2,
+            'font_color': 'white', 'bg_color': _live_score_bg, 'border': 2,
         })
         _score_lbl_fmt = workbook.add_format({
             'bold': True, 'font_size': 10, 'align': 'center', 'valign': 'vcenter',
@@ -2185,11 +2448,21 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         _comp_lbl_fmt = workbook.add_format({
             'font_size': 9, 'bg_color': '#F2F2F2', 'border': 1,
         })
+        _comp_lbl_italic_fmt = workbook.add_format({
+            'font_size': 9, 'bg_color': '#F2F2F2', 'border': 1, 'italic': True,
+            'font_color': '#595959',
+        })
         _comp_pct_fmt = workbook.add_format({
             'font_size': 9, 'num_format': '0%', 'align': 'right', 'border': 1,
+            'bg_color': '#EBF3FB', 'font_color': '#1F3864',  # blue tint = live cell
         })
         _comp_pts_fmt = workbook.add_format({
-            'font_size': 9, 'num_format': '0.0', 'align': 'right', 'border': 1, 'font_color': '#1F3864',
+            'font_size': 9, 'num_format': '0.0', 'align': 'right', 'border': 1,
+            'bg_color': '#EBF3FB', 'font_color': '#1F3864',  # blue tint = live cell
+        })
+        _comp_pts_static_fmt = workbook.add_format({
+            'font_size': 9, 'num_format': '0.0', 'align': 'right', 'border': 1,
+            'font_color': '#1F3864',
         })
         _pen_neg_fmt = workbook.add_format({
             'font_size': 9, 'num_format': '0.0', 'align': 'right', 'border': 1, 'font_color': '#C00000',
@@ -2203,7 +2476,7 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         })
         _phs_final_val_fmt = workbook.add_format({
             'bold': True, 'font_size': 9, 'num_format': '0', 'align': 'right',
-            'bg_color': _phs_colour, 'font_color': 'white', 'border': 1,
+            'bg_color': '#EBF3FB', 'font_color': '#1F3864', 'border': 2,
         })
         _score_note_fmt = workbook.add_format({
             'italic': True, 'font_size': 8, 'font_color': '#595959', 'text_wrap': True,
@@ -2216,10 +2489,51 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         row = 3
         ws.set_row(row,     44)
         ws.set_row(row + 1, 14)
-        ws.merge_range(row, 0, row + 1, 1, _phs_score,                       _score_box_fmt)
-        ws.merge_range(row, 2, row + 1, 2, _phs_grade,                       _grade_box_fmt)
+
+        # Score box (cols A-B) -- live formula or static fallback.
+        # xlsxwriter supports formulas in merge_range by passing the formula string
+        # as the data argument directly. Calling write_formula on the same cell
+        # afterwards corrupts the XLSX XML, so we use a single merge_range call.
+        _score_box_row = row   # remember for conditional formatting below
+        if _hs_live:
+            # Write the full score formula into hidden helper cell E4 first.
+            # All visible cells reference $E$4 to stay under the 8192-char limit.
+            ws.write_formula(_helper_row, _helper_col, f'={_f_score}',
+                             workbook.add_format({'num_format': '0', 'font_color': 'white',
+                                                  'bg_color': 'white'}), _phs_score)
+            ws.merge_range(row, 0, row + 1, 1, _f_score_ref, _score_box_fmt)
+        else:
+            ws.merge_range(row, 0, row + 1, 1, _phs_score, _score_box_fmt)
+
+        # Grade box (col C) -- same pattern
+        if _hs_live:
+            ws.merge_range(row, 2, row + 1, 2, f'={_f_grade}', _grade_box_fmt)
+        else:
+            ws.merge_range(row, 2, row + 1, 2, _phs_grade, _grade_box_fmt)
+
         ws.merge_range(row, 3, row + 1, 3, 'Patching Health Score  (0\u2013100)', _score_lbl_fmt)
         row += 2
+
+        # ── Conditional formatting: colour score/grade boxes by live score value ─
+        # Applied to the top-left cell of each merged region (xlsxwriter targets the
+        # top-left cell; Excel applies the format to the entire merged range).
+        if _hs_live:
+            _cf_base = {'type': 'cell', 'multi_range': f'A{_score_box_row+1} C{_score_box_row+1}'}
+            for _cf_min, _cf_max, _cf_bg in [
+                (90, 100, '#375623'),   # A — dark green
+                (75,  89, '#70AD47'),   # B — green
+                (60,  74, '#ED7D31'),   # C — orange
+                (40,  59, '#C00000'),   # D — red
+                ( 0,  39, '#7B0000'),   # F — dark red
+            ]:
+                _cf_fmt = workbook.add_format({
+                    'bold': True, 'font_color': 'white', 'bg_color': _cf_bg, 'border': 2,
+                })
+                ws.conditional_format(_score_box_row, 0, _score_box_row + 1, 2, {
+                    'type': 'cell', 'criteria': 'between',
+                    'minimum': _cf_min, 'maximum': _cf_max,
+                    'format': _cf_fmt,
+                })
 
         ws.write(row, 0, 'Score Component',  _comp_hdr_fmt)
         ws.write(row, 1, 'Coverage Rate',    _comp_hdr_fmt)
@@ -2227,34 +2541,67 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         ws.write(row, 3, '/ Max',            _comp_hdr_fmt)
         row += 1
 
-        for _lbl, _key, _max in [
-            ('Resolution rate',                  'resolution',       60),
-            ('Critical CVE coverage (CVSS \u22659)', 'critical_coverage', 20),
-            ('Known-exploit coverage',            'exploit_coverage', 20),
-        ]:
+        # ── Component rows ────────────────────────────────────────────────────
+        # (rate, pts) are live formulas when _hs_live, static values otherwise.
+        _comp_rows = [
+            ('Resolution rate',                     'resolution',       60,
+             _f_hs_res   if _hs_live else None,
+             _f_hs_total if _hs_live else None),
+            ('Critical CVE coverage (CVSS \u22659)', 'critical_coverage', 20,
+             _f_crit_res   if _hs_live else None,
+             _f_crit_total if _hs_live else None),
+            ('Known-exploit coverage',               'exploit_coverage', 20,
+             _f_exp_res   if _hs_live else None,
+             _f_exp_total if _hs_live else None),
+        ]
+        _comp_pts_fmls = [
+            _f_pts_res  if _hs_live else None,
+            _f_pts_crit if _hs_live else None,
+            _f_pts_exp  if _hs_live else None,
+        ]
+
+        for (_lbl, _key, _max, _f_res_n, _f_tot_n), _f_pts_n in zip(_comp_rows, _comp_pts_fmls):
             _c = _phs_comps.get(_key, {})
-            ws.write(row, 0, _lbl,                   _comp_lbl_fmt)
-            ws.write(row, 1, _c.get('rate', 1.0),    _comp_pct_fmt)
-            ws.write(row, 2, _c.get('pts',  _max),   _comp_pts_fmt)
-            ws.write(row, 3, f'/ {_max}',            _comp_lbl_fmt)
+            _static_rate = _c.get('rate', 1.0)
+            _static_pts  = _c.get('pts',  float(_max))
+            ws.write(row, 0, _lbl, _comp_lbl_fmt)
+            if _hs_live and _f_res_n and _f_tot_n:
+                ws.write_formula(row, 1,
+                    f'=IF(({_f_tot_n})>0,({_f_res_n})/({_f_tot_n}),1)',
+                    _comp_pct_fmt, _static_rate)
+                ws.write_formula(row, 2, f'={_f_pts_n}', _comp_pts_fmt, _static_pts)
+            else:
+                ws.write(row, 1, _static_rate, _comp_pct_fmt)
+                ws.write(row, 2, _static_pts,  _comp_pts_static_fmt)
+            ws.write(row, 3, f'/ {_max}', _comp_lbl_fmt)
             row += 1
 
+        # ── Penalty rows (always static — depend on external data) ─────────────
         for _plbl, _pkey, _punit in [
-            ('Persisting CVE types (\u22120.5 each, max \u22125)', 'persisting_cves', 'CVE types'),
-            ('Unresolved CISA KEV CVEs (\u22121 each, max \u22125)',  'kev_unresolved',  'KEV CVEs'),
+            ('Persisting CVE types (\u22120.5 each, max \u22125)  \u2013 fixed at generation',
+             'persisting_cves', 'CVE types'),
+            ('Unresolved CISA KEV CVEs (\u22121 each, max \u22125)  \u2013 fixed at generation',
+             'kev_unresolved',  'KEV CVEs'),
         ]:
-            _pen = _phs_pens.get(_pkey, {})
-            _ppts  = _pen.get('pts', 0)
-            _pcnt  = _pen.get('count', 0)
-            ws.write(row, 0, _plbl,               _comp_lbl_fmt)
-            ws.write(row, 1, f'{_pcnt} {_punit}', _comp_lbl_fmt)
-            ws.write(row, 2, -_ppts if _ppts > 0 else None, _pen_neg_fmt if _ppts > 0 else _pen_zero_fmt)
-            ws.write(row, 3, 'penalty',           _comp_lbl_fmt)
+            _pen  = _phs_pens.get(_pkey, {})
+            _ppts = _pen.get('pts', 0)
+            _pcnt = _pen.get('count', 0)
+            ws.write(row, 0, _plbl,               _comp_lbl_italic_fmt)
+            ws.write(row, 1, f'{_pcnt} {_punit}', _comp_lbl_italic_fmt)
+            ws.write(row, 2, -_ppts if _ppts > 0 else None,
+                     _pen_neg_fmt if _ppts > 0 else _pen_zero_fmt)
+            ws.write(row, 3, 'penalty',            _comp_lbl_italic_fmt)
             row += 1
 
-        ws.merge_range(row, 0, row, 1, f'Patching Health Score  (Grade {_phs_grade})', _phs_final_lbl_fmt)
-        ws.write(row, 2, _phs_score, _phs_final_val_fmt)
-        ws.write(row, 3, '/ 100',    _phs_final_lbl_fmt)
+        # ── Final score row ────────────────────────────────────────────────────
+        ws.merge_range(row, 0, row, 1,
+                       f'Patching Health Score  (Grade {_phs_grade})',
+                       _phs_final_lbl_fmt)
+        if _hs_live:
+            ws.write_formula(row, 2, _f_score_ref, _phs_final_val_fmt, _phs_score)
+        else:
+            ws.write(row, 2, _phs_score, _phs_final_val_fmt)
+        ws.write(row, 3, '/ 100', _phs_final_lbl_fmt)
         row += 1
 
         _scope_note = (
@@ -2268,17 +2615,22 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
             _kev_cap_note = '  ·  No patch report: KEV grade cap active.'
         elif _kev_cnt > 0:
             _kev_cap_note = '  ·  Unresolved KEV CVEs: grade cap active.'
+        _live_note_hs = (
+            '\u26a1 Blue cells update automatically when \u2610/\u2611 are toggled in product sheets.  '
+            'Penalties are fixed at report generation (depend on trend/KEV data).  '
+        ) if _hs_live else ''
         ws.merge_range(row, 0, row, 3,
-            'Grade bands:  A ≥ 90  |  B ≥ 75  |  C ≥ 60  |  D ≥ 40  |  F < 40  ·  '
+            f'{_live_note_hs}'
+            'Grade bands:  A \u2265 90  |  B \u2265 75  |  C \u2265 60  |  D \u2265 40  |  F < 40  ·  '
             'Score = Resolution rate (60 pts) + Critical CVE coverage (20 pts) + '
-            'Known-exploit coverage (20 pts) − penalties.  '
+            'Known-exploit coverage (20 pts) \u2212 penalties.  '
             f'{_scope_note} (stale / not-in-RMM excluded).{_kev_cap_note}',
             _score_note_fmt)
         ws.set_row(row, 28)
         row += 1
 
         ws.merge_range(row, 0, row, 3,
-            '⚠  Beta feature — scoring methodology may change. '
+            '\u26a0  Beta feature \u2014 scoring methodology may change. '
             'Do not use for formal reporting without validation.',
             _beta_fmt)
         row += 2
