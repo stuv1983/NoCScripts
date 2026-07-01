@@ -408,6 +408,7 @@ def build_trend_summary_sheet(workbook, trend, threshold, prev_report_name, head
 def build_trend_detail_sheets(writer, workbook, trend, link_fmt, sheets_subset=None):
     new_bg  = workbook.add_format({'bg_color': '#FCE4D6'})  
     per_bg  = workbook.add_format({'bg_color': '#FFF2CC'}) 
+    res_bg  = workbook.add_format({'bg_color': '#E2EFDA'})
 
     detail_cols = ['Name', 'Device Type', 'Vulnerability Name', 'Vulnerability Score',
                    'Vulnerability Severity', 'Affected Products',
@@ -416,6 +417,11 @@ def build_trend_detail_sheets(writer, workbook, trend, link_fmt, sheets_subset=N
     all_sheets = [
         ('New This Month',  trend['new_df'],        new_bg,
          'New CVEs not seen in the previous report — investigate and prioritise.'),
+        ('Resolved Since Previous Report', trend.get('resolved_df', pd.DataFrame()), res_bg,
+         'Rows shown here appeared UNRESOLVED in the previous report and are no longer present '
+         'in this period\u2019s active scope. INFERRED resolution — the device may have been '
+         'patched, but it could also have been decommissioned, renamed, or dropped out of RMM. '
+         'Verify against a patch report if you need certainty.'),
         ('Persisting CVEs', trend['persisting_df'], per_bg,
          'CVEs carried over from the previous report — still unresolved.'),
     ]
@@ -1339,11 +1345,6 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
             ('#D9F0F4', 'teal row',   'Patch installing — patch is in progress, re-check after next RMM sync'),
             ('#FFCCCC', 'red row',    'Unresolved — patch not yet applied'),
         ]
-        ws.write(legend_row + len(legend_entries) + 2, 0,
-                 'ℹ  Baseline Compliance column: shows whether the installed version meets the '
-                 'current rolling product baseline (_baseline in config.json), '
-                 'independently of CVE-specific patch status.',
-                 wb_.add_format({'italic': True, 'font_color': '#595959', 'font_size': 8}))
         ws.write(legend_row, 0, 'Legend', l_title)
         for i, (colour, label, desc) in enumerate(legend_entries, start=1):
             fmt = wb_.add_format({'bg_color': colour, 'font_size': 9, 'border': 1})
@@ -2708,6 +2709,21 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
             ws.write(r, c, static, fmt)
 
     # ── Resolution Status (active devices only) — LIVE ──────────────────────────
+    # "Resolved" combines two sources so this table doesn't sit at 0% forever
+    # when no --patch report is supplied:
+    #   1. CONFIRMED this period — explicit patch evidence, or Status/Threat
+    #      Status == 'RESOLVED' in the raw export (the ☑/☐ checkbox system).
+    #   2. INFERRED since the previous report — a (device, CVE) pair that was
+    #      UNRESOLVED last report and is simply no longer present this period.
+    #      N-able's detection export never emits a RESOLVED row for a patched
+    #      CVE — a fixed CVE just stops appearing — so #2 is often the ONLY
+    #      way resolution ever shows up without a patch report. It's inferred,
+    #      not proven: disappearance can also mean a device was decommissioned,
+    #      renamed, or dropped out of RMM. See the 'Resolved Since Previous Report' sheet
+    #      for the underlying device/CVE rows behind this number.
+    # Total is therefore Resolved + Unresolved, where Unresolved = still-active
+    # rows this period and Resolved = confirmed + inferred — i.e. "of everything
+    # tracked as of the last report, how much is now closed out."
     row += 1
     ws.merge_range(row, 0, row, 3, '  Resolution Status  (active devices only)', sect_fmt); row += 1
     ws.write(row, 0, 'Status',          hdr_fmt)
@@ -2716,16 +2732,32 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     ws.write(row, 3, 'Unique CVE Types (at generation)', hdr_fmt)
     row += 1
 
-    _rr  = int(_is_res.sum()); _ur = int(_is_unr.sum()); _tot = _rr + _ur
-    _rc  = int(triage_dedup.loc[_is_res, 'Vulnerability Name'].nunique()) if 'Vulnerability Name' in triage_dedup.columns else 0
+    _rr_confirmed = int(_is_res.sum()); _ur = int(_is_unr.sum())
+    _rc_confirmed = int(triage_dedup.loc[_is_res, 'Vulnerability Name'].nunique()) if 'Vulnerability Name' in triage_dedup.columns else 0
     _uc  = int(triage_dedup.loc[_is_unr, 'Vulnerability Name'].nunique()) if 'Vulnerability Name' in triage_dedup.columns else 0
+
+    _trend_resolved_pairs = 0
+    _trend_resolved_cves  = 0
+    if trend_data:
+        _tm = trend_data.get('metrics', {})
+        _trend_resolved_pairs = int(_tm.get('resolved_pair_count', 0))
+        _trend_resolved_cves  = int(_tm.get('resolved_cve_count', 0))
+
+    _rr  = _rr_confirmed + _trend_resolved_pairs
+    _rc  = _rc_confirmed + _trend_resolved_cves   # may double-count a CVE id seen in both sources; acceptable for a summary count
+    _tot = _rr + _ur
 
     res_row = row
     ws.write(row, 0, 'Resolved',   lbl_fmt)
-    _write_val(row, 1, _f_res,   _rr,  grn_fmt)
+    if _live:
+        _f_res_combined = f'({_f_res}) + {_trend_resolved_pairs}' if _trend_resolved_pairs else _f_res
+        ws.write_formula(row, 1, f'={_f_res_combined}', grn_fmt, _rr)
+    else:
+        ws.write(row, 1, _rr, grn_fmt)
     # % = resolved / total — live
     if _live:
-        ws.write_formula(row, 2, f'=IF({_f_total}>0,({_f_res})/({_f_total}),0)', _live_pct, _rr/_tot if _tot else 0)
+        _f_total_combined = f'({_f_total}) + {_trend_resolved_pairs}' if _trend_resolved_pairs else _f_total
+        ws.write_formula(row, 2, f'=IF(({_f_total_combined})>0,({_f_res_combined})/({_f_total_combined}),0)', _live_pct, _rr/_tot if _tot else 0)
     else:
         ws.write(row, 2, _rr/_tot if _tot else 0, val_pct)
     ws.write(row, 3, _rc, grn_fmt)
@@ -2734,23 +2766,36 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     ws.write(row, 0, 'Unresolved', lbl_fmt)
     _write_val(row, 1, _f_unres, _ur,  red_fmt)
     if _live:
-        ws.write_formula(row, 2, f'=IF({_f_total}>0,({_f_unres})/({_f_total}),0)', _live_pct, _ur/_tot if _tot else 0)
+        ws.write_formula(row, 2, f'=IF(({_f_total_combined})>0,({_f_unres})/({_f_total_combined}),0)', _live_pct, _ur/_tot if _tot else 0)
     else:
         ws.write(row, 2, _ur/_tot if _tot else 0, val_pct)
     ws.write(row, 3, _uc, red_fmt)
     row += 1
 
     ws.write(row, 0, 'Total', lbl_fmt)
-    _write_val(row, 1, _f_total, _tot, val_fmt)
+    if _live:
+        ws.write_formula(row, 1, f'={_f_total_combined}', val_fmt, _tot)
+    else:
+        ws.write(row, 1, _tot, val_fmt)
     ws.write(row, 2, 1.0, val_pct)
-    ws.write(row, 3, triage_dedup['Vulnerability Name'].nunique() if 'Vulnerability Name' in triage_dedup.columns else 0, val_fmt)
+    ws.write(row, 3, _rc + _uc, val_fmt)
     row += 1
 
+    _trend_note = (
+        ' \u2018Resolved\u2019 = confirmed this period (patch evidence / Status=RESOLVED) '
+        '+ INFERRED (unresolved last report, absent this period \u2014 verify against a patch '
+        'report if uncertain; see \u2018Resolved Since Previous Report\u2019 for the underlying rows).'
+        if trend_data else
+        ' No previous report was supplied, so \u2018Resolved\u2019 reflects confirmed evidence only '
+        '(patch data / Status=RESOLVED). Pass --previous to also infer resolutions from CVEs that '
+        'dropped out of the detection export since last time.'
+    )
     ws.merge_range(row, 0, row, 3,
                    f'\u2139  {_live_note}  '
-                   f'Unique CVE Type counts are fixed at report generation — they do not update live.',
+                   f'Unique CVE Type counts are fixed at report generation — they do not update live.'
+                   f'{_trend_note}',
                    note_fmt)
-    ws.set_row(row, 36); row += 2
+    ws.set_row(row, 60); row += 2
 
     # ── Device Breakdown (active scope) — unique device counts ───────────────────
     ws.merge_range(row, 0, row, 3,

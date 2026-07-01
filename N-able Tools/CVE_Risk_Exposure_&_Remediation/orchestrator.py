@@ -360,6 +360,7 @@ def run(request: DashboardRequest) -> DashboardResult:
         reserved = {
             "cves on stale devices", 'trend summary', 'all detections', 'raw data',
             'stale excluded devices', 'new this month', 'resolved', 'persisting cves',
+            'resolved since previous report',
             'patch match overview', 'patch match full data', 'patch report (full)',
             'patch confirmed', 'resolved (patch confirmed)',
         }
@@ -618,6 +619,14 @@ def run(request: DashboardRequest) -> DashboardResult:
                                   stale_warning_days=request.stale_warning_days,
                                   health_triage_df=health_triage_df,
                                   trend_data=trend_data)
+
+            # 'Resolved Since Previous Report' is placed after all product sheets —
+            # each product sheet tracks its own ☑/☐ Resolved column, so this
+            # cross-product, trend-inferred rollup reads more naturally as a
+            # follow-on to that per-product tracking than as a lead-in to it.
+            if trend_data:
+                build_trend_detail_sheets(writer, wb, trend_data, link_fmt,
+                                          sheets_subset={'Resolved Since Previous Report'})
 
             if not stale_excluded.empty or not not_in_rmm_df.empty:
                 build_stale_excluded_sheet(writer, stale_excluded,
