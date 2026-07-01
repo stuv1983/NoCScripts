@@ -1071,15 +1071,24 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     ws.write(row, 6, '📅 Days Since Response',     _th)
     row += 1
 
-    if not triage_df.empty and 'Name' in triage_df.columns:
-        # Was: filtered directly on raw Threat Status/Status, ignoring patch
-        # evidence — a CVE confirmed ☑ resolved via a --patch report but not
-        # yet reflected in N-able's own scan would still count as "unresolved"
-        # here, while every other unresolved count on this sheet (Resolution
-        # Status, Device Breakdown) correctly excluded it. Now uses the same
-        # _compute_resolved_series() helper as those, so this table can't
-        # silently disagree with the rest of the workbook.
-        _unr_df = triage_df[~_compute_resolved_series(triage_df)].copy()
+    if not triage_dedup.empty and 'Name' in triage_dedup.columns:
+        # Was: computed against raw triage_df (every detection row, including
+        # duplicates). build_product_sheets deduplicates by (Name,
+        # Vulnerability Name) PER PRODUCT *before* determining ☑/☐ — so if a
+        # device has multiple raw rows for the same CVE with mixed resolved
+        # status (e.g. detected under two Affected Products variants, or a
+        # stale scan entry alongside a fresh one), the written sheet shows
+        # one final verdict for that CVE, while counting against raw
+        # triage_df would count it as unresolved if ANY of the duplicate
+        # rows was. That let this table disagree with the actual product
+        # sheets by a handful of CVEs per affected device. Using
+        # triage_dedup — the same per-Base-Product-deduplicated frame the
+        # Resolution Status table and Device Breakdown already use, built
+        # with the identical drop_duplicates(['Name','Vulnerability Name'])
+        # rule build_product_sheets applies — guarantees this table can
+        # never again show a different "unresolved" verdict for a CVE than
+        # the product sheet the reader would go check it against.
+        _unr_df = triage_dedup[~_compute_resolved_series(triage_dedup)].copy()
         if not _unr_df.empty:
             _agg = _unr_df.groupby('Name', as_index=False).agg(
                 cve_count   =('Vulnerability Name', 'nunique'),

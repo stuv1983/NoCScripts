@@ -286,3 +286,59 @@ def test_compute_resolved_series_respects_product_scoped_patch_pairs():
     result = compute_resolved_series(df, product_to_sheet, patch_resolved_pairs=pairs)
     assert result.loc[0] == True    # Chrome row: covered by the scoped pair
     assert result.loc[1] == False   # Edge row: same device+CVE, different product — must stay unresolved
+
+
+# ── compute_resolved_series does NOT deduplicate — callers must ───────────────
+# A real bug: build_product_sheets deduplicates each product's rows by
+# (Name, Vulnerability Name) BEFORE computing ☑/☐ (keep='first'), but the
+# Summary sheet's Top At-Risk Devices table was calling compute_resolved_series
+# on the raw, un-deduplicated triage_df. When a device had multiple raw rows
+# for the same CVE with mixed resolved status (duplicate scan entries, or the
+# same CVE surfacing under two Affected Products variants), the two tables
+# could legitimately disagree — the product sheet showed one final verdict,
+# Top At-Risk counted the CVE as unresolved if ANY duplicate instance was.
+# Fixed by pointing Top At-Risk at triage_dedup (the same per-Base-Product
+# drop_duplicates(['Name','Vulnerability Name']) frame the product sheets and
+# Resolution Status table already use) instead of raw triage_df.
+#
+# compute_resolved_series() itself is correct either way — it just resolves
+# whatever rows it's given. The contract callers must honor is: dedupe your
+# input the same way build_product_sheets does, BEFORE calling this, or your
+# counts can disagree with what the reader sees on the actual product sheet.
+def test_compute_resolved_series_result_depends_on_caller_deduplication():
+    """
+    Demonstrates why the dedup-timing bug was possible: the same raw data,
+    deduplicated vs not, gives different "how many CVEs are unresolved for
+    this device" answers when duplicate rows disagree on status. This isn't
+    a bug in compute_resolved_series — it's documentation of the contract
+    that let the bug happen when a caller skipped the dedup step.
+    """
+    raw_rows = [
+        {'Name': 'CVLT001', 'Vulnerability Name': 'CVE-2026-0001',
+         'Base Product': 'Google Chrome', 'Affected Products': 'Google Chrome',
+         'Threat Status': 'RESOLVED'},
+        {'Name': 'CVLT001', 'Vulnerability Name': 'CVE-2026-0001',   # duplicate CVE, conflicting status
+         'Base Product': 'Google Chrome', 'Affected Products': 'Google Chrome',
+         'Threat Status': 'UNRESOLVED'},
+    ]
+    product_to_sheet = {'Google Chrome': 'Google Chrome'}
+
+    # Without dedup: nunique() over the unresolved subset still counts this
+    # CVE once, because one of the two duplicate rows is unresolved.
+    df_raw = _df(raw_rows)
+    resolved_raw = compute_resolved_series(df_raw, product_to_sheet, patch_resolved_pairs=None)
+    unresolved_cve_count_raw = df_raw.loc[~resolved_raw, 'Vulnerability Name'].nunique()
+    assert unresolved_cve_count_raw == 1
+
+    # Deduplicated first (keep='first', matching build_product_sheets): only
+    # the first row survives, and it's RESOLVED — so this CVE does not count
+    # as unresolved. This is what the product sheet itself would show.
+    df_dedup = df_raw.drop_duplicates(subset=['Name', 'Vulnerability Name']).copy()
+    resolved_dedup = compute_resolved_series(df_dedup, product_to_sheet, patch_resolved_pairs=None)
+    unresolved_cve_count_dedup = df_dedup.loc[~resolved_dedup, 'Vulnerability Name'].nunique()
+    assert unresolved_cve_count_dedup == 0
+
+    # The two disagree — which is exactly why every consumer of
+    # compute_resolved_series that reports a count meant to match a product
+    # sheet MUST dedupe with the same rule first.
+    assert unresolved_cve_count_raw != unresolved_cve_count_dedup

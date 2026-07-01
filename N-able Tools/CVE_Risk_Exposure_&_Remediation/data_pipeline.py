@@ -397,7 +397,16 @@ def load_vulnerability_data(file_path: str) -> pd.DataFrame:
     else:
         try:
             df = pd.read_csv(file_path, dtype_backend='pyarrow')
-        except TypeError:
+        except (TypeError, ImportError):
+            # TypeError: pandas < 2.0 doesn't recognise the dtype_backend
+            #            keyword argument at all.
+            # ImportError: pandas recognises the argument but the pyarrow
+            #            package itself isn't installed — this is the
+            #            actual failure mode on a real "pyarrow missing"
+            #            environment, and a bare `except TypeError` never
+            #            catches it, so this would previously crash the
+            #            whole load instead of gracefully falling back to
+            #            the default (numpy-backed) CSV reader.
             df = pd.read_csv(file_path)
 
     rename = {}
@@ -1071,7 +1080,11 @@ def load_previous_report(file_path):
             # CSV path — read directly, skip ExcelFile entirely
             try:
                 df_raw = pd.read_csv(file_path, dtype_backend='pyarrow')
-            except TypeError:
+            except (TypeError, ImportError):
+                # See load_vulnerability_data() for why both exception types
+                # are needed — ImportError is pandas' actual failure mode
+                # when pyarrow isn't installed; TypeError only covers
+                # pandas < 2.0 not recognising the keyword at all.
                 df_raw = pd.read_csv(file_path)
             # Wrap in a minimal object so the rest of the function can share
             # the same rename + validation logic via the Path B code below.
