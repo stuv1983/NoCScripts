@@ -357,13 +357,8 @@ def run(request: DashboardRequest) -> DashboardResult:
 
         report_month_val = request.report_month if request.report_month else datetime.now().strftime('%B %Y')
 
-        reserved = {
-            "cves on stale devices", 'trend summary', 'all detections', 'raw data',
-            'stale excluded devices', 'new this month', 'resolved', 'persisting cves',
-            'resolved since previous report',
-            'patch match overview', 'patch match full data', 'patch report (full)',
-            'patch confirmed', 'resolved (patch confirmed)',
-        }
+        from sheet_names import RESERVED_SHEET_NAMES
+        reserved = set(RESERVED_SHEET_NAMES)
         used_names       = set(reserved)
         product_to_sheet = {}
         for product, _ in triage_df.groupby('Base Product'):

@@ -1156,14 +1156,7 @@ def load_previous_report(file_path):
         df['_CVE_Key']  = df['Vulnerability Name'].astype(str).apply(extract_cve_id)
         df['Vulnerability Score'] = pd.to_numeric(df.get('Vulnerability Score', 0), errors='coerce').fillna(0)
 
-        _RESERVED = {
-            'trend summary', 'overview', 'all detections', 'raw data',
-            'stale excluded devices', 'new this month', 'new device-cve pairs', 'new cve types',
-            'resolved', 'persisting cves',
-            'patch match overview', 'patch match full data', 'patch report (full)',
-            'patch confirmed', 'resolved (patch confirmed)', "cves on stale devices",
-            'client summary', 'summary',
-        }
+        from sheet_names import RESERVED_SHEET_NAMES as _RESERVED
         resolved_pairs = set()
         try:
             import openpyxl as _opx
@@ -1569,110 +1562,6 @@ def compute_trends(current_df, previous_df, threshold,
         'redetected_count':        redetected_count,
     }
 
-
-# ==============================================================================
-# PATCH DIAGNOSTICS  (lag · version drift · mismatch)
-# ==============================================================================
-
-def compute_patch_diagnostics(patch_full_df: pd.DataFrame) -> dict:
-    df = patch_full_df.copy()
-    required = {'Name', 'Vulnerability Name', 'Patch Match Result',
-                'Patch Evidence Status'}
-    if not required.issubset(df.columns):
-        log.warning("compute_patch_diagnostics: missing columns %s — skipping",
-                    required - set(df.columns))
-        return {'patch_lag_df': pd.DataFrame(),
-                'version_drift_df': pd.DataFrame(),
-                'mismatch_summary_df': pd.DataFrame()}
-
-    lag_rows = []
-    if 'Patch Install Date' in df.columns and 'First detected' in df.columns:
-        for _, row in df.iterrows():
-            install_dt = pd.to_datetime(row.get('Patch Install Date'), errors='coerce')
-            first_dt   = pd.to_datetime(row.get('First detected'),    errors='coerce')
-            if pd.isna(install_dt) or pd.isna(first_dt):
-                continue
-            lag_days = (install_dt - first_dt).days
-            lag_rows.append({
-                'Device':             row.get('Name', ''),
-                'CVE':                extract_cve_id(str(row.get('Vulnerability Name', ''))),
-                'Product':            row.get('Affected Products', ''),
-                'First Detected':     first_dt.date(),
-                'Patch Install Date': install_dt.date(),
-                'Lag (days)':         lag_days,
-                'Status':             row.get('Patch Evidence Status', ''),
-            })
-    patch_lag_df = (pd.DataFrame(lag_rows)
-                    .sort_values('Lag (days)', ascending=False)
-                    .reset_index(drop=True)
-                    if lag_rows else pd.DataFrame())
-
-    drift_rows = []
-    if 'Matched Patch Version' in df.columns:
-        df['_bp'] = df['Affected Products'].apply(get_base_product)
-        for product, grp in df.groupby('_bp'):
-            versions = (grp['Matched Patch Version']
-                        .dropna()
-                        .astype(str)
-                        .str.strip()
-                        .loc[lambda s: s.str.len() > 0]
-                        .unique()
-                        .tolist())
-            if len(versions) < 2:
-                continue
-            parsed = [v for v in (_parse_version(v) for v in versions) if v]
-            if len(parsed) < 2:
-                continue
-            spread = len(set(versions))
-            drift_rows.append({
-                'Product':          product,
-                'Distinct Versions': spread,
-                'Min Version':      min(versions, key=lambda v: _parse_version(v) or (0,)),
-                'Max Version':      max(versions, key=lambda v: _parse_version(v) or (0,)),
-                'Versions Seen':    ', '.join(sorted(set(versions))),
-                'Device Count':     grp['Name'].nunique(),
-            })
-    version_drift_df = (pd.DataFrame(drift_rows)
-                        .sort_values('Distinct Versions', ascending=False)
-                        .reset_index(drop=True)
-                        if drift_rows else pd.DataFrame())
-
-    mismatch_rows = []
-    for _, row in df.iterrows():
-        gap = classify_patch_gap(
-            row.get('Patch Match Result', ''),
-            row.get('Patch Evidence Status', ''),
-        )
-        if gap != 'detection_mismatch':
-            continue
-        install_dt = pd.to_datetime(row.get('Patch Install Date'), errors='coerce')
-        first_dt   = pd.to_datetime(row.get('First detected'),    errors='coerce')
-        lag = (install_dt - first_dt).days if not (pd.isna(install_dt) or pd.isna(first_dt)) else None
-        mismatch_rows.append({
-            'Device':               row.get('Name', ''),
-            'CVE':                  extract_cve_id(str(row.get('Vulnerability Name', ''))),
-            'Product':              row.get('Affected Products', ''),
-            'Patch Match Result':   row.get('Patch Match Result', ''),
-            'Installed Version':    row.get('Matched Patch Version', ''),
-            'Fixed Version Needed': row.get('Fixed Version Used', ''),
-            'Patch Install Date':   row.get('Patch Install Date', ''),
-            'First Detected':       row.get('First detected', ''),
-            'Lag (days)':           lag,
-            'Likely Cause':         (
-                'Install predates CVE detection — patch may not address this CVE'
-                if lag is not None and lag < 0
-                else 'Patch installed but CVE still detected — scanner/patch tool disagreement'
-            ),
-        })
-    mismatch_summary_df = (pd.DataFrame(mismatch_rows)
-                           .reset_index(drop=True)
-                           if mismatch_rows else pd.DataFrame())
-
-    return {
-        'patch_lag_df':       patch_lag_df,
-        'version_drift_df':   version_drift_df,
-        'mismatch_summary_df': mismatch_summary_df,
-    }
 
 
 # ==============================================================================
