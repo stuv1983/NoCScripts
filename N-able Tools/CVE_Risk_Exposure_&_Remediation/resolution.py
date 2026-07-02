@@ -1,31 +1,20 @@
 """
 resolution.py — single source of truth for "is this CVE/device row resolved?"
 
-Before this module existed, this determination was implemented twice,
-independently, in excel_builder.py:
-  - build_product_sheets()       — writes the per-row ☑/☐ checkbox column
-  - build_client_summary_sheet() — re-derived the same flags to compute the
-                                    Resolution Status table's numbers
-
-Both copies applied the same three-source priority rule, hand-copied. That's
-exactly the kind of duplication that lets a rule change land in one place and
-silently miss the other — the checkbox column and the summary math could, in
-principle, disagree even though they're describing the same thing.
+Used by build_product_sheets() (the ☑/☐ checkbox column) and
+build_client_summary_sheet() (Resolution Status table) — both must call
+this rather than reimplementing the logic locally.
 
 Precedence (first match wins):
-  1. Patch evidence     — (device, cve[, product]) present in patch_resolved_pairs
-  2. Raw export status  — Threat Status / Status column == 'RESOLVED'
-  3. Neither            — unresolved (☐)
-Override: a device flagged "approaching stale" is always forced to ☐
-regardless of the above — patch confirmation is treated as unreliable once
-a device is close to going stale (last response near the cutoff).
+  1. Patch evidence    — (device, cve[, product]) in patch_resolved_pairs
+  2. Raw export status — Threat Status / Status column == 'RESOLVED'
+  3. Neither           — unresolved (☐)
+Override: an approaching-stale device is always forced to ☐.
 
-What this module deliberately does NOT cover: trend-inferred resolution (a
-device/CVE pair that was unresolved last report and is simply absent this
-period). Those rows don't exist in the current dataframe at all — there's
-nothing to flag — so that signal stays in data_pipeline.compute_trends()
-and is combined separately, at the aggregate level, by the caller (see
-build_client_summary_sheet's Resolution Status section).
+Trend-inferred resolution (a device/CVE pair unresolved last report and
+now absent) is handled separately in data_pipeline.compute_trends() —
+those rows don't exist in the current dataframe, so there's nothing here
+to flag.
 """
 from __future__ import annotations
 
@@ -128,6 +117,43 @@ def compute_resolved_flags(
     return res_bool
 
 
+def dedup_per_base_product(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Deduplicate df by (Name, Vulnerability Name) within each 'Base Product'
+    group, unconditionally — do not filter by whether a product also
+    exists in some other scope (e.g. product_to_sheet). A product that
+    exists only on stale or not-in-RMM devices must still be kept.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if 'Base Product' in df.columns:
+        frames = [g.drop_duplicates(subset=['Name', 'Vulnerability Name'])
+                  for _, g in df.groupby('Base Product')]
+        return pd.concat(frames, ignore_index=True) if frames else df.copy()
+    return df.drop_duplicates(subset=['Name', 'Vulnerability Name']).copy()
+
+
+def build_all_scope_frame(
+    triage_dedup: pd.DataFrame,
+    stale_excluded_df: Optional[pd.DataFrame] = None,
+    not_in_rmm_df: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    """
+    Build the frame the Summary sheet's "All" column (Key Metrics,
+    Data Filtering Reconciliation) is computed from: active scope + every
+    stale-excluded row + every not-in-RMM row, each deduplicated the same
+    way triage_dedup itself is — see dedup_per_base_product() for why this
+    must not filter by product_to_sheet membership.
+    """
+    stale_dedup = dedup_per_base_product(stale_excluded_df)
+    nirm_dedup  = dedup_per_base_product(not_in_rmm_df)
+    parts = [p for p in [triage_dedup, stale_dedup, nirm_dedup]
+             if p is not None and not p.empty]
+    if parts:
+        return pd.concat(parts, ignore_index=True)
+    return triage_dedup.copy() if triage_dedup is not None else pd.DataFrame()
+
+
 def compute_resolved_series(
     df: pd.DataFrame,
     product_to_sheet: Optional[dict],
@@ -137,26 +163,12 @@ def compute_resolved_series(
     """
     Whole-dataframe version of compute_resolved_flags(): groups df by
     'Base Product', resolves each group against its own product scope, and
-    returns a single bool Series correctly aligned to df's original index.
+    returns a bool Series correctly aligned to df's original index (built
+    from (label, flag) pairs, not by row position — groupby iterates rows
+    in per-group order, not df's original order, so position-based
+    reindexing silently misattaches flags to the wrong rows).
 
-    This exists because of a real bug: df.groupby('Base Product') iterates
-    rows in per-group order, not df's original row order. Naively building a
-    flat list of flags across groups and then doing
-    pd.Series(flat_list, index=df.index) assumes list position i belongs to
-    df.index[i] — false whenever a product's rows aren't already contiguous
-    in df. That silently attaches every flag to the WRONG row while the
-    aggregate count (sum of Trues) still comes out right, which is exactly
-    what let it hide in production: top-line totals matched, but anything
-    that combined the resolved flag with another per-row filter (device
-    type, exploit status, KEV-unresolved-by-CVE, health score components)
-    was scrambled. It was silently harmless in some call sites purely by
-    accident of how their input frame happened to be constructed (already
-    grouped by product), and silently wrong in others (Top At-Risk Devices,
-    Score Lift's KEV bonus) where the input frame wasn't.
-
-    Do not reimplement this locally — call it, the same way
-    compute_resolved_flags() itself must be called rather than
-    reimplemented per call site.
+    Do not reimplement this locally.
     """
     approaching_stale_names = approaching_stale_names or set()
     p2s = product_to_sheet or {}

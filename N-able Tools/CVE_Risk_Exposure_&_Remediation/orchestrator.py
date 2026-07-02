@@ -588,6 +588,7 @@ def run(request: DashboardRequest) -> DashboardResult:
                 not_in_rmm_count=not_in_rmm,
                 not_in_rmm_cve_count=_not_in_rmm_cve_rows,
                 not_in_rmm_unique_cves=_not_in_rmm_unique_cves,
+                not_in_rmm_df=not_in_rmm_df if not not_in_rmm_df.empty else None,
                 report_month=report_month_val,
                 approaching_stale_names=approaching_stale_names,
                 stale_warning_days=request.stale_warning_days,
@@ -613,7 +614,8 @@ def run(request: DashboardRequest) -> DashboardResult:
                                   approaching_stale_names=approaching_stale_names,
                                   stale_warning_days=request.stale_warning_days,
                                   health_triage_df=health_triage_df,
-                                  trend_data=trend_data)
+                                  trend_data=trend_data,
+                                  include_health_score=request.include_health_score)
 
             # 'Resolved Since Previous Report' is placed after all product sheets —
             # each product sheet tracks its own ☑/☐ Resolved column, so this

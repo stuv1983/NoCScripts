@@ -2,24 +2,9 @@
 formatting.py — named color palette and shared xlsxwriter format factories
 for the dashboard workbook.
 
-Why this exists: excel_builder.py has ~186 workbook.add_format(...) calls.
-A `get_workbook_styles()` factory already existed to centralize the common
-ones, but most sheet-builder functions never adopted it — they redefine
-their own local formats with the same hex colors under different variable
-names (e.g. the peach '#FCE4D6' background shows up as `row_red` in the
-shared factory, `new_bg` in the trend sheets, and `_nday_high` in the N-Day
-Exposure section — three names, one color, three separate add_format calls).
-
-This module is the start of consolidating that: a single named COLORS
-palette, and the shared style factory moved here so it has a home that
-isn't buried in the middle of a 3,000-line file.
-
-Scope note: this pass moves the pieces that were ALREADY meant to be
-shared (get_workbook_styles, the product-sheet legend) plus gives the
-palette names. It does NOT yet migrate every one of the ~186 call sites —
-that's a larger, higher-risk mechanical change better done incrementally
-and reviewed in pieces. Grep excel_builder.py for the hex codes in COLORS
-below to find the remaining local redefinitions still to be migrated.
+Note: excel_builder.py still has many local add_format() calls using the
+same hex colors under different names — not yet all migrated to COLORS
+below.
 """
 from __future__ import annotations
 
@@ -70,11 +55,8 @@ COLORS = {
 
 
 def get_workbook_styles(wb) -> dict:
-    """
-    The common, reusable format set. Sheet builders should pull from this
-    dict instead of redefining their own copy of the same style — see the
-    module docstring for which call sites still need migrating.
-    """
+    """The common, reusable format set — sheet builders should pull from
+    this dict instead of redefining their own copy of the same style."""
     C = COLORS
     return {
         'title':        wb.add_format({'bold': True, 'font_size': 14,
@@ -134,12 +116,7 @@ def get_band_formats(wb) -> dict:
 
 
 def build_legend_entries(stale_warning_days: int) -> list:
-    """
-    The row-color legend shown at the bottom of every product sheet.
-    Was previously defined inline inside build_product_sheets — pulled out
-    so it has exactly one definition regardless of how many places want to
-    reference or display it (e.g. a future 'Notes & Legend' sheet).
-    """
+    """The row-color legend shown at the bottom of every product sheet."""
     C = COLORS
     return [
         (C['STEEL_BLUE_BG'], 'blue row',   'Patch via RMM — install confirmed after CVE first detected'),

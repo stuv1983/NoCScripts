@@ -1,17 +1,11 @@
 """
-summary_sheet.py — the workbook's "Summary" sheet: Key Metrics, Resolution
-Status, Device Breakdown, Data Filtering Reconciliation, Top At-Risk
-Devices, Month-over-Month Patching Progress, and the Patching Health Score.
+summary_sheet.py — builds the workbook's Summary sheet: Key Metrics,
+Resolution Status, Device Breakdown, Data Filtering Reconciliation,
+Top At-Risk Devices, Month-over-Month Patching Progress, and the
+Patching Health Score.
 
-Split out of excel_builder.py, which had grown to ~2,400 lines. This is the
-single largest sheet builder in the workbook — the Resolution Status math
-here (and its interplay with resolution.py and compute_trends()) is exactly
-what this codebase's earlier bugs lived in, so changes here deserve extra
-scrutiny and, ideally, the dedicated tests in test_resolution.py rerun
-after any edit.
-
-compute_patching_health_score moved with build_client_summary_sheet since
-it has exactly one caller.
+Resolution Status math here must stay in sync with resolution.py and
+test_resolution.py — see resolution.py for the shared logic.
 
 Author : Stu Villanti <s.villanti@kenstra.com>
 """
@@ -179,6 +173,7 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
                                cutoff_date=None, stale_excluded_df=None,
                                not_in_rmm_count=0, not_in_rmm_cve_count=0,
                                not_in_rmm_unique_cves=0,
+                               not_in_rmm_df: 'Optional[pd.DataFrame]' = None,
                                report_month='',
                                approaching_stale_names: Optional[Set[str]] = None,
                                stale_warning_days: int = 14,
@@ -378,30 +373,15 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
                                      'border': 1})
     def _unr_fmt(n): return red_fmt if n > 0 else _zero_fmt
 
-    # Compute "All" totals — deduped the same way as triage_dedup so All = Active + Excluded
-    # Raw _all_df has cross-product duplicates (same CVE on same device under multiple
-    # product versions) that inflate row counts vs what product sheets actually contain.
-    # Apply the same per-Base-Product drop_duplicates to stale rows, then sum.
-    if stale_excluded_df is not None and not stale_excluded_df.empty:
-        if 'Base Product' in stale_excluded_df.columns and _p2s_keys:
-            _stale_dedup_frames = [
-                grp.drop_duplicates(subset=['Name', 'Vulnerability Name'])
-                for bp, grp in stale_excluded_df.groupby('Base Product')
-                if bp in _p2s_keys
-            ]
-            _stale_dedup = pd.concat(_stale_dedup_frames, ignore_index=True) if _stale_dedup_frames else stale_excluded_df.drop_duplicates(subset=['Name', 'Vulnerability Name']).copy()
-        elif 'Base Product' in stale_excluded_df.columns:
-            _stale_dedup_frames = [
-                grp.drop_duplicates(subset=['Name', 'Vulnerability Name'])
-                for _, grp in stale_excluded_df.groupby('Base Product')
-            ]
-            _stale_dedup = pd.concat(_stale_dedup_frames, ignore_index=True) if _stale_dedup_frames else stale_excluded_df.copy()
-        else:
-            _stale_dedup = stale_excluded_df.drop_duplicates(subset=['Name', 'Vulnerability Name']).copy()
-    else:
-        _stale_dedup = pd.DataFrame()
-
-    _all_df = pd.concat([triage_dedup, _stale_dedup], ignore_index=True) if not _stale_dedup.empty else triage_dedup.copy()
+    # Compute "All" totals — deduped the same way as triage_dedup so All = Active + Excluded.
+    # See resolution.build_all_scope_frame() / dedup_per_base_product() for
+    # why this must not filter stale/not-in-RMM rows by product_to_sheet
+    # membership — that filter existed here before and silently dropped
+    # stale-only or not-in-RMM-only products from the "All" totals.
+    from resolution import build_all_scope_frame as _build_all_scope_frame, dedup_per_base_product as _dedup_pbp
+    _stale_dedup = _dedup_pbp(stale_excluded_df)
+    _nirm_dedup  = _dedup_pbp(not_in_rmm_df)
+    _all_df = _build_all_scope_frame(triage_dedup, stale_excluded_df, not_in_rmm_df)
 
     _all_rows      = len(_all_df)          # = total_rows + stale_dedup_rows — math correct
     _all_cves      = int(_all_df['Vulnerability Name'].nunique()) if 'Vulnerability Name' in _all_df.columns else 0
@@ -435,7 +415,11 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     else:
         _stale_crit_dedup = _stale_crit
 
-    _excl_rows          = len(_stale_dedup) + not_in_rmm_cve_count
+    # Uses the deduped not-in-RMM row count (matches how _all_rows is now built)
+    # when the actual dataframe was passed; falls back to the pre-computed
+    # scalar for callers that haven't been updated to pass not_in_rmm_df yet.
+    _nirm_excl_rows    = len(_nirm_dedup) if not _nirm_dedup.empty else not_in_rmm_cve_count
+    _excl_rows          = len(_stale_dedup) + _nirm_excl_rows
     _excl_devs_tot      = _stale_devs + _nirm_devs
     _excl_crit_tot      = _stale_full_crit + _nirm_crit        # full stale, not _p2s_keys-filtered
     _excl_crit_cves_tot = _stale_full_crit_cves + _nirm_crit_cves

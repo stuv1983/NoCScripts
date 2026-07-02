@@ -2,14 +2,8 @@
 device_sheets.py — device/raw-data sheets: All Detections, Stale Excluded
 Devices, CVEs on Stale Devices, Device Inventory, and Raw Data.
 
-Split out of excel_builder.py as part of breaking that file into one
-module per sheet category.
-
 Note: build_all_detections_sheet and build_raw_data_sheet are currently
-dead code — neither is imported by orchestrator.py, so neither ever runs.
-Moved as-is rather than dropped, since removing unused code wasn't part
-of this refactor's scope; flagging it here so it isn't mistaken for an
-active sheet builder.
+dead code — neither is imported by orchestrator.py.
 
 Author : Stu Villanti <s.villanti@kenstra.com>
 """

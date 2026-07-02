@@ -12,4 +12,4 @@ pyarrow>=14         # optional but recommended: cuts string-column RAM in CSV lo
                     # (dtype_backend='pyarrow' in load_vulnerability_data)
 
 requests>=2.31      # HTTP client with connection pooling, retry, and backoff
-loguru>=0.7        # Structured logging with automatic file rotation and retention
+loguru>=0.7         # Structured logging with automatic file rotation and retention

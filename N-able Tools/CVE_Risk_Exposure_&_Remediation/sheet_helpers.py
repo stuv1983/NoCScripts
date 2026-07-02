@@ -1,11 +1,6 @@
 """
-sheet_helpers.py — small, generic xlsxwriter-writing helpers shared by more
-than one sheet-builder module (excel_builder.py, product_sheets.py, and any
-future split-out sheet modules).
-
-Kept deliberately tiny and dependency-free (only config.CVE_PATTERN) so it
-can sit underneath both excel_builder.py and product_sheets.py without
-either of them importing the other just to reach these two functions.
+sheet_helpers.py — small xlsxwriter-writing helpers shared across
+sheet-builder modules (excel_builder.py, product_sheets.py, and others).
 
 Author : Stu Villanti <s.villanti@kenstra.com>
 """

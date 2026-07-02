@@ -203,7 +203,8 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
                           approaching_stale_names: Optional[Set[str]] = None,
                           stale_warning_days: int = 14,
                           health_triage_df: 'Optional[pd.DataFrame]' = None,
-                          trend_data: Optional[dict] = None):
+                          trend_data: Optional[dict] = None,
+                          include_health_score: bool = False):
     if patch_resolved_pairs is None:
         patch_resolved_pairs = set()
     if patch_gap_pairs is None:
@@ -222,60 +223,68 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
     _patch_2d, _patch_3d = _split_patch_pairs(patch_resolved_pairs)
 
     # ── Fleet-level Score Lift context ────────────────────────────────────────────────────────
-    # Pre-compute totals from the health scope once before the per-product loop
-    # so every sheet divides by the same fleet-wide denominators.
-    _sl_scope = health_triage_df if (health_triage_df is not None and not health_triage_df.empty) else triage_df
+    # Score Lift is a Health Score companion — it tells the reader "fixing
+    # this row moves the Health Score by X" — so there's no reason to pay
+    # for computing it (or show a column full of numbers nobody asked to
+    # see) when Health Score itself isn't enabled. Everything in this
+    # block, and the per-row Score Lift insert further down, is skipped
+    # entirely when include_health_score is False.
+    if include_health_score:
+        # Pre-compute totals from the health scope once before the per-product loop
+        # so every sheet divides by the same fleet-wide denominators.
+        _sl_scope = health_triage_df if (health_triage_df is not None and not health_triage_df.empty) else triage_df
 
-    # Dedup per Base Product first (mirrors summary_sheet.py's triage_dedup),
-    # then concatenate — this preserves which product each surviving row
-    # belongs to, which the resolution check below needs to correctly scope
-    # 3-tuple (device, cve, product) patch-evidence pairs. A flat
-    # drop_duplicates(['Name','Vulnerability Name']) across the whole
-    # fleet would silently collapse the same device+CVE seen under two
-    # different products into one arbitrary row, before we ever get to.
-    if 'Base Product' in _sl_scope.columns and product_to_sheet:
-        _sl_dedup_frames = [
-            grp.drop_duplicates(subset=['Name', 'Vulnerability Name'])
-            for bp, grp in _sl_scope.groupby('Base Product')
-            if bp in product_to_sheet
-        ]
-        _sl_dedup = (pd.concat(_sl_dedup_frames, ignore_index=True) if _sl_dedup_frames
-                     else _sl_scope.drop_duplicates(subset=['Name', 'Vulnerability Name']).copy())
-    else:
-        _sl_dedup = _sl_scope.drop_duplicates(subset=['Name', 'Vulnerability Name'])
+        # Dedup per Base Product first (mirrors summary_sheet.py's triage_dedup),
+        # then concatenate — this preserves which product each surviving row
+        # belongs to, which the resolution check below needs to correctly scope
+        # 3-tuple (device, cve, product) patch-evidence pairs. A flat
+        # drop_duplicates(['Name','Vulnerability Name']) across the whole
+        # fleet would silently collapse the same device+CVE seen under two
+        # different products into one arbitrary row, before we ever get to.
+        if 'Base Product' in _sl_scope.columns and product_to_sheet:
+            _sl_dedup_frames = [
+                grp.drop_duplicates(subset=['Name', 'Vulnerability Name'])
+                for bp, grp in _sl_scope.groupby('Base Product')
+                if bp in product_to_sheet
+            ]
+            _sl_dedup = (pd.concat(_sl_dedup_frames, ignore_index=True) if _sl_dedup_frames
+                         else _sl_scope.drop_duplicates(subset=['Name', 'Vulnerability Name']).copy())
+        else:
+            _sl_dedup = _sl_scope.drop_duplicates(subset=['Name', 'Vulnerability Name'])
 
-    _sl_sc_col    = 'Vulnerability Score' if 'Vulnerability Score' in _sl_dedup.columns else None
-    _sl_total     = len(_sl_dedup)
-    _sl_crit_total = int((pd.to_numeric(_sl_dedup[_sl_sc_col], errors='coerce') >= 9.0).sum()) if _sl_sc_col else 0
-    _sl_exp_col   = 'Has Known Exploit' if 'Has Known Exploit' in _sl_dedup.columns else None
-    _sl_exp_total = int(_sl_dedup[_sl_exp_col].astype(str).str.strip().str.lower().isin(['yes','y','true','1']).sum()) if _sl_exp_col else 0
+        _sl_sc_col    = 'Vulnerability Score' if 'Vulnerability Score' in _sl_dedup.columns else None
+        _sl_total     = len(_sl_dedup)
+        _sl_crit_total = int((pd.to_numeric(_sl_dedup[_sl_sc_col], errors='coerce') >= 9.0).sum()) if _sl_sc_col else 0
+        _sl_exp_col   = 'Has Known Exploit' if 'Has Known Exploit' in _sl_dedup.columns else None
+        _sl_exp_total = int(_sl_dedup[_sl_exp_col].astype(str).str.strip().str.lower().isin(['yes','y','true','1']).sum()) if _sl_exp_col else 0
 
-    # Unresolved KEV row counts per CVE ID for penalty-recovery lift.
-    #
-    # This used to check ONLY the raw Threat Status/Status column — a row
-    # already ☑ resolved via patch evidence (patch_resolved_pairs) could
-    # still be counted as an active unresolved KEV instance here, which
-    # would incorrectly grant a DIFFERENT row's Score Lift the +1.0
-    # "clears the last unresolved KEV instance" bonus. Now uses
-    # resolution.compute_resolved_series() — the same index-safe, three-source
-    # (patch evidence → status → approaching-stale override) computation the
-    # ☑/☐ checkbox column and the Summary sheet's Resolution Status table use.
-    _sl_is_res = _compute_resolved_series(_sl_dedup, product_to_sheet, patch_resolved_pairs,
-                                          approaching_stale_names=approaching_stale_names)
-    _sl_is_unr = ~_sl_is_res
+        # Unresolved KEV row counts per CVE ID for penalty-recovery lift.
+        #
+        # This used to check ONLY the raw Threat Status/Status column — a row
+        # already ☑ resolved via patch evidence (patch_resolved_pairs) could
+        # still be counted as an active unresolved KEV instance here, which
+        # would incorrectly grant a DIFFERENT row's Score Lift the +1.0
+        # "clears the last unresolved KEV instance" bonus. Now uses
+        # resolution.compute_resolved_series() — the same index-safe, three-source
+        # (patch evidence → status → approaching-stale override) computation the
+        # ☑/☐ checkbox column and the Summary sheet's Resolution Status table use.
+        _sl_is_res = _compute_resolved_series(_sl_dedup, product_to_sheet, patch_resolved_pairs,
+                                              approaching_stale_names=approaching_stale_names)
+        _sl_is_unr = ~_sl_is_res
 
-    _kev_unres_by_cve: dict = {}
-    if 'CISA KEV' in _sl_dedup.columns and 'Vulnerability Name' in _sl_dedup.columns:
-        _kev_mask = _sl_dedup['CISA KEV'].astype(str).str.strip().str.lower().isin(['yes','y','true','1'])
-        for _cve_raw in _sl_dedup.loc[_kev_mask & _sl_is_unr, 'Vulnerability Name']:
-            _cid = extract_cve_id(str(_cve_raw))
-            _kev_unres_by_cve[_cid] = _kev_unres_by_cve.get(_cid, 0) + 1
+        _kev_unres_by_cve: dict = {}
+        if 'CISA KEV' in _sl_dedup.columns and 'Vulnerability Name' in _sl_dedup.columns:
+            _kev_mask = _sl_dedup['CISA KEV'].astype(str).str.strip().str.lower().isin(['yes','y','true','1'])
+            for _cve_raw in _sl_dedup.loc[_kev_mask & _sl_is_unr, 'Vulnerability Name']:
+                _cid = extract_cve_id(str(_cve_raw))
+                _kev_unres_by_cve[_cid] = _kev_unres_by_cve.get(_cid, 0) + 1
 
-    _persisting_cves: set = set()
-    if trend_data is not None:
-        _persisting_cves = trend_data.get('persisting_cve_ids', set()) or set()
+        _persisting_cves: set = set()
+        if trend_data is not None:
+            _persisting_cves = trend_data.get('persisting_cve_ids', set()) or set()
 
-    cols_order = ['Resolved', 'Score Lift', 'Vulnerability Name', 'Name', 'Device Type',
+    cols_order = ['Resolved'] + (['Score Lift'] if include_health_score else []) + [
+                  'Vulnerability Name', 'Name', 'Device Type',
                   'Vulnerability Severity', 'Vulnerability Score', 'Risk Severity Index',
                   'Has Known Exploit', 'CISA KEV', 'Last Response', 'Days Since Last Response', 'Affected Products',
                   'Baseline Compliance', 'NVD']
@@ -335,18 +344,21 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
         group.insert(0, 'Resolved', _res_list)
 
         # ── Score Lift ─────────────────────────────────────────────────────────────────
-        _group_rows = group.to_dict('records')
-        _sl_list = [
-            compute_score_lift(r, _sl_total, _sl_crit_total, _sl_exp_total,
-                               _kev_unres_by_cve, _persisting_cves)
-            for r in _group_rows
-        ]
-        group.insert(1, 'Score Lift', _sl_list)
+        if include_health_score:
+            _group_rows = group.to_dict('records')
+            _sl_list = [
+                compute_score_lift(r, _sl_total, _sl_crit_total, _sl_exp_total,
+                                   _kev_unres_by_cve, _persisting_cves)
+                for r in _group_rows
+            ]
+            group.insert(1, 'Score Lift', _sl_list)
+            _sort_cols = ['Score Lift', 'Vulnerability Score', '_Sort_Time', 'Name']
+            _sort_asc  = [False, False, False, True]
+        else:
+            _sort_cols = ['Vulnerability Score', '_Sort_Time', 'Name']
+            _sort_asc  = [False, False, True]
 
-        group = group.sort_values(
-            by=['Score Lift', 'Vulnerability Score', '_Sort_Time', 'Name'],
-            ascending=[False, False, False, True],
-        )
+        group = group.sort_values(by=_sort_cols, ascending=_sort_asc)
         group['NVD'] = ''
 
         final_cols = [c for c in cols_order if c in group.columns]

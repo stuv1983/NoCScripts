@@ -1,19 +1,7 @@
 """
-test_resolution.py — unit tests for resolution.py, the single source of
-truth for "is this CVE/device row resolved?"
+test_resolution.py — unit tests for resolution.py.
 
-Why this file exists: the Resolution Status table on the Summary sheet once
-showed 0% Resolved on a real customer report even though the customer had
-been patching all along — because the per-row ☑/☐ logic in
-build_product_sheets() and the aggregate math in build_client_summary_sheet()
-were two independently-maintained copies of the same rule, and neither one
-alone made it obvious that "no --patch file + an export with no RESOLVED
-rows" == "Resolved will always be 0". That's exactly the kind of thing a
-test should catch before a report goes out, not a person staring at a
-workbook wondering if the tool is broken.
-
-Run with:
-    pytest test_resolution.py -v
+Run with: pytest test_resolution.py -v
 
 Author : Stu Villanti <s.villanti@kenstra.com>
 """
@@ -71,6 +59,8 @@ from resolution import (  # noqa: E402
     split_patch_pairs,
     get_sheet_product_key,
     compute_resolved_series,
+    dedup_per_base_product,
+    build_all_scope_frame,
 )
 
 
@@ -342,3 +332,75 @@ def test_compute_resolved_series_result_depends_on_caller_deduplication():
     # compute_resolved_series that reports a count meant to match a product
     # sheet MUST dedupe with the same rule first.
     assert unresolved_cve_count_raw != unresolved_cve_count_dedup
+
+
+# ── build_all_scope_frame / dedup_per_base_product: stale-only-product bug ────
+# Real bug: the "All" scope used to be built by deduplicating stale/not-in-RMM
+# rows PER Base Product, but only for Base Products that were ALSO a key in
+# product_to_sheet (the active scope). A product existing exclusively on
+# stale or not-in-RMM devices — never on any active device — would silently
+# vanish from "Unique CVE Types (All)" / "Total detection rows (All)" even
+# though those exact rows are written, unfiltered, to their own detail sheet.
+# Confirmed on a real dataset: 8 stale-only products, 470 rows, 468 unique
+# CVEs, silently dropped. These tests lock in that dedup_per_base_product()
+# and build_all_scope_frame() include EVERY Base Product, regardless of
+# whether it also appears in some other scope.
+
+def test_dedup_per_base_product_includes_products_with_no_active_sheet():
+    """A product that only exists in this frame (e.g. only ever seen on
+    stale devices) must still be deduplicated and kept — not dropped just
+    because some OTHER scope (like product_to_sheet) doesn't know about it."""
+    df = _df([
+        {'Name': 'CVLT001', 'Vulnerability Name': 'CVE-2026-0001', 'Base Product': 'MySQL Server'},
+        {'Name': 'CVLT001', 'Vulnerability Name': 'CVE-2026-0001', 'Base Product': 'MySQL Server'},  # dup
+        {'Name': 'CVLT002', 'Vulnerability Name': 'CVE-2026-0002', 'Base Product': 'VMware Tools'},
+    ])
+    result = dedup_per_base_product(df)
+    assert len(result) == 2   # duplicate MySQL row collapsed, VMware row kept
+    assert set(result['Base Product']) == {'MySQL Server', 'VMware Tools'}
+
+
+def test_dedup_per_base_product_handles_empty_and_none():
+    assert dedup_per_base_product(None).empty
+    assert dedup_per_base_product(_df([])).empty
+
+
+def test_build_all_scope_frame_includes_stale_only_product():
+    """
+    The exact scenario that caused the bug: 'MySQL Server' only appears on
+    a stale device, never on any active one, so it's not in triage_dedup
+    at all. The All-scope frame must still include it.
+    """
+    triage_dedup = _df([
+        {'Name': 'CVLT001', 'Vulnerability Name': 'CVE-2026-0001', 'Base Product': 'Google Chrome'},
+    ])
+    stale_df = _df([
+        {'Name': 'CVLT099', 'Vulnerability Name': 'CVE-2026-9999', 'Base Product': 'MySQL Server'},
+    ])
+    all_scope = build_all_scope_frame(triage_dedup, stale_excluded_df=stale_df, not_in_rmm_df=None)
+
+    assert len(all_scope) == 2
+    assert all_scope['Vulnerability Name'].nunique() == 2
+    assert 'CVE-2026-9999' in all_scope['Vulnerability Name'].values
+
+
+def test_build_all_scope_frame_includes_not_in_rmm_only_product():
+    """Same scenario, but for a product only seen on a not-in-RMM device."""
+    triage_dedup = _df([
+        {'Name': 'CVLT001', 'Vulnerability Name': 'CVE-2026-0001', 'Base Product': 'Google Chrome'},
+    ])
+    nirm_df = _df([
+        {'Name': 'CVFANTOM', 'Vulnerability Name': 'CVE-2026-8888', 'Base Product': 'PuTTY'},
+    ])
+    all_scope = build_all_scope_frame(triage_dedup, stale_excluded_df=None, not_in_rmm_df=nirm_df)
+
+    assert len(all_scope) == 2
+    assert 'CVE-2026-8888' in all_scope['Vulnerability Name'].values
+
+
+def test_build_all_scope_frame_with_no_exclusions_equals_triage_dedup():
+    triage_dedup = _df([
+        {'Name': 'CVLT001', 'Vulnerability Name': 'CVE-2026-0001', 'Base Product': 'Google Chrome'},
+    ])
+    all_scope = build_all_scope_frame(triage_dedup, stale_excluded_df=None, not_in_rmm_df=None)
+    assert len(all_scope) == len(triage_dedup)
