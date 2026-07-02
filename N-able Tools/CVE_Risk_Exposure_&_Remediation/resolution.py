@@ -156,26 +156,40 @@ def build_all_scope_frame(
 
 def compute_resolved_series(
     df: pd.DataFrame,
-    product_to_sheet: Optional[dict],
-    patch_resolved_pairs: Optional[set],
+    product_to_sheet: Optional[dict] = None,
+    patch_resolved_pairs: Optional[set] = None,
     approaching_stale_names: Optional[Set[str]] = None,
 ) -> pd.Series:
     """
     Whole-dataframe version of compute_resolved_flags(): groups df by
-    'Base Product', resolves each group against its own product scope, and
-    returns a bool Series correctly aligned to df's original index (built
-    from (label, flag) pairs, not by row position — groupby iterates rows
-    in per-group order, not df's original order, so position-based
-    reindexing silently misattaches flags to the wrong rows).
+    'Base Product', resolves each group, and returns a bool Series
+    correctly aligned to df's original index (built from (label, flag)
+    pairs, not by row position — groupby iterates rows in per-group order,
+    not df's original order, so position-based reindexing silently
+    misattaches flags to the wrong rows).
+
+    This function resolves every row it's given — it does not filter or
+    exclude rows based on product_to_sheet. A Base Product not present in
+    product_to_sheet is still resolved via get_sheet_product_key() and
+    whatever patch evidence / raw status it has; product_to_sheet is not
+    used to gate inclusion. If you need a narrower scope (e.g. only
+    products with an active product sheet), filter df before calling this
+    — do not expect this function to do that filtering for you. (It used
+    to: a product absent from product_to_sheet was silently forced
+    unresolved, which broke the Health Score / Score Lift denominators
+    whenever their broader CVSS scope included a product with no rows at
+    the report's own threshold — see build_client_summary_sheet's Health
+    Score section and product_sheets.py's Score Lift setup for how they now
+    build their own scope frame with dedup_per_base_product() before
+    calling this, instead of relying on this function to narrow it.)
 
     Do not reimplement this locally.
     """
     approaching_stale_names = approaching_stale_names or set()
-    p2s = product_to_sheet or {}
     patch_2d, patch_3d = split_patch_pairs(patch_resolved_pairs)
 
-    if 'Base Product' not in df.columns or not p2s:
-        # No product grouping available — degrade to status-column-only,
+    if 'Base Product' not in df.columns:
+        # No product column to group on at all — degrade to status-column-only,
         # still correctly aligned since there's no groupby involved.
         status_col = ('Threat Status' if 'Threat Status' in df.columns
                       else 'Status' if 'Status' in df.columns else None)
@@ -188,10 +202,6 @@ def compute_resolved_series(
     flags: List[bool] = []
     flag_index: list = []
     for base_product, group in df.groupby('Base Product', sort=False):
-        if base_product not in p2s:
-            flags.extend([False] * len(group))
-            flag_index.extend(group.index.tolist())
-            continue
         raw_pnames = (group['Affected Products'].dropna().astype(str).unique().tolist()
                       if 'Affected Products' in group.columns else [])
         sheet_pk = get_sheet_product_key(raw_pnames, base_product)

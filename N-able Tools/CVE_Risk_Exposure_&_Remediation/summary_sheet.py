@@ -432,17 +432,19 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         # Falls back to triage_dedup when no broader scope was supplied.
         _health_raw = health_triage_df if (health_triage_df is not None and not health_triage_df.empty) else None
         if _health_raw is not None:
-            _p2s_hs = set((product_to_sheet or {}).keys())
-            if 'Base Product' in _health_raw.columns and _p2s_hs:
-                _hs_frames = [grp.drop_duplicates(subset=['Name', 'Vulnerability Name'])
-                              for bp, grp in _health_raw.groupby('Base Product') if bp in _p2s_hs]
-            else:
-                _hs_frames = [grp.drop_duplicates(subset=['Name', 'Vulnerability Name'])
-                              for _, grp in (_health_raw.groupby('Base Product')
-                                             if 'Base Product' in _health_raw.columns
-                                             else [(None, _health_raw)])]
-            _score_scope = (pd.concat(_hs_frames, ignore_index=True) if _hs_frames
-                            else _health_raw.drop_duplicates(subset=['Name', 'Vulnerability Name']).copy())
+            # Was: only kept Base Products already present in product_to_sheet
+            # — but product_to_sheet is built from triage_df, which uses the
+            # report's OWN (narrower) threshold, while health_triage_df is
+            # deliberately broader (CVSS ≥ 7.0 even when the report threshold
+            # is 9.0). A product with only 7.0–8.9 rows and nothing at the
+            # report's own threshold would never be a product_to_sheet key,
+            # so its rows were silently dropped from the Health Score scope
+            # entirely — even though the Health Score explicitly claims to
+            # use the broader CVSS ≥ 7.0 scope. dedup_per_base_product()
+            # includes every Base Product unconditionally; compute_resolved_series()
+            # no longer needs product_to_sheet to resolve a group correctly
+            # (see resolution.py), so there's no reason to pre-filter here.
+            _score_scope = _dedup_pbp(_health_raw)
 
             # Resolved flags — reuses the same _compute_resolved_series helper as
             # the Resolution Status table and Top At-Risk Devices (see above).
@@ -488,6 +490,33 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         # they remain static and are labelled "(fixed at generation)".
         _p2s_hs_vals = list((product_to_sheet or {}).values())   # list of sheet name strings
         _hs_live = bool(_p2s_hs_vals)
+
+        # health_triage_df is deliberately broader than the report's own
+        # threshold (e.g. CVSS ≥ 7.0 even when the report itself is ≥ 9.0),
+        # so _score_scope can legitimately contain a Base Product with no
+        # entry in product_to_sheet at all — no dedicated sheet, no ☑/☐
+        # column, nothing a COUNTIF formula could reference. The Python-side
+        # score (_phs, above) already accounts for these "hidden" products
+        # correctly via compute_resolved_series(). But a LIVE formula only
+        # ever sums COUNTIFs over _p2s_hs_vals (existing sheets) — so if we
+        # built one anyway, it would silently drop those products' rows the
+        # moment Excel recalculates (e.g. the reader toggles any unrelated
+        # checkbox), producing a number that visibly disagrees with the
+        # correct one this workbook was generated with. Rather than ship a
+        # formula that can drift wrong on first interaction, fall back to
+        # the same static-value path already used when a formula is too
+        # long for Excel's limit.
+        if _hs_live and 'Base Product' in _score_scope.columns:
+            _hs_hidden_products = set(_score_scope['Base Product'].unique()) - set((product_to_sheet or {}).keys())
+            if _hs_hidden_products:
+                log.info(
+                    "Patching Health Score live formulas disabled: %d product(s) in the "
+                    "health scope have no dedicated sheet (%s) — a live COUNTIF formula "
+                    "can't reference rows that don't exist on any sheet. Static score "
+                    "values will be written instead.",
+                    len(_hs_hidden_products), ', '.join(sorted(_hs_hidden_products)),
+                )
+                _hs_live = False
 
         if _hs_live:
             # ── Component 1: Resolution rate across ALL product sheets ──────────

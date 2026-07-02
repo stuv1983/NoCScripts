@@ -28,6 +28,7 @@ from resolution import (
     get_sheet_product_key as _get_sheet_pk,
     compute_resolved_flags as _compute_flags,
     compute_resolved_series as _compute_resolved_series,
+    dedup_per_base_product as _dedup_per_base_product,
 )
 from sheet_helpers import write_nvd_links as _write_nvd_links
 
@@ -234,23 +235,19 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
         # so every sheet divides by the same fleet-wide denominators.
         _sl_scope = health_triage_df if (health_triage_df is not None and not health_triage_df.empty) else triage_df
 
-        # Dedup per Base Product first (mirrors summary_sheet.py's triage_dedup),
-        # then concatenate — this preserves which product each surviving row
-        # belongs to, which the resolution check below needs to correctly scope
-        # 3-tuple (device, cve, product) patch-evidence pairs. A flat
-        # drop_duplicates(['Name','Vulnerability Name']) across the whole
-        # fleet would silently collapse the same device+CVE seen under two
-        # different products into one arbitrary row, before we ever get to.
-        if 'Base Product' in _sl_scope.columns and product_to_sheet:
-            _sl_dedup_frames = [
-                grp.drop_duplicates(subset=['Name', 'Vulnerability Name'])
-                for bp, grp in _sl_scope.groupby('Base Product')
-                if bp in product_to_sheet
-            ]
-            _sl_dedup = (pd.concat(_sl_dedup_frames, ignore_index=True) if _sl_dedup_frames
-                         else _sl_scope.drop_duplicates(subset=['Name', 'Vulnerability Name']).copy())
-        else:
-            _sl_dedup = _sl_scope.drop_duplicates(subset=['Name', 'Vulnerability Name'])
+        # Was: only kept Base Products already present in product_to_sheet
+        # — but product_to_sheet is built from triage_df, which uses the
+        # report's OWN (narrower) threshold, while health_triage_df is
+        # deliberately broader (CVSS ≥ 7.0 even when the report threshold
+        # is 9.0). A product with rows only in that 7.0–8.9 gap, and none
+        # at the report's own threshold, would never be a product_to_sheet
+        # key — so its rows were silently dropped from the Score Lift
+        # denominators despite Score Lift explicitly using the broader
+        # health scope. dedup_per_base_product() includes every Base
+        # Product unconditionally, and compute_resolved_series() no longer
+        # needs product_to_sheet to resolve a group correctly (see
+        # resolution.py) — so there's no reason to pre-filter here.
+        _sl_dedup = _dedup_per_base_product(_sl_scope)
 
         _sl_sc_col    = 'Vulnerability Score' if 'Vulnerability Score' in _sl_dedup.columns else None
         _sl_total     = len(_sl_dedup)

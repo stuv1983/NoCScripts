@@ -404,3 +404,104 @@ def test_build_all_scope_frame_with_no_exclusions_equals_triage_dedup():
     ])
     all_scope = build_all_scope_frame(triage_dedup, stale_excluded_df=None, not_in_rmm_df=None)
     assert len(all_scope) == len(triage_dedup)
+
+
+# ── compute_resolved_series: health-score scope gap ────────────────────────────
+# Real bug: health_triage_df (used for Health Score / Score Lift) is built
+# from a broader CVSS threshold (≥7.0) than the report's own threshold
+# (e.g. ≥9.0), so it can contain a product with rows in the 7.0-8.9 gap but
+# none at the report's own threshold — meaning that product is never a key
+# in product_to_sheet (which is built from the narrower triage_df). Callers
+# used to pre-filter their scope frame to `bp in product_to_sheet`, or
+# compute_resolved_series() itself forced such rows to False — either way,
+# a product legitimately in-scope for the Health Score was silently
+# dropped from it. Fixed by (a) building scope frames with
+# dedup_per_base_product() (no product_to_sheet filtering) and (b) making
+# compute_resolved_series() resolve every group it's given rather than
+# gating on product_to_sheet membership — inclusion/exclusion is now the
+# caller's job, done before calling this function, not this function's job.
+
+def test_compute_resolved_series_resolves_products_not_in_product_to_sheet():
+    """
+    'MySQL Server' is NOT a key in product_to_sheet (simulating a product
+    that only has rows below the report's own threshold, so it never got a
+    product sheet) — but it must still be resolved correctly via its own
+    raw status, not forced unresolved just because product_to_sheet doesn't
+    know about it.
+    """
+    df = _df([
+        {'Name': 'CVLT001', 'Vulnerability Name': 'CVE-2026-0001',
+         'Base Product': 'Google Chrome', 'Affected Products': 'Google Chrome',
+         'Threat Status': 'UNRESOLVED'},
+        {'Name': 'CVLT002', 'Vulnerability Name': 'CVE-2026-0002',
+         'Base Product': 'MySQL Server', 'Affected Products': 'MySQL Server',
+         'Threat Status': 'RESOLVED'},
+    ])
+    product_to_sheet = {'Google Chrome': 'Google Chrome'}   # MySQL Server deliberately absent
+
+    result = compute_resolved_series(df, product_to_sheet, patch_resolved_pairs=None)
+
+    assert result.loc[0] == False   # Chrome row: genuinely unresolved
+    assert result.loc[1] == True    # MySQL row: genuinely resolved — must NOT be forced False
+
+
+def test_compute_resolved_series_resolves_products_not_in_product_to_sheet_via_patch_evidence():
+    """Same scope gap, but the out-of-scope product's resolution comes from
+    patch evidence rather than raw status — must still apply correctly."""
+    df = _df([
+        {'Name': 'CVFANTOM', 'Vulnerability Name': 'CVE-2026-9999',
+         'Base Product': 'VMware Tools', 'Affected Products': 'VMware Tools'},
+    ])
+    product_to_sheet = {'Google Chrome': 'Google Chrome'}   # VMware Tools absent
+    pairs = {('CVFANTOM', 'CVE-2026-9999')}   # 2-tuple: applies regardless of product
+
+    result = compute_resolved_series(df, product_to_sheet, patch_resolved_pairs=pairs)
+    assert result.loc[0] == True
+
+
+def test_compute_resolved_series_with_empty_product_to_sheet_still_groups_by_base_product():
+    """
+    Even with product_to_sheet=None/empty entirely, a 'Base Product' column
+    is enough to group and resolve correctly — this must NOT degrade to the
+    raw-status-only fallback just because product_to_sheet is missing.
+    """
+    df = _df([
+        {'Name': 'CVLT001', 'Vulnerability Name': 'CVE-2026-0001',
+         'Base Product': 'Google Chrome', 'Affected Products': 'Google Chrome',
+         'Threat Status': 'RESOLVED'},
+        {'Name': 'CVLT002', 'Vulnerability Name': 'CVE-2026-0002',
+         'Base Product': 'Microsoft Edge', 'Affected Products': 'Microsoft Edge',
+         'Threat Status': 'UNRESOLVED'},
+    ])
+    result = compute_resolved_series(df, product_to_sheet=None, patch_resolved_pairs=None)
+    assert result.loc[0] == True
+    assert result.loc[1] == False
+
+
+def test_dedup_per_base_product_then_compute_resolved_series_matches_expected_scope():
+    """
+    End-to-end shape of the actual fix: build a scope frame with
+    dedup_per_base_product() (broader than product_to_sheet), then resolve
+    it with compute_resolved_series() — a product outside product_to_sheet
+    must survive both steps and be resolved correctly, not vanish at
+    either one.
+    """
+    broad_scope = _df([
+        {'Name': 'CVLT001', 'Vulnerability Name': 'CVE-2026-0001',
+         'Base Product': 'Google Chrome', 'Affected Products': 'Google Chrome',
+         'Threat Status': 'UNRESOLVED'},
+        {'Name': 'CVLT001', 'Vulnerability Name': 'CVE-2026-0001',   # duplicate, should collapse
+         'Base Product': 'Google Chrome', 'Affected Products': 'Google Chrome',
+         'Threat Status': 'UNRESOLVED'},
+        {'Name': 'CVFANTOM', 'Vulnerability Name': 'CVE-2026-7777',
+         'Base Product': 'PuTTY', 'Affected Products': 'PuTTY',
+         'Threat Status': 'RESOLVED'},
+    ])
+    product_to_sheet = {'Google Chrome': 'Google Chrome'}   # PuTTY absent — simulates the scope gap
+
+    scope = dedup_per_base_product(broad_scope)
+    assert len(scope) == 2   # duplicate Chrome row collapsed, PuTTY row kept
+
+    resolved = compute_resolved_series(scope, product_to_sheet, patch_resolved_pairs=None)
+    unresolved_count = int((~resolved).sum())
+    assert unresolved_count == 1   # only the Chrome row — PuTTY correctly resolved, not dropped or forced False
