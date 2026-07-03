@@ -598,6 +598,7 @@ def run(request: DashboardRequest) -> DashboardResult:
                 health_triage_df=health_triage_df,
                 health_score_threshold=health_score_threshold,
                 has_patch_report=patch_data is not None,
+                prev_report_name=prev_report_name,
             )
             if trend_data:
                 build_trend_summary_sheet(wb, trend_data, request.threshold,

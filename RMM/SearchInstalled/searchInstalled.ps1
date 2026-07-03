@@ -34,7 +34,7 @@ Set to $true to also check Program Files and AppData folders.
 
 [CmdletBinding()]
 param(
-    [string]$AppKeywords = "",
+    [string[]]$AppKeywords = @(),
     [bool]$SearchAll = $false,
     [bool]$IncludeFileSystem = $true
 )
@@ -47,11 +47,13 @@ $Results = New-Object System.Collections.Generic.List[object]
 $Keywords = @()
 
 if (-not $SearchAll) {
-    $Keywords = $AppKeywords -split "," | ForEach-Object {
-        $_.Trim()
-    } | Where-Object {
-        $_ -ne ""
-    }
+    # Accepts either a quoted comma-string ("Outlook,Teams") or an unquoted
+    # array from the command line (Outlook,Teams -> @("Outlook","Teams")).
+    # Splitting each element on "," again handles both cases safely.
+    $Keywords = $AppKeywords |
+        ForEach-Object { $_ -split "," } |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { $_ -ne "" }
 
     if ($Keywords.Count -eq 0) {
         Write-Output "ERROR: No keywords provided. Enter app names separated by commas, or set SearchAll to True."

@@ -182,7 +182,8 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
                                patch_resolved_pairs: Optional[set] = None,
                                health_triage_df: 'Optional[pd.DataFrame]' = None,
                                health_score_threshold: float = 7.0,
-                               has_patch_report: bool = False):
+                               has_patch_report: bool = False,
+                               prev_report_name: str = ''):
     """
     Client Summary sheet.
 
@@ -833,6 +834,100 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     else:
         # Health score disabled — Key Metrics starts at row 3
         row = 3
+
+    # ── Month-over-Month Remediation Summary ────────────────────────────────────
+    # Only rendered when a previous report was supplied. The point of this
+    # section is to make remediation WORK visible without opening Trend
+    # Summary — the Resolution Status table below only shows the current
+    # snapshot, which can make a month of real patching look like "only
+    # dropped by a few hundred rows" if new detections landed at the same
+    # time.
+    #
+    # Previous / Current / Cleared / New are all computed from the same
+    # full-scope device+CVE+product population in compute_trends(), so
+    # Previous - Cleared + New = Current exactly.
+    if trend_data:
+        _mom = trend_data.get('metrics', {})
+        _mom_up_fmt   = workbook.add_format({'bold': True, 'font_color': '#C00000'})
+        _mom_down_fmt = workbook.add_format({'bold': True, 'font_color': '#375623'})
+        _mom_same_fmt = workbook.add_format({'font_color': '#595959'})
+
+        def _mom_change(prev_val, cur_val, lower_is_better=True):
+            diff = cur_val - prev_val
+            if diff == 0:
+                return '\u2014  no change', _mom_same_fmt
+            if (diff < 0) == lower_is_better:
+                return f'\u25bc  {abs(diff):,}', _mom_down_fmt
+            return f'\u25b2  {abs(diff):,}', _mom_up_fmt
+
+        ws.merge_range(row, 0, row, 3, '  Month-over-Month Remediation Summary', sect_fmt)
+        row += 1
+        ws.write(row, 0, f'Compared against: {prev_report_name}' if prev_report_name
+                         else 'Compared against previous report', note_fmt)
+        row += 1
+        ws.write(row, 0, 'Metric',   hdr_fmt)
+        ws.write(row, 1, 'Previous', hdr_fmt)
+        ws.write(row, 2, 'Current',  hdr_fmt)
+        ws.write(row, 3, 'Change',   hdr_fmt)
+        row += 1
+
+        _prev_pairs = int(_mom.get('previous_unresolved_pair_count', 0))
+        _cur_pairs  = int(_mom.get('current_unresolved_pair_count', 0))
+        ws.write(row, 0, 'Unresolved device/CVE pairs', lbl_fmt)
+        ws.write(row, 1, _prev_pairs, val_fmt)
+        ws.write(row, 2, _cur_pairs,  val_fmt)
+        _s, _f = _mom_change(_prev_pairs, _cur_pairs, lower_is_better=True)
+        ws.write(row, 3, _s, _f)
+        row += 1
+
+        _prev_devs = int(_mom.get('previous_unresolved_device_count', 0))
+        _cur_devs  = int(_mom.get('current_unresolved_device_count', 0))
+        ws.write(row, 0, 'Devices with unresolved CVEs', lbl_fmt)
+        ws.write(row, 1, _prev_devs, val_fmt)
+        ws.write(row, 2, _cur_devs,  val_fmt)
+        _s, _f = _mom_change(_prev_devs, _cur_devs, lower_is_better=True)
+        ws.write(row, 3, _s, _f)
+        row += 1
+
+        _cleared_count = int(_mom.get('cleared_previous_unresolved_count', 0))
+        _cleared_pct   = float(_mom.get('cleared_previous_unresolved_pct', 0.0))
+        ws.write(row, 0, 'Previous-period pairs now cleared', lbl_fmt)
+        ws.write(row, 1, '\u2014', val_fmt)
+        ws.write(row, 2, _cleared_count, val_fmt)
+        ws.write(row, 3, _cleared_pct, val_pct)
+        row += 1
+
+        _new_count = int(_mom.get('new_unresolved_pair_count', 0))
+        ws.write(row, 0, 'New unresolved pairs introduced', lbl_fmt)
+        ws.write(row, 1, '\u2014', val_fmt)
+        ws.write(row, 2, _new_count, val_fmt)
+        ws.write(row, 3, '\u25b2  offset' if _new_count else '\u2014', _mom_up_fmt if _new_count else _mom_same_fmt)
+        row += 1
+
+        _plain_english = (
+            f'\u2139  Remediation cleared {_cleared_pct:.1%} of device/CVE pairs that were unresolved '
+            f'as of the previous report'
+        )
+        if _new_count:
+            _plain_english += (
+                f', but {_new_count:,} new unresolved pair(s) introduced this period offset part of the '
+                f'visible reduction \u2014 a lot was patched, but new detections landed at the same time.'
+            )
+        else:
+            _plain_english += '.'
+        ws.merge_range(row, 0, row, 3, _plain_english, note_fmt)
+        ws.set_row(row, 28)
+        row += 1
+
+        ws.merge_range(row, 0, row, 3,
+            'ℹ  Previous / Current / Cleared / New above are all drawn from the same '
+            'device+CVE+product population, so Previous \u2212 Cleared + New = Current exactly. '
+            'The \u2018Resolved Since Previous Report\u2019 sheet elsewhere in this workbook may show a '
+            'slightly different cleared count \u2014 it excludes products that existed in only one of '
+            'the two reports, which this section deliberately includes.',
+            note_fmt)
+        ws.set_row(row, 28)
+        row += 2
 
     ws.merge_range(row, 0, row, 3, '  Key Metrics', sect_fmt)
     row += 1

@@ -1523,6 +1523,32 @@ def compute_trends(current_df, previous_df, threshold,
     scoped_cur_cves  = len(cur_all_cve_ids)
     scoped_prev_cves = len(prev_cve_ids)
 
+    # ── Month-over-Month Remediation Summary metrics ─────────────────────────
+    # These are DELIBERATELY computed from the full previous/current pair-key
+    # sets on BOTH sides of every subtraction — not reusing resolved_pair_keys
+    # / new_pair_keys above, which are restricted to common_products (products
+    # that exist in both periods) for their own existing consumers (the
+    # Resolution Status table, the 'Resolved Since Previous Report' sheet).
+    # Mixing a common-product-restricted "cleared" count with a full-scope
+    # "previous/current total" looks like it should reconcile
+    # (Previous - Cleared + New == Current) but doesn't — confirmed on a real
+    # dataset where it was off by 244 pairs, because a product that
+    # disappeared entirely between reports contributes to the full-scope
+    # previous/current totals but not to the common-product-restricted
+    # "cleared" count. Using the same full-scope set on every side of this
+    # section's arithmetic is what makes the four numbers actually add up.
+    prev_all_pair_keys = set(zip(prev_t['_Name_Key'], prev_t['_CVE_Key'], prev_t['_Product_Key']))
+    cleared_full_keys      = prev_all_pair_keys - cur_all_pair_keys
+    new_unresolved_full_keys = cur_all_pair_keys  - prev_all_pair_keys
+    previous_unresolved_pair_count = len(prev_all_pair_keys)
+    current_unresolved_pair_count  = len(cur_all_pair_keys)
+    cleared_previous_unresolved_count = len(cleared_full_keys)
+    new_unresolved_pair_count_full    = len(new_unresolved_full_keys)
+    cleared_previous_unresolved_pct = (
+        cleared_previous_unresolved_count / previous_unresolved_pair_count
+        if previous_unresolved_pair_count else 0.0
+    )
+
     metrics = {
         'cur_cves':             snap_cur_cves,
         'prev_cves':            snap_prev_cves,
@@ -1544,6 +1570,20 @@ def compute_trends(current_df, previous_df, threshold,
         'persisting_pair_count':len(persisting_pair_keys),
         'new_devices':          len(cur_dev_set  - prev_dev_set),
         'remediated_devices':   len(prev_dev_set - cur_dev_set),
+        # Month-over-Month Remediation Summary — self-consistent full-scope
+        # set (Previous - Cleared + New == Current, exactly). Deliberately
+        # separate from resolved_pair_count / new_pair_count above, which
+        # stay common-product-restricted for their existing consumers
+        # (Resolution Status table, 'Resolved Since Previous Report' sheet)
+        # — see the comment above prev_all_pair_keys for why mixing the two
+        # scopes silently breaks the arithmetic.
+        'previous_unresolved_pair_count':    previous_unresolved_pair_count,
+        'current_unresolved_pair_count':     current_unresolved_pair_count,
+        'previous_unresolved_device_count':  snap_prev_devices,
+        'current_unresolved_device_count':   snap_cur_devices,
+        'cleared_previous_unresolved_count': cleared_previous_unresolved_count,
+        'cleared_previous_unresolved_pct':   cleared_previous_unresolved_pct,
+        'new_unresolved_pair_count':         new_unresolved_pair_count_full,
     }
 
     cur_prod      = cur_t.groupby('Base Product')['_Name_Key'].nunique()
