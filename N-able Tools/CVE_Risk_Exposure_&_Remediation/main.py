@@ -230,7 +230,7 @@ def toggle_rmm_state():
 def toggle_date_state():
     state = "disabled" if show_all_dates_var.get() else "normal"
     date_entry.configure(state=state)
-    _warn_days_entry.configure(state=state)
+    # _warn_days_entry no longer exists — "Highlight active devices" UI is disabled.
 
 def toggle_trend_state():
     state = "normal" if include_trend_var.get() else "disabled"
@@ -359,110 +359,135 @@ def show_about():
 
 def open_advanced_dialog():
     """
-    Help > Advanced  --  Patch Report options in a modal dialog.
+    Advanced Options dialog — baseline refresh, the (beta) Health Score
+    toggle, and (commented out for now) patch-evidence options.
     """
     dlg = ctk.CTkToplevel(root)
-    dlg.title("Advanced \u2014 Patch Report Options")
+    dlg.title("Advanced Options")
     dlg.resizable(False, False)
     dlg.grab_set()
 
     dlg.update_idletasks()
     pw = root.winfo_x() + root.winfo_width()  // 2
     ph = root.winfo_y() + root.winfo_height() // 2
-    dlg.geometry(f"560x320+{pw - 280}+{ph - 160}")
+    dlg.geometry(f"560x220+{pw - 280}+{ph - 110}")
 
     PAD = {"padx": 16, "pady": (6, 0)}
 
-    ctk.CTkLabel(dlg, text="Patch Report Options",
+    ctk.CTkLabel(dlg, text="Advanced Options",
                  font=ctk.CTkFont(size=14, weight="bold")).pack(pady=(14, 8))
 
-    # ── Patch Report ──────────────────────────────────────────────────────────
-    ctk.CTkLabel(dlg, text="Patch Report  (CSV or XLSX)",
-                 font=ctk.CTkFont(weight="bold")).pack(anchor="w", **PAD)
-    pf = ctk.CTkFrame(dlg, fg_color="transparent")
-    pf.pack(fill="x", padx=16)
-    _pe = ctk.CTkEntry(pf, textvariable=patch_var, width=380,
-                       state="normal" if include_patch_var.get() else "disabled")
-    _pe.pack(side="left")
-    _pb = ctk.CTkButton(pf, text="Browse", width=80,
-                        command=lambda: select_file(patch_var),
-                        state="normal" if include_patch_var.get() else "disabled")
-    _pb.pack(side="left", padx=6)
+    # ── Refresh product baselines ────────────────────────────────────────────────
+    # Moved here from the main Filters card.
+    _baselines_cb = ctk.CTkCheckBox(dlg, text="Refresh product baselines before run",
+                                    variable=sync_baselines_var)
+    _baselines_cb.pack(anchor="w", padx=16, pady=(4, 4))
+    Tooltip(_baselines_cb, "Pulls the latest known-good software versions before "
+                           "generating. Only matters if you're using patch-evidence "
+                           "matching — adds a little time to the run.")
 
-    def _toggle_p():
-        s = "normal" if include_patch_var.get() else "disabled"
-        _pe.configure(state=s)
-        _pb.configure(state=s)
-        _refresh_status()
+    # ── Patching Health Score ────────────────────────────────────────────────────
+    # Moved here from the main Filters card.
+    _health_score_cb = ctk.CTkCheckBox(dlg, text="Show Patching Health Score on Summary sheet  ⚠ Beta",
+                                       variable=include_health_score_var)
+    _health_score_cb.pack(anchor="w", padx=16, pady=(4, 0))
+    Tooltip(_health_score_cb, "Adds an experimental A–F grade to the Summary sheet, "
+                              "combining resolution rate, critical-CVE coverage, and "
+                              "known-exploit coverage. Methodology may still change — "
+                              "not recommended for formal client reporting yet.")
+    ctk.CTkLabel(dlg, text="  Scoring methodology is experimental — not for formal reporting",
+                 font=("", 11), text_color="#7F6000").pack(anchor="w", padx=16, pady=(0, 4))
 
-    ctk.CTkCheckBox(dlg, text="Include Patch Report matching",
-                    variable=include_patch_var, command=_toggle_p).pack(anchor="w", padx=16)
-
-    # ── Patch Failure Report ──────────────────────────────────────────────────
-    ctk.CTkLabel(dlg, text="Patch Failure Report  (CSV)",
-                 font=ctk.CTkFont(weight="bold")).pack(anchor="w", **PAD)
-    ff = ctk.CTkFrame(dlg, fg_color="transparent")
-    ff.pack(fill="x", padx=16)
-    _fe = ctk.CTkEntry(ff, textvariable=failure_var, width=380,
-                       state="normal" if include_failure_var.get() else "disabled")
-    _fe.pack(side="left")
-    _fb = ctk.CTkButton(ff, text="Browse", width=80,
-                        command=lambda: select_file(failure_var, [("CSV Files", "*.csv")]),
-                        state="normal" if include_failure_var.get() else "disabled")
-    _fb.pack(side="left", padx=6)
-
-    def _toggle_f():
-        s = "normal" if include_failure_var.get() else "disabled"
-        _fe.configure(state=s)
-        _fb.configure(state=s)
-        _refresh_status()
-
-    ctk.CTkCheckBox(dlg, text="Include Patch Failure analysis",
-                    variable=include_failure_var, command=_toggle_f).pack(anchor="w", padx=16)
-
-    # ── Browser Audit ─────────────────────────────────────────────────────────
-    ctk.CTkLabel(dlg, text="Browser Audit  (XLSX — from PS browser scan)",
-                 font=ctk.CTkFont(weight="bold")).pack(anchor="w", **PAD)
-    bf = ctk.CTkFrame(dlg, fg_color="transparent")
-    bf.pack(fill="x", padx=16)
-    _be = ctk.CTkEntry(bf, textvariable=browser_audit_var, width=380,
-                       state="normal" if include_browser_audit_var.get() else "disabled")
-    _be.pack(side="left")
-    _bb = ctk.CTkButton(bf, text="Browse", width=80,
-                        command=lambda: select_file(browser_audit_var, [("Excel Files", "*.xlsx")]),
-                        state="normal" if include_browser_audit_var.get() else "disabled")
-    _bb.pack(side="left", padx=6)
-
-    def _toggle_b():
-        s = "normal" if include_browser_audit_var.get() else "disabled"
-        _be.configure(state=s); _bb.configure(state=s)
-        _refresh_status()
-
-    ctk.CTkCheckBox(dlg, text="Include Browser Audit (merges into Version Drift)",
-                    variable=include_browser_audit_var, command=_toggle_b).pack(anchor="w", padx=16)
-
-    # ── Status ────────────────────────────────────────────────────────────────
-    _dlg_status_var = tk.StringVar()
-
-    def _refresh_status(*_):
-        parts = []
-        if include_patch_var.get() and patch_var.get():
-            parts.append(f"Patch: {Path(patch_var.get()).name}")
-        if include_failure_var.get() and failure_var.get():
-            parts.append(f"Failure: {Path(failure_var.get()).name}")
-        if include_browser_audit_var.get() and browser_audit_var.get():
-            parts.append(f"Browser: {Path(browser_audit_var.get()).name}")
-        txt = "  |  ".join(parts) if parts else "No patch data selected"
-        _dlg_status_var.set(txt)
-        _update_patch_status()
-
-    patch_var.trace_add("write",        _refresh_status)
-    failure_var.trace_add("write",      _refresh_status)
-    browser_audit_var.trace_add("write",_refresh_status)
-    _refresh_status()
-
-    ctk.CTkLabel(dlg, textvariable=_dlg_status_var,
-                 text_color=_MUTED_FG, font=ctk.CTkFont(size=11)).pack(pady=(10, 0))
+    # ── Patch Report / Patch Failure Report / Browser Audit ──────────────────────
+    # Disabled for now (commented out). The include_* / *_var names stay
+    # declared elsewhere (defaulting to unset/False) so process_reports(),
+    # _update_ready_hint(), and _update_patch_status() don't need changes —
+    # they just always see "not configured" while this is off.
+    #
+    # ctk.CTkLabel(dlg, text="Patch Report  (CSV or XLSX)",
+    #              font=ctk.CTkFont(weight="bold")).pack(anchor="w", **PAD)
+    # pf = ctk.CTkFrame(dlg, fg_color="transparent")
+    # pf.pack(fill="x", padx=16)
+    # _pe = ctk.CTkEntry(pf, textvariable=patch_var, width=380,
+    #                    state="normal" if include_patch_var.get() else "disabled")
+    # _pe.pack(side="left")
+    # _pb = ctk.CTkButton(pf, text="Browse", width=80,
+    #                     command=lambda: select_file(patch_var),
+    #                     state="normal" if include_patch_var.get() else "disabled")
+    # _pb.pack(side="left", padx=6)
+    #
+    # def _toggle_p():
+    #     s = "normal" if include_patch_var.get() else "disabled"
+    #     _pe.configure(state=s)
+    #     _pb.configure(state=s)
+    #     _refresh_status()
+    #
+    # ctk.CTkCheckBox(dlg, text="Include Patch Report matching",
+    #                 variable=include_patch_var, command=_toggle_p).pack(anchor="w", padx=16)
+    #
+    # ctk.CTkLabel(dlg, text="Patch Failure Report  (CSV)",
+    #              font=ctk.CTkFont(weight="bold")).pack(anchor="w", **PAD)
+    # ff = ctk.CTkFrame(dlg, fg_color="transparent")
+    # ff.pack(fill="x", padx=16)
+    # _fe = ctk.CTkEntry(ff, textvariable=failure_var, width=380,
+    #                    state="normal" if include_failure_var.get() else "disabled")
+    # _fe.pack(side="left")
+    # _fb = ctk.CTkButton(ff, text="Browse", width=80,
+    #                     command=lambda: select_file(failure_var, [("CSV Files", "*.csv")]),
+    #                     state="normal" if include_failure_var.get() else "disabled")
+    # _fb.pack(side="left", padx=6)
+    #
+    # def _toggle_f():
+    #     s = "normal" if include_failure_var.get() else "disabled"
+    #     _fe.configure(state=s)
+    #     _fb.configure(state=s)
+    #     _refresh_status()
+    #
+    # ctk.CTkCheckBox(dlg, text="Include Patch Failure analysis",
+    #                 variable=include_failure_var, command=_toggle_f).pack(anchor="w", padx=16)
+    #
+    # ctk.CTkLabel(dlg, text="Browser Audit  (XLSX — from PS browser scan)",
+    #              font=ctk.CTkFont(weight="bold")).pack(anchor="w", **PAD)
+    # bf = ctk.CTkFrame(dlg, fg_color="transparent")
+    # bf.pack(fill="x", padx=16)
+    # _be = ctk.CTkEntry(bf, textvariable=browser_audit_var, width=380,
+    #                    state="normal" if include_browser_audit_var.get() else "disabled")
+    # _be.pack(side="left")
+    # _bb = ctk.CTkButton(bf, text="Browse", width=80,
+    #                     command=lambda: select_file(browser_audit_var, [("Excel Files", "*.xlsx")]),
+    #                     state="normal" if include_browser_audit_var.get() else "disabled")
+    # _bb.pack(side="left", padx=6)
+    #
+    # def _toggle_b():
+    #     s = "normal" if include_browser_audit_var.get() else "disabled"
+    #     _be.configure(state=s); _bb.configure(state=s)
+    #     _refresh_status()
+    #
+    # ctk.CTkCheckBox(dlg, text="Include Browser Audit (merges into Version Drift)",
+    #                 variable=include_browser_audit_var, command=_toggle_b).pack(anchor="w", padx=16)
+    #
+    # # ── Status ──────────────────────────────────────────────────────────────────
+    # _dlg_status_var = tk.StringVar()
+    #
+    # def _refresh_status(*_):
+    #     parts = []
+    #     if include_patch_var.get() and patch_var.get():
+    #         parts.append(f"Patch: {Path(patch_var.get()).name}")
+    #     if include_failure_var.get() and failure_var.get():
+    #         parts.append(f"Failure: {Path(failure_var.get()).name}")
+    #     if include_browser_audit_var.get() and browser_audit_var.get():
+    #         parts.append(f"Browser: {Path(browser_audit_var.get()).name}")
+    #     txt = "  |  ".join(parts) if parts else "No patch data selected"
+    #     _dlg_status_var.set(txt)
+    #     _update_patch_status()
+    #
+    # patch_var.trace_add("write",        _refresh_status)
+    # failure_var.trace_add("write",      _refresh_status)
+    # browser_audit_var.trace_add("write",_refresh_status)
+    # _refresh_status()
+    #
+    # ctk.CTkLabel(dlg, textvariable=_dlg_status_var,
+    #              text_color=_MUTED_FG, font=ctk.CTkFont(size=11)).pack(pady=(10, 0))
     ctk.CTkButton(dlg, text="Close", width=100,
                   fg_color="gray40", hover_color="gray30",
                   command=dlg.destroy).pack(pady=(12, 16))
@@ -596,6 +621,63 @@ def _inline_field(parent, row, label, variable, width=120, suffix=None):
 def _filename_or_missing(value, missing="Not selected"):
     return Path(value).name if value else missing
 
+
+class Tooltip:
+    """
+    Minimal hover tooltip for any tkinter/customtkinter widget. Shows a
+    small dark popup near the cursor after a short delay, matching the
+    app's own dark theme rather than the OS default tooltip styling.
+
+    Usage:
+        Tooltip(some_widget, "Explanation shown on hover.")
+    """
+    _DELAY_MS = 450
+
+    def __init__(self, widget, text, wraplength=320):
+        self.widget = widget
+        self.text = text
+        self.wraplength = wraplength
+        self._after_id = None
+        self._tip_window = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, _event=None):
+        self._cancel()
+        self._after_id = self.widget.after(self._DELAY_MS, self._show)
+
+    def _cancel(self):
+        if self._after_id is not None:
+            self.widget.after_cancel(self._after_id)
+            self._after_id = None
+
+    def _show(self):
+        if self._tip_window is not None:
+            return
+        try:
+            x = self.widget.winfo_rootx() + 12
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 8
+        except tk.TclError:
+            return
+        self._tip_window = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        tw.attributes("-topmost", True)
+        label = tk.Label(
+            tw, text=self.text, justify="left", wraplength=self.wraplength,
+            background="#2b2b2b", foreground="white",
+            relief="solid", borderwidth=1,
+            padx=8, pady=5, font=("Segoe UI", 9),
+        )
+        label.pack()
+
+    def _hide(self, _event=None):
+        self._cancel()
+        if self._tip_window is not None:
+            self._tip_window.destroy()
+            self._tip_window = None
+
 # ==========================================================================
 # VARIABLES
 # ==========================================================================
@@ -603,14 +685,14 @@ def _filename_or_missing(value, missing="Not selected"):
 vuln_var = tk.StringVar()
 rmm_var = tk.StringVar()
 skip_rmm_var = tk.BooleanVar()
-score_var = tk.StringVar(value="9.0")
+score_var = tk.StringVar(value="1.0")
 date_var = tk.StringVar(value=(date.today() - timedelta(days=90)).strftime('%d/%m/%Y'))
 _date_display_var = tk.StringVar(value=date_var.get())   # mirrors date_var for the label
 show_all_dates_var = tk.BooleanVar()
 stale_warning_days_var = tk.StringVar(value="14")        # approaching-stale warning window (days)
 report_month_var = tk.StringVar(value=datetime.now().strftime('%B %Y'))
 prev_report_var = tk.StringVar()
-include_trend_var = tk.BooleanVar()
+include_trend_var = tk.BooleanVar(value=True)
 sync_baselines_var = tk.BooleanVar()
 patch_var = tk.StringVar()
 failure_var = tk.StringVar()
@@ -642,6 +724,10 @@ vuln_entry, vuln_browse_btn = _file_row(
     vuln_var,
     lambda: select_file(vuln_var),
 )
+Tooltip(vuln_entry, "The vulnerability detections export from N-able (CSV or XLSX).\n"
+                    "This should be this month's export — the tool only ever sees "
+                    "currently active detections, so a patched CVE simply disappears "
+                    "from next month's file rather than being marked resolved in it.")
 row += 1
 
 ctk.CTkLabel(inputs_card, text="Device Inventory / RMM Report  (CSV or XLSX)").grid(
@@ -654,14 +740,20 @@ rmm_entry, rmm_browse_btn = _file_row(
     rmm_var,
     lambda: select_file(rmm_var),
 )
+Tooltip(rmm_entry, "The device inventory / RMM export from N-able (CSV or XLSX). "
+                   "Used to fill in device type, username, last check-in, and to "
+                   "identify devices that are stale or missing from RMM entirely.")
 row += 1
 
-ctk.CTkCheckBox(
-    inputs_card,
-    text="Skip RMM — CVE export already includes device information",
-    variable=skip_rmm_var,
-    command=toggle_rmm_state,
-).grid(row=row, column=0, sticky="w", padx=16, pady=(0, 14))
+# Skip RMM checkbox — disabled for now (commented out). skip_rmm_var stays
+# declared (defaults to False) so nothing else in the form has to change;
+# RMM data is always required until this is re-enabled.
+# ctk.CTkCheckBox(
+#     inputs_card,
+#     text="Skip RMM — CVE export already includes device information",
+#     variable=skip_rmm_var,
+#     command=toggle_rmm_state,
+# ).grid(row=row, column=0, sticky="w", padx=16, pady=(0, 14))
 
 # ==========================================================================
 # FILTERS CARD
@@ -674,6 +766,10 @@ filters_card, row = _card(
 )
 
 score_entry = _inline_field(filters_card, row, "Minimum CVE Score:", score_var, width=80, suffix="Example: 9.0")
+Tooltip(score_entry, "CVSS floor for what gets included in the report. Lower values "
+                     "(e.g. 1.0) pull in far more data — every severity, not just "
+                     "critical — and take longer to generate. Use 9.0 for a "
+                     "critical-only report, 7.0 for critical + high.")
 row += 1
 
 # Stale date row
@@ -699,50 +795,49 @@ date_entry = ctk.CTkButton(
     hover_color=_BLUE_HOVER,
 )
 date_entry.pack(side="left", padx=(0, 8))
-ctk.CTkCheckBox(
+Tooltip(date_entry, "Devices whose last check-in is before this date are excluded "
+                    "from the Active scope and moved to the Stale Excluded Devices "
+                    "tab instead of being silently dropped.")
+_show_all_dates_cb = ctk.CTkCheckBox(
     _date_frame,
     text="Show all dates",
     variable=show_all_dates_var,
     command=toggle_date_state,
-).pack(side="left", padx=(8, 0))
+)
+_show_all_dates_cb.pack(side="left", padx=(8, 0))
+Tooltip(_show_all_dates_cb, "Ignore the stale-date cutoff entirely and include every "
+                            "device regardless of how long it's been offline.")
 row += 1
 
-# Approaching-stale warning window
-_warn_frame = ctk.CTkFrame(filters_card, fg_color="transparent")
-_warn_frame.grid(row=row, column=0, sticky="w", padx=16, pady=(0, 6))
-ctk.CTkLabel(_warn_frame, text="⚠  Highlight active devices last seen within:").pack(side="left")
-_warn_days_entry = ctk.CTkEntry(_warn_frame, textvariable=stale_warning_days_var, width=52)
-_warn_days_entry.pack(side="left", padx=(8, 4))
-ctk.CTkLabel(
-    _warn_frame,
-    text="days without response  (orange in product sheets — flags any active device offline this long)",
-    text_color=_MUTED_FG,
-    font=ctk.CTkFont(size=11),
-).pack(side="left")
+# Approaching-stale warning window — disabled for now (commented out).
+# stale_warning_days_var stays declared with its default ("14") so
+# DashboardRequest still gets a sensible value; it's just no longer
+# user-configurable from the UI.
+# _warn_frame = ctk.CTkFrame(filters_card, fg_color="transparent")
+# _warn_frame.grid(row=row, column=0, sticky="w", padx=16, pady=(0, 6))
+# ctk.CTkLabel(_warn_frame, text="⚠  Highlight active devices last seen within:").pack(side="left")
+# _warn_days_entry = ctk.CTkEntry(_warn_frame, textvariable=stale_warning_days_var, width=52)
+# _warn_days_entry.pack(side="left", padx=(8, 4))
+# Tooltip(_warn_days_entry, "Devices that are still active but haven't responded within "
+#                           "this many days get flagged amber on product sheets, as a "
+#                           "warning that patch confirmation for them may be unreliable — "
+#                           "they're not excluded from the report.")
+# ctk.CTkLabel(
+#     _warn_frame,
+#     text="days without response  (orange in product sheets — flags any active device offline this long)",
+#     text_color=_MUTED_FG,
+#     font=ctk.CTkFont(size=11),
+# ).pack(side="left")
 row += 1
 
 report_month_entry = _inline_field(filters_card, row, "Report Month:", report_month_var, width=160)
+Tooltip(report_month_entry, "The label shown on the report (e.g. \"April 2026\"). "
+                            "Defaults to the current month — override this when "
+                            "generating a report retroactively.")
 row += 1
 
-ctk.CTkCheckBox(
-    filters_card,
-    text="Refresh product baselines before run",
-    variable=sync_baselines_var,
-).grid(row=row, column=0, sticky="w", padx=16, pady=(2, 4))
-row += 1
-
-ctk.CTkCheckBox(
-    filters_card,
-    text="Show Patching Health Score on Summary sheet  ⚠ Beta",
-    variable=include_health_score_var,
-).grid(row=row, column=0, sticky="w", padx=16, pady=(0, 4))
-ctk.CTkLabel(
-    filters_card,
-    text="  Scoring methodology is experimental — not for formal reporting",
-    font=("", 11),
-    text_color="#7F6000",
-).grid(row=row, column=1, sticky="w", padx=(0, 16), pady=(0, 4))
-row += 1
+# "Refresh product baselines before run" and "Show Patching Health Score on
+# Summary sheet" moved to Advanced Options — see open_advanced_dialog().
 
 # ==========================================================================
 # OPTIONAL DATA CARD
@@ -765,13 +860,19 @@ prev_report_entry, prev_report_browse_btn = _file_row(
     lambda: select_file(prev_report_var, [("Previous Report", "*.xlsx *.csv"), ("Excel Files", "*.xlsx"), ("CSV RawData", "*.csv")]),
     state="disabled",
 )
+Tooltip(prev_report_entry, "Last month's GENERATED dashboard output (not a raw N-able "
+                           "export). Enables the Month-over-Month Remediation Summary "
+                           "and trend detail sheets on this run.")
 row += 1
-ctk.CTkCheckBox(
+_trend_cb = ctk.CTkCheckBox(
     optional_card,
     text="Include month-over-month trend analysis",
     variable=include_trend_var,
     command=toggle_trend_state,
-).grid(row=row, column=0, sticky="w", padx=16, pady=(0, 8))
+)
+_trend_cb.grid(row=row, column=0, sticky="w", padx=16, pady=(0, 8))
+Tooltip(_trend_cb, "On by default. Untick if you don't have a previous dashboard "
+                   "to compare against, or don't want trend sections on this run.")
 row += 1
 
 patch_status_label = ctk.CTkLabel(
@@ -803,6 +904,9 @@ generate_btn = ctk.CTkButton(
     corner_radius=16,
 )
 generate_btn.grid(row=row, column=0, sticky="ew", padx=16, pady=(4, 10))
+Tooltip(generate_btn, "Builds the workbook and prompts you for where to save it. "
+                      "Generation time depends on your threshold and fleet size — "
+                      "a low threshold across a large fleet can take a minute or more.")
 row += 1
 
 status_line = ctk.CTkLabel(
@@ -846,7 +950,7 @@ def _update_patch_status(*_):
     patch_status_var.set(
         "Patch evidence: " + "  |  ".join(parts)
         if parts else
-        "Patch evidence: not configured — use Advanced Options if required"
+        "Patch evidence: not configured"
     )
 
 

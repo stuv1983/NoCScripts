@@ -405,15 +405,39 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
         # IMPORTANT: range starts at Excel row 2 (xlsxwriter row index 1), so formula
         # must reference row 2 ($A2) not row 1 ($A1). Using $A1 causes an off-by-one:
         # each row gets coloured based on the PREVIOUS row's value, not its own.
+        #
+        # The Vulnerability Score column is DELIBERATELY EXCLUDED from every
+        # row-level range below. Every row is either ☑ or ☐ (always one or the
+        # other, always true), so if the Score column were included here, the
+        # row-level rule — added first, hence higher priority in Excel — would
+        # win the conflict on that cell on EVERY row, and the CVSS score-band
+        # colour applied further down would never actually be visible. This
+        # was a real bug: the score-band rules existed and were correct, but
+        # were silently overridden on 100% of rows. Splitting the range in two
+        # (skipping the Score column entirely) means there's no overlap for
+        # Excel to resolve — both colourings show, independently, as intended.
+        _vs_idx = cl.index('Vulnerability Score') if 'Vulnerability Score' in cl else None
+
+        def _row_cf(cf_dict):
+            """Apply a row-level conditional format across all columns except
+            the Vulnerability Score column (if present)."""
+            if _vs_idx is None:
+                ws.conditional_format(1, 0, _last, len(cl) - 1, cf_dict)
+                return
+            if _vs_idx > 0:
+                ws.conditional_format(1, 0, _last, _vs_idx - 1, cf_dict)
+            if _vs_idx < len(cl) - 1:
+                ws.conditional_format(1, _vs_idx + 1, _last, len(cl) - 1, cf_dict)
+
         # Priority 1: Resolved (☑ in col A) → blue.
-        ws.conditional_format(1, 0, _last, len(cl) - 1, {
+        _row_cf({
             'type':     'formula',
             'criteria': '=$A2="☑"',
             'format':   patch_res_fmt,
         })
         # Priority 2: Unresolved (☐ in col A) → light red. Makes unresolved rows
         # immediately visible against the blue resolved rows.
-        ws.conditional_format(1, 0, _last, len(cl) - 1, {
+        _row_cf({
             'type':     'formula',
             'criteria': '=$A2="☐"',
             'format':   unresolved_fmt,
@@ -422,7 +446,7 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
         _exp_col = 'Has Known Exploit'
         if _exp_col in cl:
             _ec = chr(ord('A') + cl.index(_exp_col))
-            ws.conditional_format(1, 0, _last, len(cl) - 1, {
+            _row_cf({
                 'type':     'formula',
                 'criteria': f'=OR(${_ec}2=TRUE,UPPER(TEXT(${_ec}2,"@"))="YES")',
                 'format':   exploit_fmt,
@@ -469,19 +493,21 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
         if 'Name'               in cl: ws.set_column(cl.index('Name'),               cl.index('Name'),               25)
         if 'Device Type'        in cl: ws.set_column(cl.index('Device Type'),        cl.index('Device Type'),        15)
         if 'Baseline Compliance' in cl: ws.set_column(cl.index('Baseline Compliance'), cl.index('Baseline Compliance'), 22)
-        if 'Vulnerability Score' in cl:
-            _vs_idx = cl.index('Vulnerability Score')
+        if _vs_idx is not None:
             _vs_col = get_col_letter(_vs_idx)
             ws.set_column(_vs_idx, _vs_idx, 8)
-            # CVSS score colour coding — added AFTER row-level CFs so row colour
-            # takes precedence on resolved/exploit rows; score colour shows on others.
-            _crit_fmt = wb_.add_format({'bg_color': '#C00000', 'font_color': 'white',
-                                        'bold': True,  'num_format': '0.0', 'align': 'center'})
-            _high_fmt = wb_.add_format({'bg_color': '#ED7D31', 'font_color': 'white',
+            # CVSS score colour coding — matches the Risk Rating matrix exactly:
+            # Critical 9.0-10.0 = red, High 7.0-8.9 = gold, Medium 4.0-6.9 = yellow,
+            # Low 0.1-3.9 = green. Colour follows score ONLY — added AFTER
+            # row-level CFs so row colour (resolved/exploit) still takes
+            # precedence on those rows; score colour shows on the rest.
+            _crit_fmt = wb_.add_format({'bg_color': '#FF0000', 'font_color': 'white',
                                         'num_format': '0.0', 'align': 'center'})
-            _med_fmt  = wb_.add_format({'bg_color': '#FFF2CC', 'font_color': '#7F6000',
+            _high_fmt = wb_.add_format({'bg_color': '#FFC000', 'font_color': 'black',
                                         'num_format': '0.0', 'align': 'center'})
-            _low_fmt  = wb_.add_format({'bg_color': '#E2EFDA',
+            _med_fmt  = wb_.add_format({'bg_color': '#FFFF00', 'font_color': 'black',
+                                        'num_format': '0.0', 'align': 'center'})
+            _low_fmt  = wb_.add_format({'bg_color': '#92D050', 'font_color': 'black',
                                         'num_format': '0.0', 'align': 'center'})
             ws.conditional_format(1, _vs_idx, _last, _vs_idx, {
                 'type': 'cell', 'criteria': '>=', 'value': 9.0, 'format': _crit_fmt})
