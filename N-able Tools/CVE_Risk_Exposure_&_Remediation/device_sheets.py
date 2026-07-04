@@ -137,7 +137,7 @@ def build_stale_excluded_sheet(writer, stale_df, not_in_rmm_df=None) -> None:
     ws.write(note_row, 0,
              'ℹ  Date-Stale: last seen before the cutoff — may still be live. '
              'Not-in-RMM (🚫 red): device absent from RMM inventory — '
-             'verify decommission status (shadow IT / orphaned agent).', note_fmt)
+             'verify decommission status.', note_fmt)
     ws.set_row(note_row, 30)
 
 
@@ -227,7 +227,7 @@ def build_stale_cves_sheet(writer, df, link_fmt, not_in_rmm_cves_df=None) -> Non
     ws.write(note_row, 0,
              'ℹ  Date-Stale (grey): device excluded — Last Response before cutoff. '
              'Not-in-RMM (🚫 red): device absent from RMM inventory — '
-             'verify decommission status (shadow IT / orphaned agent). '
+             'verify decommission status. '
              'Use the Reason filter to view each category separately.',
              note_fmt)
     ws.set_row(note_row, 36)

@@ -252,7 +252,6 @@ def run(request: DashboardRequest) -> DashboardResult:
         raw_df         = merged_df.copy()
         stale_excluded = pd.DataFrame()
         approaching_stale_names: set = set()
-        _STALE_DAYS = 30   # fixed staleness threshold (days without a response)
 
         if not request.show_all_dates and request.cutoff_date:
             cutoff = pd.to_datetime(request.cutoff_date, dayfirst=True, errors='coerce')
@@ -260,47 +259,26 @@ def run(request: DashboardRequest) -> DashboardResult:
                 cutoff = pd.to_datetime('1900-01-01')
             high = merged_df[merged_df['Vulnerability Score'] >= request.threshold]
 
-            # ── Pass 1: date-filter stale (last seen before cutoff_date) ────────
-            stale_by_date = high[
+            # Stale = last seen before the user-entered cutoff date. This is
+            # the ONLY staleness criterion — there is no separate fixed
+            # day-count rule layered on top of it. 'Not found in RMM' is a
+            # wholly separate, orthogonal category (handled elsewhere as
+            # not_in_rmm_df) and is never counted as stale here.
+            stale_excluded = high[
                 (high['_Sort_Time'] < cutoff) &
                 (high['Last Response'] != 'Not Found in RMM')
             ].copy()
-
-            # ── Pass 2: days-stale (last seen after cutoff but >= 30 days ago) ──
-            if 'Days Since Last Response' in merged_df.columns:
-                _days_col = pd.to_numeric(merged_df['Days Since Last Response'], errors='coerce')
-                stale_names_by_days = set(
-                    merged_df.loc[
-                        (merged_df['Last Response'] != 'Not Found in RMM') &
-                        (_days_col >= _STALE_DAYS),
-                        'Name'
-                    ].unique()
-                )
-            else:
-                stale_names_by_days = set()
-
-            stale_by_days_df = high[
-                high['Name'].isin(stale_names_by_days) &
-                (high['Last Response'] != 'Not Found in RMM') &
-                ~high['Name'].isin(set(stale_by_date['Name'].unique()))
-            ].copy()
-
-            stale_excluded = pd.concat([stale_by_date, stale_by_days_df], ignore_index=True)
             all_stale_names = set(stale_excluded['Name'].unique())
 
-            # Remove ALL stale devices (both passes) from the working dataset
+            # Remove stale devices from the working dataset
             merged_df = merged_df[
                 (~merged_df['Name'].isin(all_stale_names)) |
                 (merged_df['Last Response'] == 'Not Found in RMM')
             ]
 
             log.info(
-                "Date filter applied (>= %s): %d rows kept, "
-                "%d stale excluded (%d by date-filter, %d by %d-day rule)",
-                request.cutoff_date, len(merged_df),
-                len(all_stale_names), len(stale_by_date['Name'].unique()),
-                len(stale_names_by_days - set(stale_by_date['Name'].unique())),
-                _STALE_DAYS,
+                "Date filter applied (>= %s): %d rows kept, %d stale device(s) excluded",
+                request.cutoff_date, len(merged_df), len(all_stale_names),
             )
 
         # ── Approaching stale: DISABLED FOR TESTING ─────────────────────────────

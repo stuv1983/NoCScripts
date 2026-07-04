@@ -213,6 +213,8 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     grn_fmt   = workbook.add_format({'bold': True, 'font_color': 'white', 'bg_color': '#375623',
                                       'border': 1, 'align': 'right', 'num_format': '#,##0'})
     note_fmt  = workbook.add_format({'italic': True, 'font_color': '#595959', 'font_size': 9, 'text_wrap': True})
+    def_fmt   = workbook.add_format({'italic': True, 'font_color': '#595959', 'font_size': 9,
+                                      'border': 1, 'align': 'left'})
     trend_up  = workbook.add_format({'bold': True, 'font_color': '#375623', 'border': 1, 'align': 'right'})
     trend_dn  = workbook.add_format({'bold': True, 'font_color': '#C00000',  'border': 1, 'align': 'right'})
     trend_eq  = workbook.add_format({'font_color': '#595959', 'border': 1, 'align': 'right'})
@@ -224,11 +226,17 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     wf_eq_val = workbook.add_format({'bold': True, 'bg_color': '#D6E4F0', 'border': 1,
                                       'align': 'right', 'num_format': '#,##0'})
 
-    ws.set_column('A:A', 44); ws.set_column('B:D', 18)
+    ws.set_column('A:A', 44); ws.set_column('B:D', 18); ws.set_column('E:E', 48)
     title_text = (f'{customer_name}  \u2014  ' if customer_name else '') + 'CVE Risk Exposure Summary'
     ws.merge_range('A1:D1', title_text, title_fmt); ws.set_row(0, 28)
     ws.write('A2', f'Report Month: {report_month}  |  Generated: {datetime.now().strftime("%d %b %Y")}',
              workbook.add_format({'italic': True, 'font_color': '#595959', 'font_size': 9}))
+
+    # Stale devices are excluded purely by this user-entered cutoff date —
+    # there is no separate fixed day-count rule. Computed once here so every
+    # section below that references the stale cutoff (Key Metrics footnote,
+    # Device Breakdown footnote, Data Filtering Reconciliation) stays in sync.
+    _cutoff_lbl = cutoff_date if cutoff_date else 'N/A (all dates included)'
 
     # ── Key Metrics ─────────────────────────────────────────────────────────────
     # ALL counts from triage_df: active scope only (stale + not-in-RMM removed).
@@ -860,15 +868,16 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
                 return f'\u25bc  {abs(diff):,}', _mom_down_fmt
             return f'\u25b2  {abs(diff):,}', _mom_up_fmt
 
-        ws.merge_range(row, 0, row, 3, '  Month-over-Month Remediation Summary', sect_fmt)
+        ws.merge_range(row, 0, row, 4, '  Month-over-Month Remediation Summary', sect_fmt)
         row += 1
         ws.write(row, 0, f'Compared against: {prev_report_name}' if prev_report_name
                          else 'Compared against previous report', note_fmt)
         row += 1
-        ws.write(row, 0, 'Metric',   hdr_fmt)
-        ws.write(row, 1, 'Previous', hdr_fmt)
-        ws.write(row, 2, 'Current',  hdr_fmt)
-        ws.write(row, 3, 'Change',   hdr_fmt)
+        ws.write(row, 0, 'Metric',      hdr_fmt)
+        ws.write(row, 1, 'Previous',    hdr_fmt)
+        ws.write(row, 2, 'Current',     hdr_fmt)
+        ws.write(row, 3, 'Change',      hdr_fmt)
+        ws.write(row, 4, 'Definition',  hdr_fmt)
         row += 1
 
         _prev_pairs = int(_mom.get('previous_unresolved_pair_count', 0))
@@ -878,6 +887,7 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         ws.write(row, 2, _cur_pairs,  val_fmt)
         _s, _f = _mom_change(_prev_pairs, _cur_pairs, lower_is_better=True)
         ws.write(row, 3, _s, _f)
+        ws.write(row, 4, 'Distinct device + CVE pairs still unresolved.', def_fmt)
         row += 1
 
         _prev_devs = int(_mom.get('previous_unresolved_device_count', 0))
@@ -887,6 +897,7 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         ws.write(row, 2, _cur_devs,  val_fmt)
         _s, _f = _mom_change(_prev_devs, _cur_devs, lower_is_better=True)
         ws.write(row, 3, _s, _f)
+        ws.write(row, 4, 'Devices that have at least one unresolved CVE.', def_fmt)
         row += 1
 
         _cleared_count = int(_mom.get('cleared_previous_unresolved_count', 0))
@@ -895,6 +906,7 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         ws.write(row, 1, '\u2014', val_fmt)
         ws.write(row, 2, _cleared_count, val_fmt)
         ws.write(row, 3, _cleared_pct, val_pct)
+        ws.write(row, 4, 'Pairs unresolved last report that are resolved now.', def_fmt)
         row += 1
 
         _new_count = int(_mom.get('new_unresolved_pair_count', 0))
@@ -902,34 +914,10 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         ws.write(row, 1, '\u2014', val_fmt)
         ws.write(row, 2, _new_count, val_fmt)
         ws.write(row, 3, '\u25b2  offset' if _new_count else '\u2014', _mom_up_fmt if _new_count else _mom_same_fmt)
-        row += 1
-
-        _plain_english = (
-            f'\u2139  Remediation cleared {_cleared_pct:.1%} of device/CVE pairs that were unresolved '
-            f'as of the previous report'
-        )
-        if _new_count:
-            _plain_english += (
-                f', but {_new_count:,} new unresolved pair(s) introduced this period offset part of the '
-                f'visible reduction \u2014 a lot was patched, but new detections landed at the same time.'
-            )
-        else:
-            _plain_english += '.'
-        ws.merge_range(row, 0, row, 3, _plain_english, note_fmt)
-        ws.set_row(row, 28)
-        row += 1
-
-        ws.merge_range(row, 0, row, 3,
-            'ℹ  Previous / Current / Cleared / New above are all drawn from the same '
-            'device+CVE+product population, so Previous \u2212 Cleared + New = Current exactly. '
-            'The \u2018Resolved Since Previous Report\u2019 sheet elsewhere in this workbook may show a '
-            'slightly different cleared count \u2014 it excludes products that existed in only one of '
-            'the two reports, which this section deliberately includes.',
-            note_fmt)
-        ws.set_row(row, 28)
+        ws.write(row, 4, 'Pairs that became unresolved for the first time this period.', def_fmt)
         row += 2
 
-    ws.merge_range(row, 0, row, 3, '  Key Metrics', sect_fmt)
+    ws.merge_range(row, 0, row, 4, '  Key Metrics', sect_fmt)
     row += 1
 
     # Header row
@@ -937,7 +925,16 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     ws.write(row, 1, 'All',          _all_hdr)
     ws.write(row, 2, 'Active only',  hdr_fmt)
     ws.write(row, 3, 'Excl. (stale / not in RMM)', _excl_hdr)
+    ws.write(row, 4, 'Definition',   hdr_fmt)
     row += 1
+
+    _KEY_METRIC_DEFINITIONS = {
+        'Total detection rows':       'One row per device + CVE + product detection.',
+        'Unique CVE types':           'Distinct CVE IDs, regardless of how many devices have them.',
+        'Unique devices':             'Distinct devices with at least one qualifying detection.',
+        'Detections at CVSS 9.0+':    'Detection rows scoring 9.0 or higher.',
+        'Unique CVEs at CVSS 9.0+':   'Distinct CVE IDs scoring 9.0 or higher.',
+    }
 
     for metric, all_val, active_val, excl_val, active_fmt in [
         ('Total detection rows',        _all_rows,          total_rows,     _excl_rows,             val_fmt),
@@ -950,11 +947,13 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         ws.write(row, 1, all_val,     _all_val)
         ws.write(row, 2, active_val,  active_fmt)
         ws.write(row, 3, excl_val if excl_val else '—',  _excl_val)
+        ws.write(row, 4, _KEY_METRIC_DEFINITIONS.get(metric, ''), def_fmt)
         row += 1
 
-    ws.merge_range(row, 0, row, 3,
+
+    ws.merge_range(row, 0, row, 4,
                    '\u2139  All = full dataset at CVSS \u2265 threshold.  '
-                   'Active = excludes stale (\u226530 days without response) and devices not found in RMM.  '
+                   f'Active = excludes stale devices (last seen before {_cutoff_lbl}) and devices not found in RMM.  '
                    'Active + Excluded = All for row counts and device counts.  '
                    'Unique CVE type counts may overlap between active and excluded devices (shown as \u2014).  '
                    '\u26a0  Unique device counts may appear lower than detection totals: a device running '
@@ -1112,7 +1111,7 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     ws.merge_range(row, 0, row, 3,
                    '\u2139  Counts are unique devices — a device with Chrome, Edge and Firefox counts as one device.  '
                    '"Devices with unresolved CVEs" = at least one detection still marked \u2610 across any product.  '
-                   '"Stale devices (excluded)" = inactive \u226530 days, moved to Stale Excluded Devices sheet.  '
+                   f'"Stale devices (excluded)" = last seen before {_cutoff_lbl} (set in the app), moved to Stale Excluded Devices sheet.  '
                    'All counts fixed at report generation.',
                    note_fmt)
     ws.set_row(row, 42); row += 2
@@ -1120,7 +1119,6 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     # Data Filtering Reconciliation waterfall
     # Uses deduped counts (_all_df, _stale_dedup) so [+] - [-] = [=] exactly.
     _stale_cves_dedup = int(_stale_dedup['Vulnerability Name'].nunique()) if not _stale_dedup.empty and 'Vulnerability Name' in _stale_dedup.columns else 0
-    _cutoff_lbl = cutoff_date if cutoff_date else 'N/A (all dates included)'
 
     row += 1
     ws.merge_range(row, 0, row, 3, f'  Data Filtering Reconciliation  (CVSS \u2265 {threshold})', sect_fmt); row += 1
@@ -1130,7 +1128,7 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     ws.write(row, 1, _all_devs, val_fmt); ws.write(row, 2, _all_rows, val_fmt); ws.write(row, 3, _all_cves, val_fmt); row += 1
     if not _stale_dedup.empty:
         _stale_dedup_devs = int(_stale_dedup['Name'].nunique()) if 'Name' in _stale_dedup.columns else _stale_devs
-        ws.write(row, 0, f'[-]  Excluded: stale devices  (last seen before {_cutoff_lbl} OR \u226530 days without response)', wf_minus)
+        ws.write(row, 0, f'[-]  Excluded: stale devices  (last seen before {_cutoff_lbl})', wf_minus)
         ws.write(row, 1, _stale_dedup_devs, wf_mval); ws.write(row, 2, len(_stale_dedup), wf_mval); ws.write(row, 3, _stale_cves_dedup, wf_mval); row += 1
     if not_in_rmm_count > 0:
         ws.write(row, 0, '[-]  Excluded: device not found in RMM', wf_minus)

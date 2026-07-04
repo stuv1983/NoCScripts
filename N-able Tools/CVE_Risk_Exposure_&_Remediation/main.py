@@ -682,11 +682,19 @@ class Tooltip:
 # VARIABLES
 # ==========================================================================
 
+def _default_stale_cutoff() -> str:
+    """1st of the previous calendar month (dd/mm/yyyy) — the default stale-device cutoff."""
+    first_of_this_month = date.today().replace(day=1)
+    last_of_prev_month = first_of_this_month - timedelta(days=1)
+    first_of_prev_month = last_of_prev_month.replace(day=1)
+    return first_of_prev_month.strftime('%d/%m/%Y')
+
+
 vuln_var = tk.StringVar()
 rmm_var = tk.StringVar()
 skip_rmm_var = tk.BooleanVar()
 score_var = tk.StringVar(value="1.0")
-date_var = tk.StringVar(value=(date.today() - timedelta(days=90)).strftime('%d/%m/%Y'))
+date_var = tk.StringVar(value=_default_stale_cutoff())
 _date_display_var = tk.StringVar(value=date_var.get())   # mirrors date_var for the label
 show_all_dates_var = tk.BooleanVar()
 stale_warning_days_var = tk.StringVar(value="14")        # approaching-stale warning window (days)
@@ -797,7 +805,8 @@ date_entry = ctk.CTkButton(
 date_entry.pack(side="left", padx=(0, 8))
 Tooltip(date_entry, "Devices whose last check-in is before this date are excluded "
                     "from the Active scope and moved to the Stale Excluded Devices "
-                    "tab instead of being silently dropped.")
+                    "tab instead of being silently dropped. Defaults to the 1st of "
+                    "last month — adjust it if you need a different cutoff.")
 _show_all_dates_cb = ctk.CTkCheckBox(
     _date_frame,
     text="Show all dates",

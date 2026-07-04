@@ -220,17 +220,11 @@ def _get_arch(text: str) -> str:
     a = m.group(1).lower()
     return 'x86' if ('x86' in a or '32' in a) else 'x64'
 
-STATUS_RANK = {'Installed': 6, 'Reboot Required': 5, 'Installing': 4,
-                'Pending': 3, 'Missing': 2, 'Failed': 1}
-STATUS_LABEL = {
-    'Installed':       'Matched - installed',
-    'Reboot Required': 'Matched - reboot required',
-    'Installing':      'Matched - installing',
-    'Pending':         'Matched - pending',
-    'Missing':         'Matched - missing',
-    'Failed':          'Matched - failed',
-}
-INSTALLED_STATUSES = {'Installed', 'Reboot Required'}
+# STATUS_RANK, STATUS_LABEL, INSTALLED_STATUSES are imported from config.py
+# (single source of truth — see config.py's module docstring). Do not
+# redefine them here: a local copy silently shadows the import and will
+# drift out of sync with config.py and excel_builder.py the moment either
+# is edited without the other.
 
 def _detect_product(text):
     t = _norm_text(str(text))
@@ -294,92 +288,93 @@ def _make_excel_safe(df):
             out[col] = out[col].dt.tz_localize(None)
     return out
 
-def _resolve_fixed_version(row):
-    if 'Fixed Version' in row.index:
-        v = str(row.get('Fixed Version', '')).strip()
-        if v: return v, 'CVE workbook column'
-    product = row.get('_pk', '')
-    if not product: return '', ''
-    rules = FIXED_VERSION_RULES.get(product, {})
-    for cve in _extract_cves(str(row.get('Vulnerability Name', ''))):
-        if cve in rules: return rules[cve], f'config rule ({cve})'
-    return '', ''
+def _vec_fixed_version(pk_series, vname_series):
+    """
+    Per-row (product_key, vulnerability_name) -> (fixed_version, source).
 
-def _resolve_baseline(row) -> tuple[str, str]:
-    product = row.get('_pk', '')
-    if not product: return '', ''
-    rules = FIXED_VERSION_RULES.get(product, {})
-    baseline = rules.get('_baseline', '').strip()
-    if baseline: return baseline, 'rolling baseline'
-    return '', ''
-
-
-def _classify_baseline_compliance(row) -> str:
-    status = str(row.get('Status', '')).strip()
-    if status not in INSTALLED_STATUSES:
-        return 'Not installed'
-    bl = str(row.get('Product Baseline', '')).strip()
-    if not bl:
-        return 'No baseline defined'
-    pv = str(row.get('Matched Patch Version', '')).strip()
-    if not pv:
-        return 'Version unknown'
-    cmp = _version_gte(pv, bl)
-    if cmp is True:  return 'Compliant'
-    if cmp is False: return 'Below baseline'
-    return 'Version unknown'
+    Returns the CVE-specific fixed-version rule only (config.json
+    fixed_version_rules[pk][cve_id]) — never the product's rolling
+    '_baseline'. Baseline compliance is tracked separately by
+    _vec_baseline(); a row can be CVE-fixed and still below baseline, or
+    vice versa, and the two must not be conflated here.
+    """
+    fv_out, fs_out = [], []
+    for pk, vname in zip(pk_series, vname_series):
+        rules = FIXED_VERSION_RULES.get(pk, {})
+        fv, fs = '', ''
+        for cve in _extract_cves(str(vname)):
+            if cve in rules:
+                fv, fs = rules[cve], f'config rule ({cve})'
+                break
+        fv_out.append(fv); fs_out.append(fs)
+    return fv_out, fs_out
 
 
-def _classify_version_check(row):
-    status = str(row.get('Status', '')).strip()
-    pv     = str(row.get('Matched Patch Version', '')).strip()
-    fv     = str(row.get('Fixed Version Used', '')).strip()
-    if status not in INSTALLED_STATUSES:
-        return 'Patch not yet installed' if status else 'No patch evidence'
-    if not fv:
-        return 'Installed version found - no fixed baseline' if pv else 'Installed - version unknown'
-    if not pv: return 'Fixed baseline known - installed version not found'
-    cmp = _version_gte(pv, fv)
-    if cmp is True:  return 'Version compliant'
-    if cmp is False: return 'Below fixed version'
-    return 'Version comparison failed'
+def _vec_baseline(pk_series):
+    """Per-row product_key -> (rolling_baseline_version, source)."""
+    bl_out, bs_out = [], []
+    for pk in pk_series:
+        rules = FIXED_VERSION_RULES.get(pk, {})
+        bl = rules.get('_baseline', '').strip()
+        bl_out.append(bl); bs_out.append('rolling baseline' if bl else '')
+    return bl_out, bs_out
 
-def _classify_resolution(row):
-    status = str(row.get('Status', '')).strip()
-    if status not in INSTALLED_STATUSES:
-        return 'Unresolved'
 
-    vcr = str(row.get('Version Check Result', '')).strip().lower()
+def _vec_vcr(status_s, pv_s, fv_s, inst_mask):
+    """
+    Per-row Version Check Result: compares the matched installed version
+    against the CVE-specific fixed version (from _vec_fixed_version).
+    status_s must already be the PATCH report's install status (Installed /
+    Pending / Missing / etc.) — see process_patch_match's Status-collision
+    guard for why that is not guaranteed to be true of a raw 'Status'
+    column without renaming first.
+    """
+    out = []
+    for status, pv, fv, inst in zip(status_s, pv_s, fv_s, inst_mask):
+        if not inst:
+            out.append('Patch not yet installed' if status else 'No patch evidence')
+        elif not fv:
+            out.append('Installed version found - no fixed baseline' if pv else 'Installed - version unknown')
+        elif not pv:
+            out.append('Fixed baseline known - installed version not found')
+        else:
+            cmp = _version_gte(pv, fv)
+            out.append('Version compliant' if cmp is True else
+                       'Below fixed version' if cmp is False else
+                       'Version comparison failed')
+    return out
 
-    if 'below fixed version' in vcr:
-        return 'Unresolved'
 
-    if 'no fixed baseline' in vcr:
-        return 'Unresolved'
+def _vec_bc(status_s, pv_s, bl_s, inst_mask):
+    """Per-row Baseline Compliance: matched version vs. the product's rolling baseline."""
+    out = []
+    for status, pv, bl, inst in zip(status_s, pv_s, bl_s, inst_mask):
+        if not inst:  out.append('Not installed')
+        elif not bl:  out.append('No baseline defined')
+        elif not pv:  out.append('Version unknown')
+        else:
+            cmp = _version_gte(pv, bl)
+            out.append('Compliant' if cmp is True else
+                       'Below baseline' if cmp is False else
+                       'Version unknown')
+    return out
 
-    if 'version compliant' not in vcr:
-        return 'Unresolved'
 
-    try:
-        install_dt = pd.to_datetime(row.get('Patch Install Date'), errors='coerce')
-        if pd.isna(install_dt):
-            return 'Unresolved'
-
-        cve_dates = []
-        for col in ('First detected', 'Date Published'):
-            v = row.get(col)
-            if v is not None and not (isinstance(v, float) and pd.isna(v)):
-                dt = pd.to_datetime(v, errors='coerce')
-                if not pd.isna(dt):
-                    cve_dates.append(dt)
-
-        if not cve_dates:
-            return 'Unresolved'
-
-        return 'Patch confirmed - pending rescan' if install_dt >= max(cve_dates) else 'Unresolved'
-
-    except Exception:
-        return 'Unresolved'
+def _vec_pes(status_s, vcr_s, inst_dt_s, cve_max_s):
+    """
+    Per-row Patch Evidence Status. 'Patch confirmed - pending rescan' requires
+    ALL of: an installed status, a version-compliant result, and an install
+    date on/after the CVE's own detection/publication date — an install that
+    predates the CVE cannot be evidence that it fixed the CVE.
+    """
+    out = []
+    for status, vcr, inst_dt, cve_max in zip(status_s, vcr_s, inst_dt_s, cve_max_s):
+        if status not in INSTALLED_STATUSES: out.append('Unresolved'); continue
+        if vcr in ('Below fixed version', 'No fixed baseline defined', ''): out.append('Unresolved'); continue
+        if 'version compliant' not in vcr.lower(): out.append('Unresolved'); continue
+        if pd.isna(inst_dt) or pd.isna(cve_max): out.append('Unresolved'); continue
+        out.append('Patch confirmed - pending rescan' if inst_dt >= cve_max else 'Unresolved')
+    return out
 
 
 # ==============================================================================
@@ -847,6 +842,23 @@ def process_patch_match(patch_path, cve_df, min_score=9.0):
     if 'Customer' not in cve.columns: cve['Customer'] = ''
     if 'Site'     not in cve.columns: cve['Site']     = ''
 
+    # Guard against a Status column collision. Some N-able exports carry the
+    # CVE's own resolution state in a column literally named 'Status'
+    # (RESOLVED/UNRESOLVED) rather than 'Threat Status' — see
+    # _active_trend_scope's 'Threat Status' / 'Status' fallback for the same
+    # export variability. The patch report also has its own 'Status' column
+    # (Installed/Pending/etc.), so merging the two without renaming collides:
+    # suffixes=('', '_p') keeps the LEFT (cve) column unsuffixed, so
+    # best['Status'] downstream would silently read the CVE's own
+    # RESOLVED/UNRESOLVED value instead of the patch install status. This is
+    # the same failure mode as the v0.4 'Status Column Collision' bug,
+    # reintroduced from the other side after the vectorised rewrite. Move the
+    # CVE's copy out of the way before merging; it isn't needed here since
+    # nothing in this function reads the CVE's own resolution status, and the
+    # underscore-prefixed name is dropped automatically before return.
+    if 'Status' in cve.columns:
+        cve = cve.rename(columns={'Status': '_cve_status_orig'})
+
     total_rows = len(cve)
     if 'Vulnerability Score' in cve.columns:
         cve = cve[pd.to_numeric(cve['Vulnerability Score'], errors='coerce').fillna(0) >= min_score]
@@ -907,26 +919,6 @@ def process_patch_match(patch_path, cve_df, min_score=9.0):
     best.loc[~_has_patch & ~_in_devices, 'Patch Match Result'] = 'Not found in patch report'
 
     # ── Fixed version & baseline (vectorised) ────────────────────────────────
-    def _vec_fixed_version(pk_series, vname_series):
-        fv_out, fs_out = [], []
-        for pk, vname in zip(pk_series, vname_series):
-            rules = FIXED_VERSION_RULES.get(pk, {})
-            fv, fs = '', ''
-            for cve in _extract_cves(str(vname)):
-                if cve in rules:
-                    fv, fs = rules[cve], f'config rule ({cve})'
-                    break
-            fv_out.append(fv); fs_out.append(fs)
-        return fv_out, fs_out
-
-    def _vec_baseline(pk_series):
-        bl_out, bs_out = [], []
-        for pk in pk_series:
-            rules = FIXED_VERSION_RULES.get(pk, {})
-            bl = rules.get('_baseline', '').strip()
-            bl_out.append(bl); bs_out.append('rolling baseline' if bl else '')
-        return bl_out, bs_out
-
     _pk_s = best.get('_pk', pd.Series([''] * len(best), index=best.index))
     _fv_vals, _fs_vals = _vec_fixed_version(_pk_s, best['Vulnerability Name'])
     best['Fixed Version Used']      = _fv_vals
@@ -946,35 +938,6 @@ def process_patch_match(patch_path, cve_df, min_score=9.0):
     _bl_s      = best['Product Baseline'].astype(str).str.strip()
     _inst_mask = _status_s.isin(INSTALLED_STATUSES)
 
-    def _vec_vcr(status_s, pv_s, fv_s, inst_mask):
-        out = []
-        for status, pv, fv, inst in zip(status_s, pv_s, fv_s, inst_mask):
-            if not inst:
-                out.append('Patch not yet installed' if status else 'No patch evidence')
-            elif not fv:
-                out.append('Installed version found - no fixed baseline' if pv else 'Installed - version unknown')
-            elif not pv:
-                out.append('Fixed baseline known - installed version not found')
-            else:
-                cmp = _version_gte(pv, fv)
-                out.append('Version compliant' if cmp is True else
-                           'Below fixed version' if cmp is False else
-                           'Version comparison failed')
-        return out
-
-    def _vec_bc(status_s, pv_s, bl_s, inst_mask):
-        out = []
-        for status, pv, bl, inst in zip(status_s, pv_s, bl_s, inst_mask):
-            if not inst:  out.append('Not installed')
-            elif not bl:  out.append('No baseline defined')
-            elif not pv:  out.append('Version unknown')
-            else:
-                cmp = _version_gte(pv, bl)
-                out.append('Compliant' if cmp is True else
-                           'Below baseline' if cmp is False else
-                           'Version unknown')
-        return out
-
     best['Version Check Result'] = _vec_vcr(_status_s, _pv_s, _fv_s, _inst_mask)
     best['Baseline Compliance']  = _vec_bc(_status_s, _pv_s, _bl_s, _inst_mask)
 
@@ -990,16 +953,6 @@ def process_patch_match(patch_path, cve_df, min_score=9.0):
         ).dt.tz_localize(None) if col.name in best.columns else pd.NaT,
         axis=0,
     ).max(axis=1)
-
-    def _vec_pes(status_s, vcr_s, inst_dt_s, cve_max_s):
-        out = []
-        for status, vcr, inst_dt, cve_max in zip(status_s, vcr_s, inst_dt_s, cve_max_s):
-            if status not in INSTALLED_STATUSES: out.append('Unresolved'); continue
-            if vcr in ('Below fixed version', 'No fixed baseline defined', ''): out.append('Unresolved'); continue
-            if 'version compliant' not in vcr.lower(): out.append('Unresolved'); continue
-            if pd.isna(inst_dt) or pd.isna(cve_max): out.append('Unresolved'); continue
-            out.append('Patch confirmed - pending rescan' if inst_dt >= cve_max else 'Unresolved')
-        return out
 
     best['Patch Evidence Status'] = _vec_pes(_status_s, _vcr_s, _inst_dt, _cve_dates_max)
 
