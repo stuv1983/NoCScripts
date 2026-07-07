@@ -312,6 +312,17 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     exploit_patched = int((exploit_mask & _is_res).sum())
     exploit_unpatch = int((exploit_mask & _is_unr).sum())
 
+    # CISA KEV — Known Exploited Vulnerabilities catalog. Distinct from the
+    # generic 'Has Known Exploit' column above: KEV is CISA's authoritative
+    # "actively exploited in the wild" list, so it gets its own Key Metrics
+    # rows and its own product/device tracking tables (see below).
+    kev_col        = 'CISA KEV' if 'CISA KEV' in triage_dedup.columns else None
+    kev_mask       = triage_dedup[kev_col].astype(str).str.strip().str.lower().isin(['yes','true','1','y']) if kev_col else pd.Series([False]*len(triage_dedup), index=triage_dedup.index)
+    kev_rows       = int(kev_mask.sum())
+    kev_cves       = int(triage_dedup.loc[kev_mask, 'Vulnerability Name'].nunique()) if kev_col and 'Vulnerability Name' in triage_dedup.columns else 0
+    kev_patched    = int((kev_mask & _is_res).sum())
+    kev_unpatch    = int((kev_mask & _is_unr).sum())
+
     # Server/workstation exploit breakdowns — detection row counts, active scope only
     if 'Device Type' in triage_dedup.columns:
         _srv_mask = triage_dedup['Device Type'].astype(str).str.lower().str.contains('server',      na=False)
@@ -359,6 +370,21 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         _nirm_sc       = pd.to_numeric(filtered_df.loc[_nirm_mask, score_col], errors='coerce')
         _nirm_crit     = int((_nirm_sc >= 9.0).sum())
         _nirm_crit_cves = int(filtered_df.loc[_nirm_mask & (pd.to_numeric(filtered_df[score_col], errors='coerce') >= 9.0), 'Vulnerability Name'].nunique()) if 'Vulnerability Name' in filtered_df.columns else 0
+
+    # Stale + NIRM CISA KEV counts, mirroring the CVSS 9+ pattern above so
+    # KEV gets the same All / Active / Excluded reconciliation.
+    _stale_kev = 0
+    _stale_kev_cves = 0
+    if stale_excluded_df is not None and not stale_excluded_df.empty and kev_col and kev_col in stale_excluded_df.columns:
+        _stale_kev_mask  = stale_excluded_df[kev_col].astype(str).str.strip().str.lower().isin(['yes','true','1','y'])
+        _stale_kev       = int(_stale_kev_mask.sum())
+        _stale_kev_cves  = int(stale_excluded_df.loc[_stale_kev_mask, 'Vulnerability Name'].nunique()) if 'Vulnerability Name' in stale_excluded_df.columns else 0
+    _nirm_kev  = 0
+    _nirm_kev_cves = 0
+    if 'Last Response' in filtered_df.columns and kev_col and kev_col in filtered_df.columns:
+        _nirm_kev_mask   = filtered_df[kev_col].astype(str).str.strip().str.lower().isin(['yes','true','1','y'])
+        _nirm_kev        = int((_nirm_mask & _nirm_kev_mask).sum())
+        _nirm_kev_cves   = int(filtered_df.loc[_nirm_mask & _nirm_kev_mask, 'Vulnerability Name'].nunique()) if 'Vulnerability Name' in filtered_df.columns else 0
     _excl_devs       = _stale_devs + _nirm_devs
     _excl_crit       = _stale_crit + _nirm_crit
     _excl_crit_cves  = _stale_crit_cves + _nirm_crit_cves   # note: may overlap; shown as informational
@@ -418,6 +444,22 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     _all_crit      = crit_rows + _stale_full_crit
     _all_crit_cves = crit_cves + _stale_full_crit_cves
 
+    # Same full-stale-frame pattern for CISA KEV, so a stale device running a
+    # KEV-flagged product absent from active triage isn't silently dropped
+    # from the "All" KEV totals.
+    _stale_full_kev_mask = (
+        _stale_full_dedup[kev_col].astype(str).str.strip().str.lower().isin(['yes','true','1','y'])
+        if kev_col and not _stale_full_dedup.empty and kev_col in _stale_full_dedup.columns
+        else pd.Series(dtype=bool)
+    )
+    _stale_full_kev      = int(_stale_full_kev_mask.sum())
+    _stale_full_kev_cves = (
+        int(_stale_full_dedup.loc[_stale_full_kev_mask, 'Vulnerability Name'].nunique())
+        if kev_col and 'Vulnerability Name' in _stale_full_dedup.columns and not _stale_full_dedup.empty else 0
+    )
+    _all_kev      = kev_rows + _stale_full_kev
+    _all_kev_cves = kev_cves + _stale_full_kev_cves
+
     # stale crit rows from _stale_dedup directly (consistent with _all_rows)
     if not _stale_dedup.empty and score_col and score_col in _stale_dedup.columns:
         _stale_crit_dedup = int((pd.to_numeric(_stale_dedup[score_col], errors='coerce') >= 9.0).sum())
@@ -432,6 +474,8 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     _excl_devs_tot      = _stale_devs + _nirm_devs
     _excl_crit_tot      = _stale_full_crit + _nirm_crit        # full stale, not _p2s_keys-filtered
     _excl_crit_cves_tot = _stale_full_crit_cves + _nirm_crit_cves
+    _excl_kev_tot       = _stale_full_kev + _nirm_kev          # full stale, not _p2s_keys-filtered
+    _excl_kev_cves_tot  = _stale_full_kev_cves + _nirm_kev_cves
 
     # ── Patching Health Score (beta) ──────────────────────────────────────────
     # Only rendered when include_health_score=True (opt-in checkbox in the GUI).
@@ -934,6 +978,8 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         'Unique devices':             'Distinct devices with at least one qualifying detection.',
         'Detections at CVSS 9.0+':    'Detection rows scoring 9.0 or higher.',
         'Unique CVEs at CVSS 9.0+':   'Distinct CVE IDs scoring 9.0 or higher.',
+        'Detections with CISA KEV':   'Detection rows flagged in the CISA Known Exploited Vulnerabilities (KEV) catalog.',
+        'Unique CVEs with CISA KEV':  'Distinct CVE IDs flagged in the CISA KEV catalog.',
     }
 
     for metric, all_val, active_val, excl_val, active_fmt in [
@@ -942,6 +988,8 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         ('Unique devices',              _all_devs,          unique_devices, _excl_devs_tot,         val_fmt),
         ('Detections at CVSS 9.0+',    _all_crit,          crit_rows,      _excl_crit_tot,         red_fmt if crit_rows else val_fmt),
         ('Unique CVEs at CVSS 9.0+',   _all_crit_cves,     crit_cves,      0,                      red_fmt if crit_cves else val_fmt),   # overlap
+        ('Detections with CISA KEV',   _all_kev,           kev_rows,       _excl_kev_tot,          red_fmt if kev_rows else val_fmt),
+        ('Unique CVEs with CISA KEV',  _all_kev_cves,      kev_cves,       0,                      red_fmt if kev_cves else val_fmt),   # overlap
     ]:
         ws.write(row, 0, metric,      lbl_fmt)
         ws.write(row, 1, all_val,     _all_val)
@@ -961,6 +1009,173 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
                    note_fmt)
     ws.set_row(row, 54)
     row += 2
+
+    # ── Products with Known Exploited Vulnerabilities (CISA KEV) ────────────────
+    # Two tables split by device type: workstations are summarised by product
+    # (compact — fleets can have hundreds), servers are listed with the actual
+    # device names since server-level detail matters more for a smaller,
+    # higher-value population. Both link the product name to its triage sheet,
+    # matching the Top 10 Products table below.
+    _kev_link_fmt = workbook.add_format({'font_color': '#0563C1', 'underline': True,
+                                         'border': 1, 'bg_color': '#FFFFFF'})
+    _kev_td       = workbook.add_format({'border': 1})
+    _kev_td_r     = workbook.add_format({'border': 1, 'align': 'right', 'num_format': '#,##0'})
+    _p2s_kev = product_to_sheet or {}
+
+    ws.merge_range(row, 0, row, 3,
+                   '  Products with Known Exploited Vulnerabilities  (CISA KEV, unresolved only)',
+                   sect_fmt)
+    row += 1
+
+    if kev_col and 'Base Product' in triage_dedup.columns:
+        _kev_unr_df = triage_dedup[kev_mask & _is_unr].copy()
+        _has_dt_kev = 'Device Type' in _kev_unr_df.columns
+        _kev_srv_mask = (_kev_unr_df['Device Type'].astype(str).str.lower().str.contains('server', na=False)
+                          if _has_dt_kev else pd.Series([False] * len(_kev_unr_df), index=_kev_unr_df.index))
+
+        # -- Workstations: summarised by product --
+        ws.write(row, 0, 'Workstation Products', hdr_fmt)
+        ws.merge_range(row, 1, row, 3, '', hdr_fmt)
+        row += 1
+        ws.write(row, 0, 'Product',              hdr_fmt)
+        ws.write(row, 1, 'Devices affected',      hdr_fmt)
+        ws.write(row, 2, 'Unresolved KEV CVEs',   hdr_fmt)
+        row += 1
+        _wks_kev_df = _kev_unr_df[~_kev_srv_mask]
+        if not _wks_kev_df.empty:
+            _wks_grp = (_wks_kev_df.groupby('Base Product')
+                        .agg(devices=('Name', 'nunique'),
+                             cves=('Vulnerability Name', 'nunique'))
+                        .sort_values('devices', ascending=False))
+            for prod, pr in _wks_grp.iterrows():
+                sheet = _p2s_kev.get(prod)
+                if sheet:
+                    ws.write_url(row, 0, f"internal:'{sheet}'!A1", _kev_link_fmt, string=str(prod))
+                else:
+                    ws.write(row, 0, str(prod), _kev_td)
+                ws.write(row, 1, int(pr['devices']), _kev_td_r)
+                ws.write(row, 2, int(pr['cves']),    _kev_td_r)
+                row += 1
+        else:
+            ws.merge_range(row, 0, row, 2, 'No unresolved KEV CVEs on workstations.', note_fmt)
+            row += 1
+        row += 1
+
+        # -- Servers: listed with device names --
+        ws.write(row, 0, 'Server Products', hdr_fmt)
+        ws.merge_range(row, 1, row, 3, '', hdr_fmt)
+        row += 1
+        ws.write(row, 0, 'Product',              hdr_fmt)
+        ws.write(row, 1, 'Device(s)',             hdr_fmt)
+        ws.write(row, 2, 'Unresolved KEV CVEs',   hdr_fmt)
+        row += 1
+        _srv_kev_df = _kev_unr_df[_kev_srv_mask]
+        if not _srv_kev_df.empty:
+            _srv_grp = (_srv_kev_df.groupby('Base Product')
+                        .agg(devices=('Name', lambda s: ', '.join(sorted(s.astype(str).unique()))),
+                             device_count=('Name', 'nunique'),
+                             cves=('Vulnerability Name', 'nunique'))
+                        .sort_values('device_count', ascending=False))
+            for prod, pr in _srv_grp.iterrows():
+                sheet = _p2s_kev.get(prod)
+                if sheet:
+                    ws.write_url(row, 0, f"internal:'{sheet}'!A1", _kev_link_fmt, string=str(prod))
+                else:
+                    ws.write(row, 0, str(prod), _kev_td)
+                ws.write(row, 1, str(pr['devices']), _kev_td)
+                ws.write(row, 2, int(pr['cves']),    _kev_td_r)
+                row += 1
+        else:
+            ws.merge_range(row, 0, row, 2, 'No unresolved KEV CVEs on servers.', note_fmt)
+            row += 1
+    else:
+        _kev_unr_df = pd.DataFrame()
+        ws.merge_range(row, 0, row, 3, 'CISA KEV column not available in source data.', note_fmt)
+        row += 1
+
+    ws.merge_range(row, 0, row, 3,
+                   '\u2139  Product names are hyperlinked to their triage sheet. '
+                   'Counts are unresolved (\u2610) only, active devices, fixed at report generation.',
+                   note_fmt)
+    ws.set_row(row, 28)
+    row += 2
+
+    # ── All Devices with Unpatched Known Exploited Vulnerabilities ───────────────
+    # Unlike Top At-Risk Devices below (capped to 10, mixed priority), this is
+    # the complete list — every active device with at least one unresolved CVE
+    # that is on the CISA KEV catalog, regardless of count.
+    #
+    # Last Response / Days Since Last Response are included specifically so a
+    # device that still shows "unresolved" here can be checked against how
+    # recently it actually checked in — a device that's gone quiet may simply
+    # not have reported a fresh scan showing the CVE patched, rather than
+    # genuinely still being vulnerable. Devices within stale_warning_days of
+    # going stale get the same ⚠ / orange treatment as Top At-Risk Devices.
+    _kev_has_lr   = 'Last Response' in triage_dedup.columns
+    _kev_has_days = 'Days Since Last Response' in triage_dedup.columns
+    _kev_approach = approaching_stale_names or set()
+    _kev_td_approach   = workbook.add_format({'border': 1, 'bg_color': '#FFF3E0', 'font_color': '#7B3F00'})
+    _kev_td_approach_r = workbook.add_format({'border': 1, 'bg_color': '#FFF3E0', 'font_color': '#7B3F00',
+                                               'align': 'right', 'num_format': '#,##0'})
+
+    ws.merge_range(row, 0, row, 5,
+                   '  Devices with Unpatched Known Exploited Vulnerabilities  (CISA KEV)',
+                   sect_fmt)
+    row += 1
+    ws.write(row, 0, 'Device',                       hdr_fmt)
+    ws.write(row, 1, 'Device Type',                  hdr_fmt)
+    ws.write(row, 2, 'Product(s)',                   hdr_fmt)
+    ws.write(row, 3, 'Unresolved KEV CVEs',           hdr_fmt)
+    ws.write(row, 4, 'Last Response',                hdr_fmt)
+    ws.write(row, 5, 'Days Since Last Response',     hdr_fmt)
+    row += 1
+    if kev_col and not _kev_unr_df.empty and 'Name' in _kev_unr_df.columns:
+        _dt_agg = ('Device Type', 'first') if 'Device Type' in _kev_unr_df.columns else ('Name', lambda s: 'Unknown')
+        _dev_grp = (_kev_unr_df.groupby('Name')
+                    .agg(device_type=_dt_agg,
+                         products=('Base Product', lambda s: ', '.join(sorted(s.astype(str).unique())))
+                                  if 'Base Product' in _kev_unr_df.columns else ('Name', lambda s: ''),
+                         cves=('Vulnerability Name', 'nunique'),
+                         last_response=('Last Response', 'first') if _kev_has_lr else ('Name', lambda s: ''),
+                         days_since=('Days Since Last Response', lambda s:
+                             pd.to_numeric(s, errors='coerce').max())
+                             if _kev_has_days else ('Name', lambda s: ''))
+                    .sort_values('cves', ascending=False))
+        for dev, dr in _dev_grp.iterrows():
+            _near_stale = dev in _kev_approach
+            _bf, _nf = (_kev_td_approach, _kev_td_approach_r) if _near_stale else (_kev_td, _kev_td_r)
+            _name_label = f'⚠ {dev}' if _near_stale else str(dev)
+            _days_val = (
+                int(dr['days_since']) if _kev_has_days
+                and not (isinstance(dr['days_since'], float) and pd.isna(dr['days_since']))
+                else ''
+            )
+            ws.write(row, 0, _name_label,                          _bf)
+            ws.write(row, 1, str(dr['device_type']),               _bf)
+            ws.write(row, 2, str(dr['products']),                  _bf)
+            ws.write(row, 3, int(dr['cves']),                      _nf)
+            ws.write(row, 4, str(dr['last_response']) if _kev_has_lr else '', _bf)
+            ws.write(row, 5, _days_val,                            _nf)
+            row += 1
+    else:
+        ws.merge_range(row, 0, row, 5, 'No devices with unpatched KEV CVEs.', note_fmt)
+        row += 1
+    _kev_approach_note = (
+        f'  \U0001f7e7 Orange = offline \u2265 {stale_warning_days}d (\u26a0 prefix on name) \u2014 '
+        'check Last Response before assuming the CVE is still genuinely unpatched.  '
+        if _kev_approach else ''
+    )
+    ws.merge_range(row, 0, row, 5,
+                   '\u2139  Full list \u2014 not capped, unlike Top At-Risk Devices further below. '
+                   'Includes every active device with at least one unresolved CISA KEV CVE, '
+                   f'fixed at report generation.  {_kev_approach_note}'
+                   'A device that has not checked in recently may still show as unresolved simply '
+                   'because no newer scan has confirmed the patch \u2014 use Last Response / Days Since '
+                   'Last Response to tell that apart from a genuinely still-vulnerable device.',
+                   note_fmt)
+    ws.set_row(row, 28)
+    row += 2
+
     # Build COUNTIF formula strings — these make both tables live when ☐/☑ are toggled
     _p2s = product_to_sheet or {}
     if _p2s:
@@ -1269,7 +1484,7 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         ws.merge_range(row, 0, row, 6, 'No active device data.', note_fmt); row += 1
 
     ws.set_column('A:A', 32); ws.set_column('B:B', 22)
-    ws.set_column('C:C', 18); ws.set_column('D:D', 14); ws.set_column('E:E', 16)
+    ws.set_column('C:C', 18); ws.set_column('D:D', 14); ws.set_column('E:E', 22)
     ws.set_column('F:F', 24); ws.set_column('G:G', 20)
 
     # CVSS Score Split -- TODO: re-enable when layout is agreed

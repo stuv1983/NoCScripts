@@ -40,6 +40,7 @@ import os
 import re
 import time
 import requests
+from datetime import datetime, timezone
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from pathlib import Path
@@ -51,6 +52,23 @@ _UA      = 'Mozilla/5.0 N-able-CVE-Dashboard/1.0 (automated; contact s.villanti@
 _TIMEOUT    = 8    # connect + read timeout per request attempt
 _RETRY      = 2    # reduced: 2 retries × 3 sources × 98 CVEs = still slow if all fail
 _DELAY   = 0.5   # seconds between API calls — be a polite client
+
+# CISA's official Known Exploited Vulnerabilities catalog — a curated JSON feed
+# of CVEs confirmed to be actively exploited in the wild. This is authoritative
+# and distinct from any per-vendor "Has Exploit" flag a scanner export may ship
+# (which often means "an exploit exists somewhere", not "CISA has confirmed
+# active exploitation"). Many source exports have no KEV column at all, so
+# enrich_cisa_kev() below is the only source of real KEV data for them.
+#
+# cisa.gov (Akamai-fronted) is well known to return 403 Forbidden for many
+# server/CI/cloud IP ranges even with a normal browser User-Agent — this is
+# not specific to this app (see e.g. dependency-check issues #5711, #7929).
+# CISA also publishes an official synchronized mirror on GitHub
+# (github.com/cisagov/kev-data), which is generally far more reachable from
+# server environments — used here as an automatic fallback, not a workaround
+# of any access restriction.
+_CISA_KEV_URL        = 'https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json'
+_CISA_KEV_MIRROR_URL = 'https://raw.githubusercontent.com/cisagov/kev-data/develop/known_exploited_vulnerabilities.json'
 
 
 def _make_session() -> requests.Session:
@@ -1206,6 +1224,148 @@ def enrich_config(cve_ids: Optional[list[str]] = None,
         log.info("cve_lookup: dry run — no changes written")
 
     return results
+
+
+# ==============================================================================
+# CISA KEV (KNOWN EXPLOITED VULNERABILITIES) CATALOG
+# ==============================================================================
+
+def fetch_cisa_kev_catalog(config_path: Optional[str] = None,
+                            ttl_hours: float = 24.0,
+                            force: bool = False) -> set[str]:
+    """
+    Fetch (and cache) the set of CVE IDs on CISA's Known Exploited
+    Vulnerabilities catalog — https://www.cisa.gov/known-exploited-vulnerabilities-catalog
+
+    This is the authoritative "actively exploited in the wild" list. It is
+    NOT the same thing as a scanner's generic "Has Exploit" column, which
+    typically just means an exploit exists somewhere (e.g. Metasploit),
+    not that CISA has confirmed active exploitation.
+
+    Cached in config.json under 'cisa_kev_cache' (fetched_at, cve_ids,
+    catalog_version) so a report run doesn't need network access every time,
+    and so builds still work offline. On fetch failure, falls back to the
+    cached list (even if stale) rather than silently returning an empty
+    set — an empty set would make every downstream KEV table look
+    incorrectly clean.
+
+    Returns a set of upper-cased CVE ID strings (e.g. {'CVE-2024-21413', ...}).
+    """
+    if config_path is None:
+        config_path = Path(__file__).parent / 'config.json'
+    config_path = Path(config_path)
+    cfg = _load_config(config_path)
+    cache = cfg.get('cisa_kev_cache', {}) or {}
+    cached_ids = set(cache.get('cve_ids', []) or [])
+    fetched_at = cache.get('fetched_at')
+
+    if not force and fetched_at:
+        try:
+            fetched_dt = datetime.fromisoformat(fetched_at)
+            if fetched_dt.tzinfo is None:
+                fetched_dt = fetched_dt.replace(tzinfo=timezone.utc)
+            age_hours = (datetime.now(timezone.utc) - fetched_dt).total_seconds() / 3600
+            if age_hours < ttl_hours and cached_ids:
+                log.debug("cve_lookup: using cached CISA KEV catalog (%d CVEs, %.1fh old)",
+                          len(cached_ids), age_hours)
+                return cached_ids
+        except (ValueError, TypeError):
+            pass
+
+    try:
+        session = _get_session()
+        data = None
+        _last_exc = None
+        for _url in (_CISA_KEV_URL, _CISA_KEV_MIRROR_URL):
+            try:
+                resp = session.get(_url, timeout=_TIMEOUT * 2)
+                resp.raise_for_status()
+                data = resp.json()
+                if _url == _CISA_KEV_MIRROR_URL:
+                    log.info("cve_lookup: fetched CISA KEV catalog from the GitHub mirror "
+                             "(cisa.gov was unreachable)")
+                break
+            except Exception as exc:
+                _last_exc = exc
+                continue
+        if data is None:
+            raise _last_exc or RuntimeError("both CISA KEV sources failed")
+        vulns = data.get('vulnerabilities', []) if isinstance(data, dict) else []
+        cve_ids = {str(v.get('cveID', '')).strip().upper() for v in vulns if v.get('cveID')}
+    except Exception as exc:
+        log.warning(
+            "cve_lookup: CISA KEV catalog fetch failed from both cisa.gov and the GitHub "
+            "mirror (%s); %s", exc,
+            f"using cached list ({len(cached_ids)} CVEs)" if cached_ids
+            else "no cache available — CISA KEV flags will be empty this run"
+        )
+        return cached_ids
+
+    if not cve_ids:
+        log.warning("cve_lookup: CISA KEV catalog fetch returned no CVEs; using cached list "
+                     "(%d CVEs)", len(cached_ids))
+        return cached_ids
+
+    try:
+        try:
+            with open(config_path, 'r', encoding='utf-8') as fh:
+                cfg_fresh = json.load(fh)
+        except Exception:
+            cfg_fresh = {}
+        cfg_fresh['cisa_kev_cache'] = {
+            'fetched_at':       datetime.now(timezone.utc).isoformat(),
+            'cve_ids':          sorted(cve_ids),
+            'catalog_version':  data.get('catalogVersion', '') if isinstance(data, dict) else '',
+        }
+        with open(config_path, 'w', encoding='utf-8') as fh:
+            json.dump(cfg_fresh, fh, indent=2)
+    except Exception as exc:
+        log.debug("cve_lookup: could not write CISA KEV cache: %s", exc)
+
+    log.info("cve_lookup: CISA KEV catalog refreshed — %d CVEs (catalog version %s)",
+              len(cve_ids), data.get('catalogVersion', 'unknown') if isinstance(data, dict) else 'unknown')
+    return cve_ids
+
+
+def enrich_cisa_kev(df: 'pd.DataFrame', config_path: Optional[str] = None,
+                     cve_col: str = 'Vulnerability Name',
+                     force_refresh: bool = False) -> int:
+    """
+    Populate/overwrite df['CISA KEV'] with 'Yes'/'No' by matching each row's
+    CVE ID against the real CISA KEV catalog (see fetch_cisa_kev_catalog).
+
+    Most scanner exports never include a genuine KEV column — Kenstra's own
+    default fills 'CISA KEV' with a blanket 'No' when the source is missing
+    it (see data_pipeline.load_vulnerability_data), which silently makes
+    every KEV-based table and health-score penalty a no-op. This function is
+    the actual source of truth: it flags a row 'Yes' if EITHER the catalog
+    says so OR the source file already had 'Yes' in a genuine CISA KEV
+    column of its own (so a more detailed vendor export is never downgraded).
+
+    Returns the number of rows flagged 'Yes'.
+    """
+    import pandas as pd
+    from data_pipeline import extract_cve_id
+
+    kev_ids = fetch_cisa_kev_catalog(config_path=config_path, force=force_refresh)
+
+    _cve_ids = df[cve_col].astype(str).apply(extract_cve_id).str.upper()
+    _from_catalog = _cve_ids.isin(kev_ids)
+
+    if 'CISA KEV' in df.columns:
+        _existing_yes = df['CISA KEV'].astype(str).str.strip().str.lower().isin(
+            ['yes', 'true', '1', 'y'])
+    else:
+        _existing_yes = pd.Series(False, index=df.index)
+
+    _flag = _from_catalog | _existing_yes
+    df['CISA KEV'] = _flag.map({True: 'Yes', False: 'No'})
+
+    if not kev_ids:
+        log.warning("cve_lookup: CISA KEV catalog unavailable — 'CISA KEV' column reflects "
+                     "only the source file's own data (if any), not the real catalog")
+
+    return int(_flag.sum())
 
 
 # ==============================================================================

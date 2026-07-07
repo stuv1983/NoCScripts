@@ -239,6 +239,22 @@ def run(request: DashboardRequest) -> DashboardResult:
         except Exception as _e:
             log.debug("CVE lookup auto-enrich skipped: %s", _e)
 
+        # ── CISA KEV enrichment ──────────────────────────────────────────────
+        # Independent of the version-data enrichment above (and allowed to
+        # fail independently): most detection exports have no genuine CISA
+        # KEV column at all, so without this every KEV-based Summary table
+        # and health-score penalty silently sees zero KEV CVEs even when the
+        # fleet has real, actively-exploited CVEs on it. See cve_lookup.py's
+        # enrich_cisa_kev() docstring for why this OR's the real catalog with
+        # any KEV data the source file already provided, rather than
+        # replacing it.
+        try:
+            from cve_lookup import enrich_cisa_kev
+            _kev_flagged = enrich_cisa_kev(df_vuln)
+            log.info("CISA KEV enrichment: %d row(s) flagged against the KEV catalog", _kev_flagged)
+        except Exception as _e:
+            log.warning("CISA KEV enrichment skipped: %s", _e)
+
         df_rmm = None
         if not request.skip_rmm and request.rmm_path:
             log.info("Loading RMM data: %s", request.rmm_path)
