@@ -1072,19 +1072,19 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
             row += 1
         row += 1
 
-        # -- Servers: EVERY active server device, regardless of KEV status --
-        # Unlike Workstation Products above (summarised by product, KEV-only),
-        # servers get their own row each — servers are typically few and
-        # high-value, so visibility matters even for a server with zero KEV
-        # CVEs right now. Rows with an unresolved KEV CVE are still called out
-        # with a highlight so they don't get lost in the full list.
+        # -- Servers: every UNRESOLVED CVE on a server, regardless of KEV ----
+        # Title says "regardless of KEV" — this now actually tracks any
+        # unresolved CVE on a server (not just ones on the CISA KEV catalog).
+        # Each unresolved CVE gets its own row, named and linked to the
+        # product sheet it came from, with 💣 Has Exploit marking the ones
+        # that ARE on the CISA KEV catalog specifically.
         ws.write(row, 0, 'All Servers  (tracked regardless of KEV)', hdr_fmt)
         ws.merge_range(row, 1, row, 5, '', hdr_fmt)
         row += 1
         ws.write(row, 0, 'Device',                    hdr_fmt)
         ws.write(row, 1, 'Device Type',                hdr_fmt)
-        ws.write(row, 2, 'Product(s)',                 hdr_fmt)
-        ws.write(row, 3, 'Unresolved KEV CVEs',        hdr_fmt)
+        ws.write(row, 2, 'Unresolved CVE',              hdr_fmt)
+        ws.write(row, 3, '\U0001f4a3 Has Exploit',      hdr_fmt)
         ws.write(row, 4, 'Last Response',              hdr_fmt)
         ws.write(row, 5, 'Days Since Last Response',   hdr_fmt)
         row += 1
@@ -1092,58 +1092,42 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         _has_dt_all = 'Device Type' in triage_dedup.columns
         _all_srv_mask = (triage_dedup['Device Type'].astype(str).str.lower().str.contains('server', na=False)
                           if _has_dt_all else pd.Series([False] * len(triage_dedup), index=triage_dedup.index))
-        _srv_all_df = triage_dedup[_all_srv_mask]
+        _srv_unr_df = triage_dedup[_all_srv_mask & _is_unr]
 
-        if not _srv_all_df.empty and 'Name' in _srv_all_df.columns:
-            _kev_cve_by_device = (
-                _kev_unr_df.groupby('Name')['Vulnerability Name'].nunique().to_dict()
-                if not _kev_unr_df.empty and 'Name' in _kev_unr_df.columns else {}
-            )
-            _has_lr_all   = 'Last Response' in _srv_all_df.columns
-            _has_days_all = 'Days Since Last Response' in _srv_all_df.columns
-            _srv_all_grp = (_srv_all_df.groupby('Name')
-                            .agg(device_type=('Device Type', 'first') if _has_dt_all else ('Name', lambda s: 'Unknown'),
-                                 products=('Base Product', lambda s: sorted(s.astype(str).unique()))
-                                          if 'Base Product' in _srv_all_df.columns else ('Name', lambda s: []),
-                                 last_response=('Last Response', 'first') if _has_lr_all else ('Name', lambda s: ''),
-                                 days_since=('Days Since Last Response', lambda s: pd.to_numeric(s, errors='coerce').max())
-                                            if _has_days_all else ('Name', lambda s: ''))
-                            .sort_values('device_type'))
+        if not _srv_unr_df.empty and 'Name' in _srv_unr_df.columns and 'Vulnerability Name' in _srv_unr_df.columns:
+            _has_lr_all   = 'Last Response' in _srv_unr_df.columns
+            _has_days_all = 'Days Since Last Response' in _srv_unr_df.columns
+            _srv_kev_row_mask = kev_mask.reindex(_srv_unr_df.index).fillna(False)
 
-            # If literally no server has an unresolved KEV CVE, a full table of
-            # every server showing zero is just noise — a clean "all patched"
-            # message is more useful. The full per-server table (still
-            # regardless of KEV) only appears once at least one server has
-            # something outstanding.
-            _any_srv_kev = any(
-                int(_kev_cve_by_device.get(dev, 0)) > 0 for dev in _srv_all_grp.index
-            )
-            if not _any_srv_kev:
-                ws.merge_range(row, 0, row, 5, 'All Servers Patched', note_fmt)
+            _srv_cve_rows = (_srv_unr_df.assign(_is_kev=_srv_kev_row_mask)
+                             .drop_duplicates(subset=['Name', 'Vulnerability Name',
+                                                       'Base Product' if 'Base Product' in _srv_unr_df.columns else 'Name']))
+            _srv_cve_rows = _srv_cve_rows.sort_values(
+                by=['_is_kev', 'Name', 'Vulnerability Name'], ascending=[False, True, True])
+
+            for _, _r in _srv_cve_rows.iterrows():
+                _is_kev  = bool(_r['_is_kev'])
+                _bf, _nf = (_kev_td_red, _kev_td_red_r) if _is_kev else (_kev_td, _kev_td_r)
+                _cve     = _r.get('Vulnerability Name', '')
+                _prod    = _r.get('Base Product', '') if 'Base Product' in _srv_unr_df.columns else ''
+                _sheet   = _p2s_kev.get(_prod) if _prod else None
+                _label   = f'{_cve} ({_prod})' if _prod else str(_cve)
+
+                ws.write(row, 0, str(_r.get('Name', '')), _bf)
+                ws.write(row, 1, str(_r.get('Device Type', '')) if _has_dt_all else '', _bf)
+                if _sheet:
+                    ws.write_url(row, 2, f"internal:'{_sheet}'!A1", _kev_link_fmt, string=_label)
+                else:
+                    ws.write(row, 2, _label, _bf)
+                ws.write(row, 3, 'Yes' if _is_kev else 'No', _bf)
+                ws.write(row, 4, str(_r.get('Last Response', '')) if _has_lr_all else '', _bf)
+                _days_v = _r.get('Days Since Last Response') if _has_days_all else None
+                ws.write(row, 5, int(_days_v) if _has_days_all and pd.notna(_days_v) else '', _nf)
                 row += 1
-            else:
-                for dev, dr in _srv_all_grp.iterrows():
-                    _kev_ct   = int(_kev_cve_by_device.get(dev, 0))
-                    _has_kev  = _kev_ct > 0
-                    _bf, _nf  = (_kev_td_red, _kev_td_red_r) if _has_kev else (_kev_td, _kev_td_r)
-                    _products = dr['products'] if isinstance(dr['products'], list) else []
-                    _prod_txt = ', '.join(_products) if _products else '\u2014'
-                    _primary  = _products[0] if _products else None
-                    _sheet    = _p2s_kev.get(_primary) if _primary else None
-
-                    ws.write(row, 0, str(dev), _bf)
-                    ws.write(row, 1, str(dr['device_type']), _bf)
-                    if _sheet:
-                        ws.write_url(row, 2, f"internal:'{_sheet}'!A1", _kev_link_fmt, string=_prod_txt)
-                    else:
-                        ws.write(row, 2, _prod_txt, _bf)
-                    ws.write(row, 3, _kev_ct, _nf)
-                    ws.write(row, 4, str(dr['last_response']) if _has_lr_all else '', _bf)
-                    _days_v = dr['days_since']
-                    ws.write(row, 5, int(_days_v) if _has_days_all and pd.notna(_days_v) else '', _nf)
-                    row += 1
         else:
-            ws.merge_range(row, 0, row, 5, 'No active server devices found.', note_fmt)
+            ws.merge_range(row, 0, row, 5,
+                           'All Servers Patched \u2014 no unresolved CVEs of any kind on active servers',
+                           note_fmt)
             row += 1
     else:
         _kev_unr_df = pd.DataFrame()
@@ -1151,10 +1135,10 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         row += 1
 
     ws.merge_range(row, 0, row, 5,
-                   '\u2139  Product name(s) are hyperlinked to their triage sheet (multi-product cells link to '
-                   'the first product listed). Unresolved KEV CVE counts are unresolved (\u2610) only, active '
-                   'devices, fixed at report generation. \U0001f7e5 Highlighted server rows have \u2265 1 '
-                   'unresolved KEV CVE; all other server rows are shown for visibility regardless of KEV status.',
+                   '\u2139  Workstation product links go to the triage sheet for that product. '
+                   'Server rows list every unresolved CVE individually, named and linked to its product sheet '
+                   '\u2014 \U0001f4a3 Has Exploit = Yes means that specific CVE is on the CISA KEV catalog. '
+                   'All counts fixed at report generation, active devices only.',
                    note_fmt)
     ws.set_row(row, 28)
     row += 2
