@@ -330,12 +330,22 @@ def run(request: DashboardRequest) -> DashboardResult:
         filtered_df = merged_df[merged_df['Vulnerability Score'] >= request.threshold]
         triage_df   = filtered_df[filtered_df['Last Response'] != 'Not Found in RMM']
 
-        # Health-score scope: always >= 7.0 so the critical-coverage component (CVSS >= 9)
-        # has a genuine non-critical baseline. When threshold is already below 7.0 this
-        # produces the same frame as triage_df.
-        _health_floor        = min(request.threshold, 7.0)
-        health_score_threshold = _health_floor
-        health_filtered      = merged_df[merged_df['Vulnerability Score'] >= _health_floor]
+        # Health-score scope is ALWAYS CVSS >= 7.0, full stop — independent of
+        # whatever CVSS threshold the report itself is displayed at. This is
+        # what keeps the score comparable across runs: a report generated at
+        # the default 9.0 threshold and one generated at 1.0 (to see
+        # everything) should produce the SAME health score, because both are
+        # graded against the same fixed CVSS >= 7.0 bar.
+        #
+        # Previously this used min(request.threshold, 7.0), which meant a low
+        # display threshold (e.g. 1.0) shrank the health-score scope down to
+        # 1.0 too — pulling in a flood of low-severity CVEs that have nothing
+        # to do with "critical patching health" and made the score swing
+        # depending on what threshold the report happened to be run at. The
+        # health scope must never go below 7.0, matching the intent already
+        # documented on compute_patching_health_score().
+        health_score_threshold = 7.0
+        health_filtered      = merged_df[merged_df['Vulnerability Score'] >= health_score_threshold]
         health_triage_df     = health_filtered[health_filtered['Last Response'] != 'Not Found in RMM']
 
         # Build a dedicated DataFrame for not-in-RMM devices so we can pass rows
