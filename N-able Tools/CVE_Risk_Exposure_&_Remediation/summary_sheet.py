@@ -1072,21 +1072,23 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
             row += 1
         row += 1
 
-        # -- Servers: every UNRESOLVED CVE on a server, regardless of KEV ----
-        # Title says "regardless of KEV" — this now actually tracks any
-        # unresolved CVE on a server (not just ones on the CISA KEV catalog).
-        # Each unresolved CVE gets its own row, named and linked to the
-        # product sheet it came from, with 💣 Has Exploit marking the ones
-        # that ARE on the CISA KEV catalog specifically.
+        # -- Servers: every product with an UNRESOLVED CVE, regardless of KEV --
+        # Title says "regardless of KEV" — this tracks any unresolved CVE on
+        # a server (not just ones on the CISA KEV catalog), grouped by
+        # product per device (not one row per CVE — a product with 23
+        # unresolved CVEs gets one row, not 23). 💣 Has Exploit marks a
+        # product/device pair where at least one of those unresolved CVEs
+        # is on the CISA KEV catalog specifically.
         ws.write(row, 0, 'All Servers  (tracked regardless of KEV)', hdr_fmt)
-        ws.merge_range(row, 1, row, 5, '', hdr_fmt)
+        ws.merge_range(row, 1, row, 6, '', hdr_fmt)
         row += 1
         ws.write(row, 0, 'Device',                    hdr_fmt)
         ws.write(row, 1, 'Device Type',                hdr_fmt)
-        ws.write(row, 2, 'Unresolved CVE',              hdr_fmt)
-        ws.write(row, 3, '\U0001f4a3 Has Exploit',      hdr_fmt)
-        ws.write(row, 4, 'Last Response',              hdr_fmt)
-        ws.write(row, 5, 'Days Since Last Response',   hdr_fmt)
+        ws.write(row, 2, 'Product',                    hdr_fmt)
+        ws.write(row, 3, 'Unresolved CVEs',            hdr_fmt)
+        ws.write(row, 4, '\U0001f4a3 Has Exploit',      hdr_fmt)
+        ws.write(row, 5, 'Last Response',              hdr_fmt)
+        ws.write(row, 6, 'Days Since Last Response',   hdr_fmt)
         row += 1
 
         _has_dt_all = 'Device Type' in triage_dedup.columns
@@ -1094,38 +1096,43 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
                           if _has_dt_all else pd.Series([False] * len(triage_dedup), index=triage_dedup.index))
         _srv_unr_df = triage_dedup[_all_srv_mask & _is_unr]
 
-        if not _srv_unr_df.empty and 'Name' in _srv_unr_df.columns and 'Vulnerability Name' in _srv_unr_df.columns:
+        if (not _srv_unr_df.empty and 'Name' in _srv_unr_df.columns
+                and 'Vulnerability Name' in _srv_unr_df.columns and 'Base Product' in _srv_unr_df.columns):
             _has_lr_all   = 'Last Response' in _srv_unr_df.columns
             _has_days_all = 'Days Since Last Response' in _srv_unr_df.columns
             _srv_kev_row_mask = kev_mask.reindex(_srv_unr_df.index).fillna(False)
 
-            _srv_cve_rows = (_srv_unr_df.assign(_is_kev=_srv_kev_row_mask)
-                             .drop_duplicates(subset=['Name', 'Vulnerability Name',
-                                                       'Base Product' if 'Base Product' in _srv_unr_df.columns else 'Name']))
-            _srv_cve_rows = _srv_cve_rows.sort_values(
-                by=['_is_kev', 'Name', 'Vulnerability Name'], ascending=[False, True, True])
+            _srv_prod_grp = (_srv_unr_df.assign(_is_kev=_srv_kev_row_mask)
+                             .groupby(['Name', 'Base Product'])
+                             .agg(device_type=('Device Type', 'first') if _has_dt_all else ('Name', lambda s: 'Unknown'),
+                                  cve_count=('Vulnerability Name', 'nunique'),
+                                  has_kev=('_is_kev', 'any'),
+                                  last_response=('Last Response', 'first') if _has_lr_all else ('Name', lambda s: ''),
+                                  days_since=('Days Since Last Response', lambda s: pd.to_numeric(s, errors='coerce').max())
+                                             if _has_days_all else ('Name', lambda s: ''))
+                             .reset_index()
+                             .sort_values(by=['has_kev', 'Name', 'Base Product'], ascending=[False, True, True]))
 
-            for _, _r in _srv_cve_rows.iterrows():
-                _is_kev  = bool(_r['_is_kev'])
+            for _, _r in _srv_prod_grp.iterrows():
+                _is_kev  = bool(_r['has_kev'])
                 _bf, _nf = (_kev_td_red, _kev_td_red_r) if _is_kev else (_kev_td, _kev_td_r)
-                _cve     = _r.get('Vulnerability Name', '')
-                _prod    = _r.get('Base Product', '') if 'Base Product' in _srv_unr_df.columns else ''
+                _prod    = _r['Base Product']
                 _sheet   = _p2s_kev.get(_prod) if _prod else None
-                _label   = f'{_cve} ({_prod})' if _prod else str(_cve)
 
-                ws.write(row, 0, str(_r.get('Name', '')), _bf)
-                ws.write(row, 1, str(_r.get('Device Type', '')) if _has_dt_all else '', _bf)
+                ws.write(row, 0, str(_r['Name']), _bf)
+                ws.write(row, 1, str(_r['device_type']) if _has_dt_all else '', _bf)
                 if _sheet:
-                    ws.write_url(row, 2, f"internal:'{_sheet}'!A1", _kev_link_fmt, string=_label)
+                    ws.write_url(row, 2, f"internal:'{_sheet}'!A1", _kev_link_fmt, string=str(_prod))
                 else:
-                    ws.write(row, 2, _label, _bf)
-                ws.write(row, 3, 'Yes' if _is_kev else 'No', _bf)
-                ws.write(row, 4, str(_r.get('Last Response', '')) if _has_lr_all else '', _bf)
-                _days_v = _r.get('Days Since Last Response') if _has_days_all else None
-                ws.write(row, 5, int(_days_v) if _has_days_all and pd.notna(_days_v) else '', _nf)
+                    ws.write(row, 2, str(_prod), _bf)
+                ws.write(row, 3, int(_r['cve_count']), _nf)
+                ws.write(row, 4, 'Yes' if _is_kev else 'No', _bf)
+                ws.write(row, 5, str(_r['last_response']) if _has_lr_all else '', _bf)
+                _days_v = _r['days_since'] if _has_days_all else None
+                ws.write(row, 6, int(_days_v) if _has_days_all and pd.notna(_days_v) else '', _nf)
                 row += 1
         else:
-            ws.merge_range(row, 0, row, 5,
+            ws.merge_range(row, 0, row, 6,
                            'All Servers Patched \u2014 no unresolved CVEs of any kind on active servers',
                            note_fmt)
             row += 1
@@ -1134,10 +1141,11 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         ws.merge_range(row, 0, row, 3, 'CISA KEV column not available in source data.', note_fmt)
         row += 1
 
-    ws.merge_range(row, 0, row, 5,
+    ws.merge_range(row, 0, row, 6,
                    '\u2139  Workstation product links go to the triage sheet for that product. '
-                   'Server rows list every unresolved CVE individually, named and linked to its product sheet '
-                   '\u2014 \U0001f4a3 Has Exploit = Yes means that specific CVE is on the CISA KEV catalog. '
+                   'Server rows group unresolved CVEs by product per device (one row per product, not '
+                   'per CVE) and link to that product\u2019s triage sheet \u2014 \U0001f4a3 Has Exploit = Yes '
+                   'means at least one of those unresolved CVEs is on the CISA KEV catalog. '
                    'All counts fixed at report generation, active devices only.',
                    note_fmt)
     ws.set_row(row, 28)
