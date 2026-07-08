@@ -1068,7 +1068,7 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
                 ws.write(row, 2, int(pr['cves']),    _kev_td_r)
                 row += 1
         else:
-            ws.merge_range(row, 0, row, 2, 'No unresolved KEV CVEs on workstations.', note_fmt)
+            ws.merge_range(row, 0, row, 2, 'No Work Stations found with KEV', note_fmt)
             row += 1
         row += 1
 
@@ -1109,26 +1109,39 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
                                  days_since=('Days Since Last Response', lambda s: pd.to_numeric(s, errors='coerce').max())
                                             if _has_days_all else ('Name', lambda s: ''))
                             .sort_values('device_type'))
-            for dev, dr in _srv_all_grp.iterrows():
-                _kev_ct   = int(_kev_cve_by_device.get(dev, 0))
-                _has_kev  = _kev_ct > 0
-                _bf, _nf  = (_kev_td_red, _kev_td_red_r) if _has_kev else (_kev_td, _kev_td_r)
-                _products = dr['products'] if isinstance(dr['products'], list) else []
-                _prod_txt = ', '.join(_products) if _products else '\u2014'
-                _primary  = _products[0] if _products else None
-                _sheet    = _p2s_kev.get(_primary) if _primary else None
 
-                ws.write(row, 0, str(dev), _bf)
-                ws.write(row, 1, str(dr['device_type']), _bf)
-                if _sheet:
-                    ws.write_url(row, 2, f"internal:'{_sheet}'!A1", _kev_link_fmt, string=_prod_txt)
-                else:
-                    ws.write(row, 2, _prod_txt, _bf)
-                ws.write(row, 3, _kev_ct, _nf)
-                ws.write(row, 4, str(dr['last_response']) if _has_lr_all else '', _bf)
-                _days_v = dr['days_since']
-                ws.write(row, 5, int(_days_v) if _has_days_all and pd.notna(_days_v) else '', _nf)
+            # If literally no server has an unresolved KEV CVE, a full table of
+            # every server showing zero is just noise — a clean "all patched"
+            # message is more useful. The full per-server table (still
+            # regardless of KEV) only appears once at least one server has
+            # something outstanding.
+            _any_srv_kev = any(
+                int(_kev_cve_by_device.get(dev, 0)) > 0 for dev in _srv_all_grp.index
+            )
+            if not _any_srv_kev:
+                ws.merge_range(row, 0, row, 5, 'All Servers Patched', note_fmt)
                 row += 1
+            else:
+                for dev, dr in _srv_all_grp.iterrows():
+                    _kev_ct   = int(_kev_cve_by_device.get(dev, 0))
+                    _has_kev  = _kev_ct > 0
+                    _bf, _nf  = (_kev_td_red, _kev_td_red_r) if _has_kev else (_kev_td, _kev_td_r)
+                    _products = dr['products'] if isinstance(dr['products'], list) else []
+                    _prod_txt = ', '.join(_products) if _products else '\u2014'
+                    _primary  = _products[0] if _products else None
+                    _sheet    = _p2s_kev.get(_primary) if _primary else None
+
+                    ws.write(row, 0, str(dev), _bf)
+                    ws.write(row, 1, str(dr['device_type']), _bf)
+                    if _sheet:
+                        ws.write_url(row, 2, f"internal:'{_sheet}'!A1", _kev_link_fmt, string=_prod_txt)
+                    else:
+                        ws.write(row, 2, _prod_txt, _bf)
+                    ws.write(row, 3, _kev_ct, _nf)
+                    ws.write(row, 4, str(dr['last_response']) if _has_lr_all else '', _bf)
+                    _days_v = dr['days_since']
+                    ws.write(row, 5, int(_days_v) if _has_days_all and pd.notna(_days_v) else '', _nf)
+                    row += 1
         else:
             ws.merge_range(row, 0, row, 5, 'No active server devices found.', note_fmt)
             row += 1
