@@ -574,6 +574,7 @@ def run(request: DashboardRequest) -> DashboardResult:
         check_lookup: dict  = {}
         check_devices: set  = set()
         check_active_names: set = set()   # normalised device names, active scope only
+        active_universe_names: set = set()   # ALL active devices (normalised), regardless of check status
         patch_check_active_df = pd.DataFrame()
 
         if request.include_patch_check_report and request.patch_check_report_path:
@@ -583,18 +584,24 @@ def run(request: DashboardRequest) -> DashboardResult:
                 check_lookup  = build_patch_check_failure_lookup(check_df)
                 check_devices = set(check_lookup.keys())
 
-                # "Active" mirrors the scope Key Metrics uses everywhere else:
-                # not stale (already excluded from merged_df) and not 'Not
-                # Found in RMM'. A device that's both active and failing its
-                # patch status check is exactly the case worth surfacing.
-                if check_devices and 'Name' in merged_df.columns and 'Last Response' in merged_df.columns:
-                    _active_names_by_norm: dict = {}
+                # "Active" mirrors the scope Key Metrics uses everywhere else —
+                # i.e. within the date range entered (not stale, given
+                # merged_df already had the cutoff_date exclusion applied
+                # above) and not 'Not Found in RMM'. The Summary sheet only
+                # ever shows devices in this active scope; the dedicated
+                # 'Patch Check Failures' worksheet shows every device from
+                # the imported report regardless, with this same set used to
+                # mark each one Active Yes/No for consistency.
+                _active_names_by_norm: dict = {}
+                if 'Name' in merged_df.columns and 'Last Response' in merged_df.columns:
                     for raw_name in merged_df.loc[
                         merged_df['Last Response'] != 'Not Found in RMM', 'Name'
                     ].unique():
                         _active_names_by_norm.setdefault(normalize_device_name(raw_name), raw_name)
-                    check_active_names = check_devices & set(_active_names_by_norm.keys())
+                active_universe_names = set(_active_names_by_norm.keys())
+                check_active_names    = check_devices & active_universe_names
 
+                if check_active_names:
                     _rows = []
                     for norm_name in sorted(
                         check_active_names,
@@ -617,7 +624,6 @@ def run(request: DashboardRequest) -> DashboardResult:
                         })
                     patch_check_active_df = pd.DataFrame(_rows)
 
-                if check_active_names:
                     warnings.append(
                         f"{len(check_active_names)} active device(s) have a failing patch status "
                         f"check — RMM cannot confirm their patch status. See 'Patch Check Failures' sheet."
@@ -776,7 +782,13 @@ def run(request: DashboardRequest) -> DashboardResult:
                     )
 
             if check_df is not None and check_lookup:
-                inventory_devices_chk = (
+                # Same "Active" definition used on the Summary sheet — within
+                # the date range entered (stale devices already excluded from
+                # merged_df) and found in RMM — not just "somewhere in the
+                # RMM inventory file" regardless of staleness. Every device
+                # from the imported report still appears in the sheet either
+                # way; this only affects the Active Yes/No column.
+                inventory_devices_chk = active_universe_names if active_universe_names else (
                     set(df_rmm['Device_Join'].unique()) if df_rmm is not None else None
                 )
                 cve_overlap_chk = triage_df[

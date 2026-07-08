@@ -1028,6 +1028,9 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
                                          'border': 1, 'bg_color': '#FFFFFF'})
     _kev_td       = workbook.add_format({'border': 1})
     _kev_td_r     = workbook.add_format({'border': 1, 'align': 'right', 'num_format': '#,##0'})
+    _kev_td_red   = workbook.add_format({'border': 1, 'bg_color': '#FCE4D6'})
+    _kev_td_red_r = workbook.add_format({'border': 1, 'bg_color': '#FCE4D6',
+                                          'align': 'right', 'num_format': '#,##0'})
     _p2s_kev = product_to_sheet or {}
 
     ws.merge_range(row, 0, row, 3,
@@ -1069,41 +1072,76 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
             row += 1
         row += 1
 
-        # -- Servers: listed with device names --
-        ws.write(row, 0, 'Server Products', hdr_fmt)
-        ws.merge_range(row, 1, row, 3, '', hdr_fmt)
+        # -- Servers: EVERY active server device, regardless of KEV status --
+        # Unlike Workstation Products above (summarised by product, KEV-only),
+        # servers get their own row each — servers are typically few and
+        # high-value, so visibility matters even for a server with zero KEV
+        # CVEs right now. Rows with an unresolved KEV CVE are still called out
+        # with a highlight so they don't get lost in the full list.
+        ws.write(row, 0, 'All Servers  (tracked regardless of KEV)', hdr_fmt)
+        ws.merge_range(row, 1, row, 5, '', hdr_fmt)
         row += 1
-        ws.write(row, 0, 'Product',              hdr_fmt)
-        ws.write(row, 1, 'Device(s)',             hdr_fmt)
-        ws.write(row, 2, 'Unresolved KEV CVEs',   hdr_fmt)
+        ws.write(row, 0, 'Device',                    hdr_fmt)
+        ws.write(row, 1, 'Device Type',                hdr_fmt)
+        ws.write(row, 2, 'Product(s)',                 hdr_fmt)
+        ws.write(row, 3, 'Unresolved KEV CVEs',        hdr_fmt)
+        ws.write(row, 4, 'Last Response',              hdr_fmt)
+        ws.write(row, 5, 'Days Since Last Response',   hdr_fmt)
         row += 1
-        _srv_kev_df = _kev_unr_df[_kev_srv_mask]
-        if not _srv_kev_df.empty:
-            _srv_grp = (_srv_kev_df.groupby('Base Product')
-                        .agg(devices=('Name', lambda s: ', '.join(sorted(s.astype(str).unique()))),
-                             device_count=('Name', 'nunique'),
-                             cves=('Vulnerability Name', 'nunique'))
-                        .sort_values('device_count', ascending=False))
-            for prod, pr in _srv_grp.iterrows():
-                sheet = _p2s_kev.get(prod)
-                if sheet:
-                    ws.write_url(row, 0, f"internal:'{sheet}'!A1", _kev_link_fmt, string=str(prod))
+
+        _has_dt_all = 'Device Type' in triage_dedup.columns
+        _all_srv_mask = (triage_dedup['Device Type'].astype(str).str.lower().str.contains('server', na=False)
+                          if _has_dt_all else pd.Series([False] * len(triage_dedup), index=triage_dedup.index))
+        _srv_all_df = triage_dedup[_all_srv_mask]
+
+        if not _srv_all_df.empty and 'Name' in _srv_all_df.columns:
+            _kev_cve_by_device = (
+                _kev_unr_df.groupby('Name')['Vulnerability Name'].nunique().to_dict()
+                if not _kev_unr_df.empty and 'Name' in _kev_unr_df.columns else {}
+            )
+            _has_lr_all   = 'Last Response' in _srv_all_df.columns
+            _has_days_all = 'Days Since Last Response' in _srv_all_df.columns
+            _srv_all_grp = (_srv_all_df.groupby('Name')
+                            .agg(device_type=('Device Type', 'first') if _has_dt_all else ('Name', lambda s: 'Unknown'),
+                                 products=('Base Product', lambda s: sorted(s.astype(str).unique()))
+                                          if 'Base Product' in _srv_all_df.columns else ('Name', lambda s: []),
+                                 last_response=('Last Response', 'first') if _has_lr_all else ('Name', lambda s: ''),
+                                 days_since=('Days Since Last Response', lambda s: pd.to_numeric(s, errors='coerce').max())
+                                            if _has_days_all else ('Name', lambda s: ''))
+                            .sort_values('device_type'))
+            for dev, dr in _srv_all_grp.iterrows():
+                _kev_ct   = int(_kev_cve_by_device.get(dev, 0))
+                _has_kev  = _kev_ct > 0
+                _bf, _nf  = (_kev_td_red, _kev_td_red_r) if _has_kev else (_kev_td, _kev_td_r)
+                _products = dr['products'] if isinstance(dr['products'], list) else []
+                _prod_txt = ', '.join(_products) if _products else '\u2014'
+                _primary  = _products[0] if _products else None
+                _sheet    = _p2s_kev.get(_primary) if _primary else None
+
+                ws.write(row, 0, str(dev), _bf)
+                ws.write(row, 1, str(dr['device_type']), _bf)
+                if _sheet:
+                    ws.write_url(row, 2, f"internal:'{_sheet}'!A1", _kev_link_fmt, string=_prod_txt)
                 else:
-                    ws.write(row, 0, str(prod), _kev_td)
-                ws.write(row, 1, str(pr['devices']), _kev_td)
-                ws.write(row, 2, int(pr['cves']),    _kev_td_r)
+                    ws.write(row, 2, _prod_txt, _bf)
+                ws.write(row, 3, _kev_ct, _nf)
+                ws.write(row, 4, str(dr['last_response']) if _has_lr_all else '', _bf)
+                _days_v = dr['days_since']
+                ws.write(row, 5, int(_days_v) if _has_days_all and pd.notna(_days_v) else '', _nf)
                 row += 1
         else:
-            ws.merge_range(row, 0, row, 2, 'No unresolved KEV CVEs on servers.', note_fmt)
+            ws.merge_range(row, 0, row, 5, 'No active server devices found.', note_fmt)
             row += 1
     else:
         _kev_unr_df = pd.DataFrame()
         ws.merge_range(row, 0, row, 3, 'CISA KEV column not available in source data.', note_fmt)
         row += 1
 
-    ws.merge_range(row, 0, row, 3,
-                   '\u2139  Product names are hyperlinked to their triage sheet. '
-                   'Counts are unresolved (\u2610) only, active devices, fixed at report generation.',
+    ws.merge_range(row, 0, row, 5,
+                   '\u2139  Product name(s) are hyperlinked to their triage sheet (multi-product cells link to '
+                   'the first product listed). Unresolved KEV CVE counts are unresolved (\u2610) only, active '
+                   'devices, fixed at report generation. \U0001f7e5 Highlighted server rows have \u2265 1 '
+                   'unresolved KEV CVE; all other server rows are shown for visibility regardless of KEV status.',
                    note_fmt)
     ws.set_row(row, 28)
     row += 2
