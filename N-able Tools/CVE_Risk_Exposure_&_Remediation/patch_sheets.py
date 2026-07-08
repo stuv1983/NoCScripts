@@ -446,3 +446,153 @@ def build_patch_sheets(writer, overview_df, full_df, patch_df):
         df.to_excel(writer, sheet_name=name, index=False)
         ws = writer.sheets[name]
         ws.autofilter(0, 0, len(df), len(df.columns) - 1)
+
+
+def build_patch_check_failure_sheet(writer, check_df: 'pd.DataFrame',
+                                    check_lookup: dict,
+                                    cve_device_overlap: 'Optional[pd.DataFrame]' = None,
+                                    inventory_devices: 'set | None' = None) -> None:
+    """
+    Builds the 'Patch Check Failures' sheet from an RMM monitoring-check
+    export (e.g. N-able's 'Failing Checks' report) — distinct from the
+    per-KB 'Patch Failures' sheet above.
+
+    This tracks devices where the RMM agent's own automated Patch Status
+    Check is failing to report at all — i.e. RMM can't confirm whether the
+    device is patched, which is a leading indicator of a device silently
+    falling out of patch management (broken agent, WMI/service issue,
+    permissions, etc.) rather than a specific patch failing to install.
+
+    inventory_devices, if provided (normalised device names, e.g. from
+    df_rmm['Device_Join']), splits the device list into Active (currently
+    in the RMM/CVE dataset) vs Not currently tracked, so the reader can
+    tell "this device is live and its patch status is a blind spot" apart
+    from "this device may no longer exist."
+    """
+    import pandas as pd
+    wb  = writer.book
+    red = wb.add_format({'bg_color': '#FCE4D6'})
+    amb = wb.add_format({'bg_color': '#FFF2CC'})
+    hdr = wb.add_format({'bold': True, 'bg_color': '#D9D9D9', 'border': 1})
+    hdr_red  = wb.add_format({'bold': True, 'bg_color': '#C00000', 'font_color': 'white', 'border': 1})
+    note_fmt = wb.add_format({'italic': True, 'font_color': '#595959'})
+    title_fmt= wb.add_format({'bold': True, 'font_size': 12, 'bg_color': '#1F4E79',
+                               'font_color': 'white', 'border': 1})
+    stat_fmt = wb.add_format({'bold': True, 'bg_color': '#F2F2F2', 'border': 1})
+    stat_val = wb.add_format({'border': 1, 'align': 'right'})
+    date_fmt = wb.add_format({'border': 1, 'num_format': 'yyyy-mm-dd hh:mm'})
+    td       = wb.add_format({'border': 1})
+    td_r     = wb.add_format({'border': 1, 'align': 'right', 'num_format': '#,##0'})
+
+    if not check_lookup:
+        return
+
+    active_devices = set(inventory_devices) if inventory_devices else None
+
+    rows = []
+    for device, info in sorted(check_lookup.items(),
+                               key=lambda x: (x[1]['days_since'] if x[1]['days_since'] is not None else -1),
+                               reverse=True):
+        is_active = (device in active_devices) if active_devices is not None else None
+        rows.append({
+            'Device':             info.get('asset_name', device),
+            'Asset Type':         info.get('asset_type', ''),
+            'Customer':           info.get('customer', ''),
+            'Site':               info.get('site', ''),
+            'Check Description':  info.get('check_description', ''),
+            'Check Frequency':    info.get('check_frequency', ''),
+            'Last Failure':       info.get('last_failure'),
+            'Days Since':         info.get('days_since'),
+            'Failure Events':     info.get('failure_count', 1),
+            'Active':             ('Yes' if is_active else 'No') if is_active is not None else 'Unknown',
+        })
+
+    ws = wb.add_worksheet('Patch Check Failures')
+
+    total_devices  = len(rows)
+    active_count   = sum(1 for r in rows if r['Active'] == 'Yes')
+    unknown_count  = sum(1 for r in rows if r['Active'] == 'Unknown')
+    long_silent    = sum(1 for r in rows if isinstance(r['Days Since'], int) and r['Days Since'] >= 30)
+
+    ws.merge_range(0, 0, 0, 5, 'Patch Status Check Failures', title_fmt)
+    stats = [
+        ('Devices with failing patch status check', total_devices),
+        ('Of which currently active (in RMM/CVE data)', active_count) if active_devices is not None
+            else ('Devices (active status unknown \u2014 no RMM data supplied)', unknown_count),
+        ('Silent \u2265 30 days since last failure recorded', long_silent),
+    ]
+    for si, (label, val) in enumerate(stats):
+        ws.write(1 + si, 0, label, stat_fmt)
+        ws.write(1 + si, 1, val,   stat_val)
+
+    ws.set_column('A:A', 26); ws.set_column('B:B', 14)
+    ws.set_column('C:C', 20); ws.set_column('D:D', 26)
+    ws.set_column('E:E', 40); ws.set_column('F:F', 20)
+    ws.set_column('G:G', 20); ws.set_column('H:H', 12)
+    ws.set_column('I:I', 16); ws.set_column('J:J', 10)
+
+    tbl_start = len(stats) + 3
+    cols = ['Device', 'Asset Type', 'Customer', 'Site', 'Check Description',
+            'Check Frequency', 'Last Failure', 'Days Since', 'Failure Events', 'Active']
+    for ci, col in enumerate(cols):
+        ws.write(tbl_start, ci, col, hdr)
+    for i, row in enumerate(rows, start=tbl_start + 1):
+        days = row['Days Since']
+        row_fmt = red if (isinstance(days, int) and days >= 30) else (amb if row['Active'] == 'Yes' else None)
+        if row_fmt is not None:
+            ws.set_row(i, None, row_fmt)
+        for ci, col in enumerate(cols):
+            val = row[col]
+            if col == 'Last Failure' and pd.notna(val):
+                ws.write_datetime(i, ci, val, date_fmt)
+            elif col in ('Days Since', 'Failure Events'):
+                ws.write(i, ci, val if val is not None else '', td_r)
+            else:
+                ws.write(i, ci, str(val) if val is not None else '', td)
+    ws.autofilter(tbl_start, 0, tbl_start + len(rows), len(cols) - 1)
+
+    note_row = tbl_start + len(rows) + 2
+    ws.merge_range(note_row, 0, note_row, 9,
+        '\u2139  \U0001f7e5 Red = failing \u2265 30 days.  \U0001f7e8 Amber = active device, failing < 30 days.  '
+        'A device here may still have unresolved CVEs that never get confirmed as patched simply because '
+        'RMM cannot report a fresh patch status for it \u2014 check its CVE detections directly rather than '
+        'trusting "unresolved" at face value. Fixing the underlying check (agent restart, WMI repair, '
+        'permissions) is usually the real remediation, not the individual CVE.',
+        note_fmt)
+    ws.set_row(note_row, 40)
+
+    # ── CVEs on devices where patch status can't be confirmed ────────────────
+    if cve_device_overlap is not None and not cve_device_overlap.empty:
+        _fail_info = check_lookup
+        _norm_name = cve_device_overlap['Name'].astype(str).apply(
+            lambda n: n.strip().upper().split('\\')[-1].split('.')[0])
+
+        cve_out = cve_device_overlap.copy()
+        cve_out['_nk'] = _norm_name
+        cve_out['Days Since Check Failed'] = cve_out['_nk'].map(
+            lambda nk: _fail_info[nk]['days_since'] if nk in _fail_info else None
+        )
+        cve_out = cve_out.drop(columns=['_nk'], errors='ignore')
+
+        out_cols = [c for c in [
+            'Name', 'Vulnerability Name', 'Vulnerability Score', 'Affected Products',
+            'Has Known Exploit', 'Days Since Check Failed'
+        ] if c in cve_out.columns]
+
+        overlap = (cve_out[out_cols]
+                   .drop_duplicates(subset=['Name', 'Vulnerability Name'])
+                   .sort_values('Vulnerability Score', ascending=False)
+                   .reset_index(drop=True))
+
+        overlap.to_excel(writer, sheet_name='CVEs on Check-Failing Devices', index=False)
+        ws2 = writer.sheets['CVEs on Check-Failing Devices']
+        ws2.autofilter(0, 0, len(overlap), len(overlap.columns) - 1)
+        ws2.set_column('A:A', 26); ws2.set_column('B:B', 22)
+        ws2.set_column('D:D', 32); ws2.set_column('F:F', 22)
+        ws2.set_row(0, None, hdr_red)
+        ws2.write(len(overlap) + 2, 0,
+                  f'\u26a0  {len(overlap)} CVE detection(s) on {overlap["Name"].nunique()} device(s) where the '
+                  f'patch status check itself is failing \u2014 these CVEs may be stuck showing unresolved '
+                  f'purely because RMM cannot confirm a fresh patch status, not because they are genuinely '
+                  f'still unpatched.', note_fmt)
+        ws2.set_row(len(overlap) + 2, 50)

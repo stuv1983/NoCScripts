@@ -183,7 +183,9 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
                                health_triage_df: 'Optional[pd.DataFrame]' = None,
                                health_score_threshold: float = 7.0,
                                has_patch_report: bool = False,
-                               prev_report_name: str = ''):
+                               prev_report_name: str = '',
+                               patch_check_active_df: 'Optional[pd.DataFrame]' = None,
+                               patch_check_active_names: Optional[Set[str]] = None):
     """
     Client Summary sheet.
 
@@ -195,6 +197,12 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     health_score_threshold — actual CVSS floor used for health_triage_df (passed explicitly to keep
                              the footnote honest when the caller used a threshold below 7.0).
     has_patch_report       — tightens the KEV grade cap when no patch evidence is available.
+    patch_check_active_df  — pre-built rows (Device, Device Type, Customer, Site, Check Description,
+                             Last Failure, Days Since) for active devices whose RMM Patch Status Check
+                             is failing (see data_pipeline.load_patch_check_report()). Already filtered
+                             to active scope by the caller (orchestrator.py).
+    patch_check_active_names — normalised device names (data_pipeline.normalize_device_name) of the
+                             same devices, used to highlight matches inside Top At-Risk Devices below.
     """
     ws = workbook.add_worksheet('Summary')
     if not report_month:
@@ -1228,7 +1236,62 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     # rows this period and Resolved = confirmed + inferred — i.e. "of everything
     # tracked as of the last report, how much is now closed out."
     row += 1
-    ws.merge_range(row, 0, row, 3, '  Resolution Status  (active devices only)', sect_fmt); row += 1
+
+    # ── Active Devices Failing Patch Status Check ────────────────────────────
+    # Sourced from an imported RMM monitoring-check export (Advanced Options
+    # → Patch Status Check Report). These are devices where RMM's own
+    # automated check can't confirm patch status at all — distinct from a
+    # CVE being genuinely unresolved. A device here may show unresolved CVEs
+    # purely because no fresh scan has ever confirmed a patch, not because
+    # it's still genuinely vulnerable.
+    if patch_check_active_df is not None and not patch_check_active_df.empty:
+        _pchk_td   = workbook.add_format({'border': 1})
+        _pchk_td_r = workbook.add_format({'border': 1, 'align': 'right', 'num_format': '#,##0'})
+        _pchk_td_red = workbook.add_format({'border': 1, 'bg_color': '#FCE4D6'})
+        _pchk_td_red_r = workbook.add_format({'border': 1, 'bg_color': '#FCE4D6',
+                                               'align': 'right', 'num_format': '#,##0'})
+        _pchk_date_fmt = workbook.add_format({'border': 1, 'num_format': 'yyyy-mm-dd hh:mm'})
+        _pchk_date_fmt_red = workbook.add_format({'border': 1, 'num_format': 'yyyy-mm-dd hh:mm',
+                                                   'bg_color': '#FCE4D6'})
+
+        ws.merge_range(row, 0, row, 5,
+                       f'  \u26a0  Active Devices Failing Patch Status Check  '
+                       f'({len(patch_check_active_df)} device(s))',
+                       sect_fmt)
+        row += 1
+        ws.write(row, 0, 'Device',            hdr_fmt)
+        ws.write(row, 1, 'Device Type',       hdr_fmt)
+        ws.write(row, 2, 'Customer',          hdr_fmt)
+        ws.write(row, 3, 'Site',              hdr_fmt)
+        ws.write(row, 4, 'Last Failure',      hdr_fmt)
+        ws.write(row, 5, 'Days Since',        hdr_fmt)
+        row += 1
+        for _, _r in patch_check_active_df.iterrows():
+            _days = _r.get('Days Since')
+            _long_silent = pd.notna(_days) and float(_days) >= 30
+            _bf   = _pchk_td_red   if _long_silent else _pchk_td
+            _nf   = _pchk_td_red_r if _long_silent else _pchk_td_r
+            _df_  = _pchk_date_fmt_red if _long_silent else _pchk_date_fmt
+            ws.write(row, 0, str(_r.get('Device', '')),      _bf)
+            ws.write(row, 1, str(_r.get('Device Type', '')), _bf)
+            ws.write(row, 2, str(_r.get('Customer', '')),    _bf)
+            ws.write(row, 3, str(_r.get('Site', '')),        _bf)
+            _last_fail = _r.get('Last Failure')
+            if pd.notna(_last_fail):
+                ws.write_datetime(row, 4, _last_fail, _df_)
+            else:
+                ws.write(row, 4, '', _bf)
+            ws.write(row, 5, int(_days) if pd.notna(_days) else '', _nf)
+            row += 1
+        ws.merge_range(row, 0, row, 5,
+                       '\u2139  \U0001f7e7 Highlighted = failing \u2265 30 days. Imported via Advanced Options → '
+                       'Patch Status Check Report. These devices are also flagged with a \U0001f527 marker '
+                       'in Top At-Risk Devices below.',
+                       note_fmt)
+        ws.set_row(row, 28)
+        row += 2
+
+
     ws.write(row, 0, 'Status',          hdr_fmt)
     ws.write(row, 1, 'Detection Rows',  hdr_fmt)
     ws.write(row, 2, '% of Total',      hdr_fmt)
@@ -1441,23 +1504,33 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
                 if len(_top) >= 10: break
 
             _approaching = approaching_stale_names or set()
+            _check_active = patch_check_active_names or set()
             _td_approach   = workbook.add_format({'border': 1, 'bg_color': '#FFF3E0', 'font_color': '#7B3F00'})
             _td_approach_r = workbook.add_format({'border': 1, 'bg_color': '#FFF3E0', 'font_color': '#7B3F00',
                                                    'align': 'right', 'num_format': '#,##0'})
+            _td_chkfail    = workbook.add_format({'border': 1, 'bg_color': '#E4DFEC', 'font_color': '#4C3B6E'})
+            _td_chkfail_r  = workbook.add_format({'border': 1, 'bg_color': '#E4DFEC', 'font_color': '#4C3B6E',
+                                                   'align': 'right', 'num_format': '#,##0'})
+            if _check_active:
+                from data_pipeline import normalize_device_name as _norm_dev_name
 
             for _r in _top:
                 _srv        = 'server' in str(_r.device_type).lower()
                 _exp        = str(_r.has_exploit).strip().lower() == 'yes'
                 _near_stale = _r.Name in _approaching
+                _chk_fail   = bool(_check_active) and _norm_dev_name(_r.Name) in _check_active
                 if _exp:
                     _bf, _nf = _td_exp, _td_exp_r
+                elif _chk_fail:
+                    _bf, _nf = _td_chkfail, _td_chkfail_r
                 elif _near_stale:
                     _bf, _nf = _td_approach, _td_approach_r
                 elif _srv:
                     _bf, _nf = _td_srv, _td_srv_r
                 else:
                     _bf, _nf = _td, _td_r
-                _name_label = f'⚠ {_r.Name}' if _near_stale else str(_r.Name)
+                _prefix     = '\U0001f527 ' if _chk_fail else ('⚠ ' if _near_stale else '')
+                _name_label = f'{_prefix}{_r.Name}'
                 _days_val   = int(_r.days_since) if hasattr(_r, 'days_since') and not (isinstance(_r.days_since, float) and pd.isna(_r.days_since)) else ''
                 ws.write(row, 0, _name_label,               _bf)
                 ws.write(row, 1, str(_r.username),           _bf)
@@ -1472,9 +1545,15 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
                 f'  🟧 Orange = offline \u2265 {stale_warning_days}d (⚠ prefix on name).  '
                 if _approaching else ''
             )
+            _chkfail_note = (
+                '  \U0001f7ea Purple = active device failing its RMM Patch Status Check '
+                '(\U0001f527 prefix on name) — see Patch Check Failures sheet.  '
+                if _check_active else ''
+            )
             ws.merge_range(row, 0, row, 6,
                 f'ℹ  🟡 Amber = Server.  🟥 Red = known exploit.  '
                 f'{_approach_note}'
+                f'{_chkfail_note}'
                 f'Up to 10 devices. Unresolved CVE counts only.',
                 note_fmt)
             ws.set_row(row, 30); row += 1

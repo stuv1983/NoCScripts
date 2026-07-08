@@ -200,6 +200,8 @@ def process_reports():
         include_failure_report = include_failure_var.get(),
         browser_audit_path     = browser_audit_var.get() or None,
         include_browser_audit  = include_browser_audit_var.get(),
+        patch_check_report_path    = patch_check_var.get() or None,
+        include_patch_check_report = include_patch_check_var.get(),
         prev_report_path       = prev_report_path or None,
         include_trend          = include_trend,
         threshold              = threshold,
@@ -370,7 +372,7 @@ def open_advanced_dialog():
     dlg.update_idletasks()
     pw = root.winfo_x() + root.winfo_width()  // 2
     ph = root.winfo_y() + root.winfo_height() // 2
-    dlg.geometry(f"560x220+{pw - 280}+{ph - 110}")
+    dlg.geometry(f"560x340+{pw - 280}+{ph - 170}")
 
     PAD = {"padx": 16, "pady": (6, 0)}
 
@@ -397,6 +399,37 @@ def open_advanced_dialog():
                               "not recommended for formal client reporting yet.")
     ctk.CTkLabel(dlg, text="  Scoring methodology is experimental — not for formal reporting",
                  font=("", 11), text_color="#7F6000").pack(anchor="w", padx=16, pady=(0, 4))
+
+    # ── Patch Status Check Report ────────────────────────────────────────────────
+    # RMM monitoring-check export (e.g. N-able "Failing Checks") listing devices
+    # where the Patch Status Check itself is failing to report — distinct from
+    # a specific patch failing to install. Adds a "Patch Check Failures" sheet,
+    # highlights matching active devices in Top At-Risk Devices, and adds a
+    # Summary table so these show up next to the CVE data they may be masking.
+    ctk.CTkLabel(dlg, text="Patch Status Check Report  (CSV or XLSX)",
+                 font=ctk.CTkFont(weight="bold")).pack(anchor="w", **PAD)
+    pcf = ctk.CTkFrame(dlg, fg_color="transparent")
+    pcf.pack(fill="x", padx=16)
+    _pce = ctk.CTkEntry(pcf, textvariable=patch_check_var, width=380,
+                        state="normal" if include_patch_check_var.get() else "disabled")
+    _pce.pack(side="left")
+    _pcb = ctk.CTkButton(pcf, text="Browse", width=80,
+                         command=lambda: select_file(patch_check_var),
+                         state="normal" if include_patch_check_var.get() else "disabled")
+    _pcb.pack(side="left", padx=6)
+
+    def _toggle_pc():
+        s = "normal" if include_patch_check_var.get() else "disabled"
+        _pce.configure(state=s)
+        _pcb.configure(state=s)
+
+    ctk.CTkCheckBox(dlg, text="Highlight active devices failing patch status check",
+                    variable=include_patch_check_var, command=_toggle_pc).pack(anchor="w", padx=16)
+    Tooltip(_pce, "A device here has passed CVE detection but RMM's own automated "
+                  "patch-status check is failing for it — meaning RMM can't confirm "
+                  "whether it's actually patched. Import to flag these on the Summary "
+                  "sheet, in Top At-Risk Devices, and in a dedicated 'Patch Check "
+                  "Failures' sheet.")
 
     # ── Patch Report / Patch Failure Report / Browser Audit ──────────────────────
     # Disabled for now (commented out). The include_* / *_var names stay
@@ -705,9 +738,11 @@ sync_baselines_var = tk.BooleanVar()
 patch_var = tk.StringVar()
 failure_var = tk.StringVar()
 browser_audit_var = tk.StringVar()
+patch_check_var = tk.StringVar()
 include_patch_var = tk.BooleanVar()
 include_failure_var = tk.BooleanVar()
 include_browser_audit_var = tk.BooleanVar()
+include_patch_check_var = tk.BooleanVar()
 include_health_score_var = tk.BooleanVar()
 patch_status_var = tk.StringVar(value="Patch evidence: not configured")
 status_var = tk.StringVar(value="Ready")

@@ -66,6 +66,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help='Patch report for patch-match analysis (CSV or XLSX)')
     p.add_argument('--failure-report', default=None, metavar='FILE',
                    help='Patch failure report CSV for failed patch delivery analysis')
+    p.add_argument('--patch-check-report', default=None, metavar='FILE',
+                   help='RMM monitoring-check export (e.g. "Failing Checks") listing devices where '
+                        'the Patch Status Check itself is failing to report — distinct from a specific '
+                        'patch failing to install. Adds a "Patch Check Failures" sheet, highlights '
+                        'matching active devices in Top At-Risk Devices, and adds a Summary table.')
     p.add_argument('--previous',  default=None,   metavar='FILE',
                    help='Previous dashboard (.xlsx) for month-over-month trends')
     p.add_argument('--threshold', default=9.0,    type=float, metavar='SCORE',
@@ -110,6 +115,9 @@ def main() -> int:
     if args.failure_report and not Path(args.failure_report).exists():
         log.error("Patch failure report not found: %s", args.failure_report)
         return 1
+    if args.patch_check_report and not Path(args.patch_check_report).exists():
+        log.error("Patch status check report not found: %s", args.patch_check_report)
+        return 1
     if args.previous and not Path(args.previous).exists():
         log.error("Previous report not found: %s", args.previous)
         return 1
@@ -124,6 +132,8 @@ def main() -> int:
         include_patch          = bool(args.patch),
         failure_report_path    = args.failure_report,
         include_failure_report = bool(args.failure_report),
+        patch_check_report_path    = args.patch_check_report,
+        include_patch_check_report = bool(args.patch_check_report),
         prev_report_path       = args.previous,
         include_trend          = bool(args.previous),
         threshold              = args.threshold,

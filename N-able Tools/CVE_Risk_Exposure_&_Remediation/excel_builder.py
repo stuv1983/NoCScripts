@@ -58,7 +58,7 @@ from summary_sheet import build_client_summary_sheet, compute_patching_health_sc
 from patch_sheets import (  # noqa: E402,F401
     build_diagnostics_sheets, build_patch_resolved_sheet,
     build_products_not_tracked_sheet, build_patch_failure_sheet,
-    build_patch_sheets,
+    build_patch_sheets, build_patch_check_failure_sheet,
 )
 
 # build_all_detections_sheet, build_stale_excluded_sheet,

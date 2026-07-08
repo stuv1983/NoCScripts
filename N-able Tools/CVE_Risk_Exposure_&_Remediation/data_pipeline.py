@@ -1645,6 +1645,99 @@ def build_patch_failure_lookup(failure_df: pd.DataFrame) -> dict:
     return result
 
 # ==============================================================================
+# PATCH STATUS CHECK FAILURES (RMM AGENT-SIDE MONITORING CHECK)
+# ==============================================================================
+# Distinct from load_patch_failure_report() above: that one is about a
+# specific patch/KB actively failing to install. This one is about the RMM
+# agent's own automated 'Patch Status Check' (a Daily Safety Check / similar
+# monitoring check) failing to even report a result — meaning RMM cannot
+# confirm whether the device is patched at all. This is a leading indicator
+# of a device silently falling out of patch management (agent broken, WMI/
+# service issue, etc.) rather than a specific patch failing.
+
+def load_patch_check_report(file_path: str) -> 'pd.DataFrame':
+    """
+    Parse an RMM monitoring-check export (e.g. N-able 'Failing Checks' /
+    Daily Safety Check report) and return the rows where a patch-status
+    check is failing.
+
+    Expected columns (case-insensitive, order-independent):
+      Check Status, Check Frequency, Check Type, Check Description,
+      Date/Time, Asset Type, Asset Name, Customer Name, Site Name
+
+    Filters to Check Status containing 'fail' AND Check Type containing
+    'patch' — deliberately permissive, so this works whether the export is
+    already pre-filtered to failures only (as N-able's own "Failing Checks"
+    report typically is) or is a broader export mixing other check types
+    (antivirus, disk space, etc.) together.
+    """
+    df = load_data(file_path)
+
+    rename = {}
+    for col in df.columns:
+        cl = str(col).lower().strip()
+        if cl == 'check status':            rename[col] = 'Check Status'
+        elif cl == 'check frequency':       rename[col] = 'Check Frequency'
+        elif cl == 'check type':            rename[col] = 'Check Type'
+        elif cl == 'check description':     rename[col] = 'Check Description'
+        elif 'date' in cl and 'time' in cl: rename[col] = 'Date/Time'
+        elif cl == 'asset type':            rename[col] = 'Asset Type'
+        elif cl == 'asset name':            rename[col] = 'Asset Name'
+        elif cl == 'customer name':         rename[col] = 'Customer Name'
+        elif cl == 'site name':             rename[col] = 'Site Name'
+    df = df.rename(columns=rename)
+
+    if 'Check Status' in df.columns:
+        df = df[df['Check Status'].astype(str).str.strip().str.lower().str.contains('fail', na=False)]
+    if 'Check Type' in df.columns:
+        df = df[df['Check Type'].astype(str).str.strip().str.lower().str.contains('patch', na=False)]
+
+    if 'Asset Name' in df.columns:
+        df['_device_norm'] = df['Asset Name'].apply(normalize_device_name)
+    else:
+        df['_device_norm'] = ''
+
+    if 'Date/Time' in df.columns:
+        df['Date/Time'] = pd.to_datetime(df['Date/Time'], errors='coerce')
+
+    return df.reset_index(drop=True)
+
+
+def build_patch_check_failure_lookup(check_df: 'pd.DataFrame') -> dict:
+    """
+    One entry per device: most recent failing check occurrence, how many
+    times it appears in the export, and how long ago that most recent
+    failure was recorded.
+    """
+    result = {}
+    if check_df is None or check_df.empty or '_device_norm' not in check_df.columns:
+        return result
+
+    now = pd.Timestamp.now()
+    for device, grp in check_df.groupby('_device_norm'):
+        if not device:
+            continue
+        grp_sorted = grp.sort_values('Date/Time') if 'Date/Time' in grp.columns else grp
+        last_row   = grp_sorted.iloc[-1]
+        last_dt    = last_row.get('Date/Time') if 'Date/Time' in grp.columns else None
+        days_since = int((now - last_dt).days) if pd.notna(last_dt) else None
+        _raw_desc = last_row.get('Check Description', '') if 'Check Description' in grp.columns else ''
+        _desc = str(_raw_desc).strip() if pd.notna(_raw_desc) else ''
+        result[device] = {
+            'asset_name':        last_row.get('Asset Name', device),
+            'asset_type':        last_row.get('Asset Type', ''),
+            'customer':          last_row.get('Customer Name', ''),
+            'site':              last_row.get('Site Name', ''),
+            'check_type':        last_row.get('Check Type', ''),
+            'check_description': _desc or 'Patch status check failing',
+            'check_frequency':   last_row.get('Check Frequency', ''),
+            'last_failure':      last_dt,
+            'days_since':        days_since,
+            'failure_count':     len(grp),
+        }
+    return result
+
+# ==============================================================================
 # BROWSER AUDIT INTEGRATION
 # ==============================================================================
 

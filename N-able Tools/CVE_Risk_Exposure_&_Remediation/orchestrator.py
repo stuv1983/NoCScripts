@@ -26,6 +26,7 @@ from data_pipeline import (
     process_patch_match, load_previous_report, compute_trends,
     normalize_device_name, extract_cve_id, clean_sheet_name,
     load_patch_failure_report, build_patch_failure_lookup,
+    load_patch_check_report, build_patch_check_failure_lookup,
     load_browser_audit, merge_browser_audit_into_drift,
 )
 from diagnostics import compute_patch_diagnostics, classify_root_cause
@@ -37,7 +38,7 @@ from excel_builder import (
     build_product_sheets, build_stale_excluded_sheet,
     build_stale_cves_sheet,
     build_patch_sheets, build_diagnostics_sheets,
-    build_patch_failure_sheet,
+    build_patch_failure_sheet, build_patch_check_failure_sheet,
     build_products_not_tracked_sheet,
     # build_patch_resolved_sheet,   # commented out — large sheet, slow to write
     build_device_report_sheet,
@@ -108,6 +109,8 @@ class DashboardRequest:
     include_patch:        bool           = False
     failure_report_path:  Optional[str]  = None
     include_failure_report: bool         = False
+    patch_check_report_path: Optional[str] = None
+    include_patch_check_report: bool     = False
     browser_audit_path:   Optional[str]  = None
     include_browser_audit: bool          = False
     prev_report_path:     Optional[str]  = None
@@ -561,6 +564,68 @@ def run(request: DashboardRequest) -> DashboardResult:
                 log.warning("Could not process patch failure report: %s", exc)
                 warnings.append(f"Could not process patch failure report: {exc}")
 
+        # ── Patch Status Check failures (RMM agent-side monitoring check) ───────
+        # Distinct from the patch failure report above: this is about RMM's own
+        # 'Patch Status Check' failing to even report a result for a device —
+        # i.e. RMM can't confirm whether the device is patched at all. See
+        # data_pipeline.load_patch_check_report()'s docstring for the full
+        # distinction.
+        check_df           = None
+        check_lookup: dict  = {}
+        check_devices: set  = set()
+        check_active_names: set = set()   # normalised device names, active scope only
+        patch_check_active_df = pd.DataFrame()
+
+        if request.include_patch_check_report and request.patch_check_report_path:
+            try:
+                log.info("Loading patch status check report: %s", request.patch_check_report_path)
+                check_df      = load_patch_check_report(request.patch_check_report_path)
+                check_lookup  = build_patch_check_failure_lookup(check_df)
+                check_devices = set(check_lookup.keys())
+
+                # "Active" mirrors the scope Key Metrics uses everywhere else:
+                # not stale (already excluded from merged_df) and not 'Not
+                # Found in RMM'. A device that's both active and failing its
+                # patch status check is exactly the case worth surfacing.
+                if check_devices and 'Name' in merged_df.columns and 'Last Response' in merged_df.columns:
+                    _active_names_by_norm: dict = {}
+                    for raw_name in merged_df.loc[
+                        merged_df['Last Response'] != 'Not Found in RMM', 'Name'
+                    ].unique():
+                        _active_names_by_norm.setdefault(normalize_device_name(raw_name), raw_name)
+                    check_active_names = check_devices & set(_active_names_by_norm.keys())
+
+                    _rows = []
+                    for norm_name in sorted(
+                        check_active_names,
+                        key=lambda n: -(check_lookup[n]['days_since'] or 0)
+                    ):
+                        info   = check_lookup[norm_name]
+                        _dtype = ''
+                        if df_rmm is not None and 'Device_Join' in df_rmm.columns:
+                            _match = df_rmm[df_rmm['Device_Join'] == norm_name]
+                            if not _match.empty and 'Device Type' in _match.columns:
+                                _dtype = _match.iloc[0]['Device Type']
+                        _rows.append({
+                            'Device':            _active_names_by_norm.get(norm_name, info.get('asset_name', norm_name)),
+                            'Device Type':       _dtype or info.get('asset_type', ''),
+                            'Customer':          info.get('customer', ''),
+                            'Site':              info.get('site', ''),
+                            'Check Description': info.get('check_description', ''),
+                            'Last Failure':      info.get('last_failure'),
+                            'Days Since':        info.get('days_since'),
+                        })
+                    patch_check_active_df = pd.DataFrame(_rows)
+
+                if check_active_names:
+                    warnings.append(
+                        f"{len(check_active_names)} active device(s) have a failing patch status "
+                        f"check — RMM cannot confirm their patch status. See 'Patch Check Failures' sheet."
+                    )
+            except Exception as exc:
+                log.warning("Could not process patch status check report: %s", exc)
+                warnings.append(f"Could not process patch status check report: {exc}")
+
         log.info("Writing workbook: %s", request.output_path)
         with pd.ExcelWriter(request.output_path, engine='xlsxwriter') as writer:  # do NOT use constant_memory=True — corrupts data in xlsxwriter 3.x
             wb = writer.book
@@ -593,6 +658,8 @@ def run(request: DashboardRequest) -> DashboardResult:
                 health_score_threshold=health_score_threshold,
                 has_patch_report=patch_data is not None,
                 prev_report_name=prev_report_name,
+                patch_check_active_df=patch_check_active_df if not patch_check_active_df.empty else None,
+                patch_check_active_names=check_active_names,
             )
             if trend_data:
                 build_trend_summary_sheet(wb, trend_data, request.threshold,
@@ -707,6 +774,16 @@ def run(request: DashboardRequest) -> DashboardResult:
                         f"{cve_overlap['Name'].nunique()} device(s) where patches are "
                         f"actively failing — see 'Patch Failures' sheet"
                     )
+
+            if check_df is not None and check_lookup:
+                inventory_devices_chk = (
+                    set(df_rmm['Device_Join'].unique()) if df_rmm is not None else None
+                )
+                cve_overlap_chk = triage_df[
+                    triage_df['Name'].apply(normalize_device_name).isin(check_devices)
+                ].copy()
+                build_patch_check_failure_sheet(writer, check_df, check_lookup,
+                                                cve_overlap_chk, inventory_devices=inventory_devices_chk)
 
             # Raw Data sheet removed — CSV written below instead.
             if df_rmm is not None:
