@@ -647,6 +647,56 @@ Added optional ingestion of a browser audit export (per-device installed browser
 
 ---
 
+
+### v0.28 — Per-Sheet Health Subtotals (live score at any workbook size)
+**Files:** `product_sheets.py`, `summary_sheet.py`, `sheet_helpers.py`
+
+**Problem:** The Summary sheet's live Patching Health Score embedded one (or two) cross-sheet `COUNTIFS` per product sheet directly into every visible formula. With many product sheets the longest formula reached 23,000+ characters — far past Excel's 8,192-character stored-formula limit — so the score permanently fell back to static values and never updated when ☑/☐ were toggled.
+
+**Fix — total once per sheet, sum cell references:**
+- **Per-sheet subtotal block** — every product sheet (full triage *and* Patch Confirmed) now carries six hidden cells at a fixed address (labels col Q, values col R, rows 1–6): resolved ☑, unresolved ☐, resolved/unresolved CVSS ≥ 9, resolved/unresolved known-exploit. Each holds a short *local* `COUNTIF`/`COUNTIFS` over that sheet's own columns, with the generation-time count written as the cached value. Shared writer: `sheet_helpers.write_hs_subtotals` / `hs_subtotal_ref`.
+- **Summary fleet-total helper cells** — the six fleet totals (`'Sheet'!$R$1 + …`, one reference per sheet) are written into hidden cells `E5:E10` next to the existing `E4` score helper. Every visible formula (score, grade, coverage rates, points) references `$E$5..$E$10`, so it is constant-size regardless of sheet count. With 70 sheets the longest formula dropped from 23,472 to ~2,600 characters; the 8,192 guard is retained but would now only trip past roughly 200 max-length sheet names, and still degrades gracefully to static values.
+- **Resolution Status table converted too** — it built the same giant `COUNTIF` chains and had *no* length guard (a latent corrupt-workbook risk at ~180+ sheets). Its ☑/☐ totals now sum the same per-sheet subtotal cells via two hidden helper cells in col G beside the table, with an 8,192 guard and static fallback. Because this table is live even when the health score is disabled, the subtotal block is written unconditionally.
+- **Bonus correctness fix** — the old Summary-side formulas hard-coded `G:G` (Vulnerability Score) and `I:I` (Has Known Exploit) for every sheet, but Patch Confirmed sheets have no Score Lift column, so their columns sit one to the left — the live critical/exploit components were silently testing Risk Severity Index and CISA KEV on those sheets. Subtotal formulas are now built from each sheet's own column order, and sheet names containing apostrophes are escaped in references.
+
+Verified: 88/88 tests pass; a 70-product workbook recalculated in LibreOffice reproduces the Python-computed score and all six fleet totals exactly, and toggling ☐→☑ updates the resolved/unresolved totals live.
+
+---
+
+
+### v0.29 — Live Grade #NAME? Fix + Score-Box Hardening
+**Files:** `summary_sheet.py`
+
+**Problem:** With live health-score formulas now actually being written (v0.28), the grade box showed `#NAME?` in Excel. Root cause: the grade formula used `IFS()`, an Excel 2019+ "future function" — xlsxwriter writes the name verbatim, but Excel stores such functions internally as `_xlfn.IFS`, so a bare `IFS` fails name resolution. The bug predates v0.28; the permanent static-value fallback had masked it.
+
+**Fixes:**
+- **`IFS()` → nested `IF()`** — equivalent logic, compatible with every Excel and LibreOffice version.
+- **Grade box colour never updated** — the score/grade box conditional-format rules were numeric (`cell between 90,100`), which can never match the grade cell's *text* value ("A".."F"); the grade box stayed neutral dark blue forever. Rules are now formula-based on the live `$E$4` score, so both boxes recolour together.
+- **KEV grade caps missing from the live score** — `compute_patching_health_score` caps the score at 74 (KEV ≥ 3, or KEV > 0 with no patch report) / 89 (any KEV), but the live formula only subtracted penalties, so toggling ☑ could push the displayed live score/grade above the documented ceiling. The generation-time cap is now baked into the formula as `MIN(74|89, …)` — consistent with penalties, which are also fixed at generation.
+- **Merged formula cells carried cached 0** — `merge_range` cannot store a cached formula result, so readers that don't recalculate on open displayed 0 in the score/grade boxes. Now merges a blank and overwrites the top-left cell via `write_formula` with the correct cached result (the documented xlsxwriter pattern; verified to produce a single cell entry in the sheet XML). The old comment claiming this corrupts the workbook was wrong for this write order.
+- **Static-fallback boxes lost their grade colour** — the box format hard-coded neutral blue even in static mode (where no conditional formatting exists to recolour it). Static mode now uses the generation-time grade colour, as the adjacent comment always claimed.
+
+Verified: 88/88 tests pass; a 70-sheet workbook shows identical score/grade values whether read from cached results or fully recalculated in LibreOffice (score 54 / grade D both paths), and a KEV-bearing no-patch-report workbook writes `=MIN(74,…)`.
+
+---
+
+
+### v0.30 — Live KEV Grade-Cap & Penalty Lift
+**Files:** `summary_sheet.py`, `product_sheets.py`, `sheet_helpers.py`
+
+**Problem:** A workbook generated with unresolved CISA KEV CVEs and no patch report scored C (74/100) — correct at generation. But after the reader marked **every** row ☑, the live score still showed 74/C: the v0.29 KEV grade cap was baked in as a constant `MIN(74, …)`, and the −1/CVE KEV penalty was static, so neither could ever lift no matter what the reader resolved.
+
+**Fix — make the cap and KEV penalty conditional on a live unresolved-KEV count:**
+- **Seventh per-sheet subtotal** — each product sheet's hidden block (col R) gains `R7`: unresolved rows with CISA KEV = Yes, again using that sheet's own column position for the KEV column.
+- **Fleet cell `$E$11`** on Summary sums those refs — a live count of unresolved KEV rows across the workbook.
+- **Score formula** — the penalty term becomes `persist_pen + IF($E$11>0, kev_pen, 0)` and the cap becomes `MIN(IF($E$11>0, 74|89, 100), …)`. The cap *tier* (74 vs 89) stays a generation-time constant, but *whether* it applies is live.
+- **Exactness note** — the Python penalty counts unique KEV CVE *types*, which no in-sheet formula can deduplicate; but the boundary is exact: unresolved KEV rows = 0 ⇔ unresolved KEV types = 0. So the "everything is ☑" case lifts precisely; intermediate states keep the generation-time penalty (still documented as fixed). If the sheets lack a CISA KEV column, the live cell can't be trusted and the fixed cap/penalty is retained.
+- **KEV penalty display row is live too** — shows `=IF($E$11>0, −pts, 0)` so the −1 visibly clears alongside the score, with the label updated to "lifts when all KEV rows are ☑". The footnote now states the cap/penalty lift behaviour instead of claiming all penalties are fixed.
+
+Verified: 88/88 tests pass. A KEV-bearing, no-patch-report workbook recalculates to score 58 / grade D with cap and −2 penalty active while KEV rows remain ☐, and to score 100 / grade A with the penalty at 0 once every row is marked ☑.
+
+---
+
 ## Files Changed Per Release
 
 | Release | `main.py` | `orchestrator.py` | `data_pipeline.py` | `excel_builder.py` | `diagnostics.py` | `snapshot.py` | `run_dashboard.py` | `cve_lookup.py` |
