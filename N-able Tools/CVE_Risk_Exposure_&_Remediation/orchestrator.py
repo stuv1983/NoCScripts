@@ -24,6 +24,7 @@ from config import FIXED_VERSION_RULES
 from data_pipeline import (
     load_vulnerability_data, load_rmm_data, merge_data,
     process_patch_match, load_previous_report, compute_trends,
+    check_customer_consistency,
     normalize_device_name, extract_cve_id, clean_sheet_name,
     load_patch_failure_report, build_patch_failure_lookup,
     load_patch_check_report, build_patch_check_failure_lookup,
@@ -264,6 +265,13 @@ def run(request: DashboardRequest) -> DashboardResult:
             df_rmm = load_rmm_data(request.rmm_path)
             log.info("  %d devices loaded", len(df_rmm))
 
+            # Safety net: abort if the device report belongs to a
+            # different customer than the detections export.
+            check_customer_consistency({
+                'Detections export': df_vuln,
+                'Device report':     df_rmm,
+            })
+
         merged_df = merge_data(df_vuln, df_rmm, request.skip_rmm,
                                exclude_missing_rmm=request.exclude_missing_rmm)
         log.info("Merged dataset: %d rows", len(merged_df))
@@ -386,6 +394,13 @@ def run(request: DashboardRequest) -> DashboardResult:
             log.info("Loading previous report for trend: %s", request.prev_report_path)
             prev_df, prev_resolved_pairs, prev_source_type = load_previous_report(request.prev_report_path)
             prev_report_name = Path(request.prev_report_path).name
+
+            # Safety net: abort if the previous report belongs to a
+            # different customer than this run's detections export.
+            check_customer_consistency({
+                'Detections export (current)': df_vuln,
+                'Previous report':             prev_df,
+            })
             inventory_set    = (set(df_rmm['Device_Join'].unique())
                                 if df_rmm is not None else None)
 
