@@ -1139,9 +1139,6 @@ def enrich_config(cve_ids: Optional[list[str]] = None,
                 cve_repo_path=cve_repo_path,
             )
 
-    for cve_id in cve_ids:
-        cve_ids_upper = [c.strip().upper() for c in cve_ids]
-
     with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
         futures = {pool.submit(_lookup_one, c.strip().upper()): c
                    for c in cve_ids}

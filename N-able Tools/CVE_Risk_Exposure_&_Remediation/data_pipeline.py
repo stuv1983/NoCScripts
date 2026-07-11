@@ -140,7 +140,8 @@ def clean_sheet_name(name: str, used_names: Set[str]) -> str:
     clean = _SHEET_CHARS.sub('', str(name)).strip()[:31].strip()
     if not clean: clean = 'Unknown Product'
     final, counter = clean, 1
-    while final.lower() in {n.lower() for n in used_names}:
+    _used_lower = {n.lower() for n in used_names}
+    while final.lower() in _used_lower:
         suffix = f'_{counter}'
         final = clean[:31 - len(suffix)] + suffix
         counter += 1
@@ -243,6 +244,12 @@ def _extract_best_version(text) -> str:
     if not versions: return ''
     return sorted(versions, key=lambda v: (len(v.split('.')), [int(x) for x in v.split('.')]))[-1]
 
+try:
+    from packaging.version import Version as _PkgVersion
+except ImportError:
+    _PkgVersion = None
+
+
 def _parse_version(value) -> Optional[tuple]:
     """
     Parse a version string into a comparable tuple using packaging.version.
@@ -251,9 +258,8 @@ def _parse_version(value) -> Optional[tuple]:
     Returns None when no version can be parsed.
     """
     try:
-        from packaging.version import Version
         v = str(value).strip().lstrip('v')
-        return Version(v).release   # tuple of ints, e.g. (136, 0, 7103, 116)
+        return _PkgVersion(v).release   # tuple of ints, e.g. (136, 0, 7103, 116)
     except Exception:
         parts = _DIGITS_RE.findall(str(value).strip())
         return tuple(int(p) for p in parts) if parts else None
@@ -269,10 +275,9 @@ def _version_gte(left, right):
     comparison when packaging cannot parse either side.
     """
     try:
-        from packaging.version import Version, InvalidVersion
         lv = str(left).strip().lstrip('v')
         rv = str(right).strip().lstrip('v')
-        return Version(lv) >= Version(rv)
+        return _PkgVersion(lv) >= _PkgVersion(rv)
     except Exception:
         # Fall back to plain digit-tuple comparison (handles build-number-only strings)
         l, r = _parse_version(left), _parse_version(right)
@@ -1379,8 +1384,6 @@ def compute_trends(current_df, previous_df, threshold,
     cur  = current_df.copy()
     cur['_Name_Key'] = cur['Name'].apply(normalize_device_name)
     cur['_CVE_Key']  = cur['Vulnerability Name'].apply(extract_cve_id)
-
-    prev = previous_df.copy()
 
     cur_t  = _active_trend_scope(current_df,  threshold, inventory_devices, stale_devices,
                                   is_raw_export=False)

@@ -14,6 +14,8 @@ of this refactor's scope.
 
 Author : Stu Villanti <s.villanti@kenstra.com>
 """
+from typing import Optional
+
 import pandas as pd
 
 def build_diagnostics_sheets(writer, diagnostics: dict) -> None:
