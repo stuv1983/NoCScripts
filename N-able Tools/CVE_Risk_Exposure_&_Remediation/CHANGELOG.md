@@ -4,18 +4,41 @@
 
 ## Architecture Overview
 
-The tool consists of six core modules that work together in a strict pipeline:
+The tool is organised into three tiers: pipeline control, data & enrichment, and Excel sheet builders. Nineteen modules in total.
+
+**Pipeline & entrypoints**
 
 | Module | Role |
 |---|---|
-| `main.py` | Tkinter GUI — collects inputs, spawns background thread |
-| `orchestrator.py` | Controller — coordinates all modules, owns execution flow |
+| `main.py` | CustomTkinter GUI — collects inputs, spawns background thread, streams progress |
+| `run_dashboard.py` | Command-line entrypoint — same pipeline as the GUI without launching Tk |
+| `orchestrator.py` | Pipeline coordinator — receives a `DashboardRequest`, runs the pipeline, writes the workbook |
+| `config.py` | Loads `config.json` (product map, version rules, cvss cache) and exposes shared constants |
+
+**Data & enrichment (no GUI, no xlsxwriter)**
+
+| Module | Role |
+|---|---|
 | `data_pipeline.py` | Data engine — load, merge, patch-match, trend arithmetic |
-| `excel_builder.py` | Report writer — all Excel sheet construction and formatting |
-| `diagnostics.py` | Root-cause classification — patch lag, version drift, mismatches |
-| `snapshot.py` | History — lightweight JSON snapshots for trend tracking |
+| `resolution.py` | Single source of truth for "is this CVE/device row resolved?" — shared by every consumer |
+| `diagnostics.py` | Root-cause classification — patch lag, version drift, detection mismatches |
+| `snapshot.py` | History — lightweight JSON snapshots for month-over-month trend tracking |
 | `cve_lookup.py` | CVE enrichment — NVD / CVE.org / OSV / cvelistV5 lookups |
-| `version_sync.py` | Baseline sync — fetches rolling baselines from vendor APIs |
+| `version_sync.py` | Baseline sync — fetches rolling stable versions from vendor APIs |
+
+**Excel sheet builders (no pandas loading, no GUI — DataFrames in, sheets out)**
+
+| Module | Role |
+|---|---|
+| `excel_builder.py` | Workbook writer — top-level `build_report()`, coordinates all sheet builders |
+| `summary_sheet.py` | Summary sheet — Patching Health Score, Key Metrics, Resolution Status, Device Breakdown, Top At-Risk Devices, Month-over-Month Remediation |
+| `product_sheets.py` | Per-product ☑/☐ triage tabs plus the "Patch Confirmed" variant |
+| `trend_sheets.py` | Trend Summary, New This Month, Persisting CVEs, Resolved Since Previous Report |
+| `device_sheets.py` | All Detections, Stale Excluded Devices, CVEs on Stale Devices, Device Inventory, Raw Data |
+| `patch_sheets.py` | Patch Evidence Notes, Patch Lag, Version Drift, Patch Failures, Products Not in Patch Scope |
+| `formatting.py` | Named colour palette and shared xlsxwriter format factories |
+| `sheet_helpers.py` | Small xlsxwriter writing helpers (CVE/NVD links, health-score subtotal block) shared across sheet builders |
+| `sheet_names.py` | Reserved sheet names — imported by both `orchestrator.py` and `data_pipeline.py` to keep name collisions impossible |
 
 ---
 
