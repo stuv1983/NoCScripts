@@ -197,12 +197,15 @@ def build_stale_cves_sheet(writer, df, link_fmt, not_in_rmm_cves_df=None) -> Non
     for ci, h in enumerate(headers):
         ws.write(0, ci, h, hdr_fmt)
 
-    # Data rows
+    # Data rows — look up 'Reason' by its actual column position rather than
+    # row[-1], which silently reads the wrong value if a column is ever
+    # appended after Reason.
+    _reason_idx = cl.index('Reason') if 'Reason' in cl else None
     for ri, row in enumerate(combined.itertuples(index=False), start=1):
-        _reason = str(row[-1]) if hasattr(row, '_fields') else ''
+        row_vals = list(row)
+        _reason  = str(row_vals[_reason_idx]) if _reason_idx is not None else ''
         _is_nirm = 'Not Found' in _reason
         _rfmt  = row_nirm  if _is_nirm else row_stale
-        row_vals = list(row)
         for ci, col_nm in enumerate(headers):
             _ci_src = cl.index(col_nm) if col_nm in cl else None
             val = row_vals[_ci_src] if _ci_src is not None else ''

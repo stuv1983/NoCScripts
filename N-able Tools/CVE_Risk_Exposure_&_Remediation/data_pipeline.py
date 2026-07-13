@@ -7,6 +7,7 @@ Author : Stu Villanti <s.villanti@kenstra.com>
 
 import logging
 import os
+from pathlib import Path
 import re
 from typing import Optional, Set
 
@@ -231,16 +232,16 @@ def parse_last_response(val):
     epoch = pd.to_datetime('1900-01-01')
     if val in ['Not Found in RMM', 'N/A', '']: return epoch
     try: return pd.to_datetime(val)
-    except Exception: pass
+    except (ValueError, TypeError): pass
     if val.startswith('overdue_'):
         try: return pd.to_datetime(val.replace('overdue_', '').split(' -')[0])
-        except Exception: pass
+        except (ValueError, TypeError): pass
     if 'days' in val or 'hrs' in val:
         try:
             m = _DIGITS_RE.search(val)
             days = int(m.group(0)) if m else 0
             return pd.Timestamp.now() - pd.Timedelta(days=days)
-        except Exception: pass
+        except (ValueError, TypeError, AttributeError): pass
     return epoch
 
 
@@ -529,6 +530,80 @@ def load_vulnerability_data(file_path: str) -> pd.DataFrame:
     _downcast_low_cardinality(df, _CAT_COLS_VULN)
 
     return df
+
+# ── Customer consistency safety net ──────────────────────────────────────────
+# Column-name candidates, checked in priority order. Detections exports are
+# normalised to 'Customer' by load_vulnerability_data / load_previous_report;
+# the device report keeps its raw header, typically 'Customer Name'.
+_CUSTOMER_COL_CANDIDATES = ('Customer', 'Customer Name', 'Client', 'Client Name',
+                            'Account Name')
+
+
+def _extract_customers(df) -> dict:
+    """
+    Return {casefolded_name: original_name} for every distinct, non-blank
+    customer value in the first recognisable customer column of df.
+    Returns {} when df is None/empty or has no usable customer column.
+    """
+    if df is None or len(df) == 0:
+        return {}
+    col_lower = {str(c).strip().lower(): c for c in df.columns}
+    for want in _CUSTOMER_COL_CANDIDATES:
+        col = col_lower.get(want.lower())
+        if col is None:
+            continue
+        vals = df[col].dropna().astype(str).str.strip()
+        vals = vals[(vals != '') & (~vals.str.lower().isin(('nan', 'none', 'n/a')))]
+        if vals.empty:
+            continue
+        out: dict = {}
+        for v in vals.unique():
+            out.setdefault(v.casefold(), v)
+        return out
+    return {}
+
+
+def check_customer_consistency(named_frames: dict) -> None:
+    """
+    Safety net: ensure every input file belongs to the same customer, so a
+    device report or previous report from a different client can never be
+    silently merged into this customer's dashboard.
+
+    named_frames maps a human-readable file label (e.g. 'Detections export',
+    'Device report', 'Previous report') to its loaded DataFrame (or None).
+    Files with no recognisable customer column, or only blank values, are
+    skipped -- they cannot be checked. Comparison is case- and
+    whitespace-insensitive.
+
+    Raises ValueError listing each file's customer(s) when they disagree
+    (this also fires if a single file contains more than one customer).
+
+    Deliberately NOT applied to the advanced-option inputs (patch report,
+    patch failure report, patch check report) -- those exports frequently
+    lack a reliable customer column.
+    """
+    per_file = {label: _extract_customers(df) for label, df in named_frames.items()}
+    per_file = {label: cust for label, cust in per_file.items() if cust}
+    if len(per_file) < 2 and sum(len(c) for c in per_file.values()) <= 1:
+        return
+
+    union: dict = {}
+    for cust in per_file.values():
+        union.update(cust)
+    if len(union) <= 1:
+        return
+
+    detail = '\n'.join(
+        f"  - {label}: {', '.join(sorted(cust.values()))}"
+        for label, cust in per_file.items()
+    )
+    raise ValueError(
+        "Customer mismatch between input files:\n"
+        f"{detail}\n\n"
+        "All files must be exports for the same customer.\n"
+        "Run aborted to prevent mixing data between customers."
+    )
+
 
 def load_rmm_data(file_path):
     df        = load_data(file_path)
@@ -1090,20 +1165,20 @@ def load_previous_report(file_path):
             # Wrap in a minimal object so the rest of the function can share
             # the same rename + validation logic via the Path B code below.
             xl     = None
-            fname  = os.path.basename(file_path)
+            fname  = Path(file_path).name
         else:
             xl = pd.ExcelFile(file_path, engine=_XLSX_ENGINE)
     except PermissionError:
-        fname = os.path.basename(file_path)
+        fname = Path(file_path).name
         raise ValueError(f"'{fname}' is currently open in Excel.\n\nPlease close the file in Excel and try again.")
     except FileNotFoundError:
-        fname = os.path.basename(file_path)
+        fname = Path(file_path).name
         raise ValueError(f"'{fname}' could not be found.\n\nPlease check the file path and try again.")
     except Exception as e:
-        fname = os.path.basename(file_path)
+        fname = Path(file_path).name
         raise ValueError(f"Could not open '{fname}'.\n\nDetails: {e}")
 
-    fname = os.path.basename(file_path)
+    fname = Path(file_path).name
 
     # CSV files go straight to Path B (raw export) — no sheet detection needed
     if _is_csv:

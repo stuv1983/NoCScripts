@@ -347,12 +347,14 @@ class TestHealthScoreScope:
             f"TestOffice (no product sheet) was silently excluded from the health scope."
         )
 
-    def test_health_score_is_static_when_hidden_products_exist(self, wb_formulas):
+    def test_health_score_is_live_with_offsheet_constants(self, wb_formulas):
         """
-        TestOffice has no dedicated sheet, so a live COUNTIF formula has
-        nothing to reference for it. The final score cell must be a plain
-        static value, not a formula — otherwise the score would silently
-        drop TestOffice the moment Excel recalculates it.
+        TestOffice has no dedicated sheet, but its rows have no checkboxes
+        either — their state is frozen at generation. The score must stay
+        LIVE, with TestOffice's counts folded into the hidden fleet-sum
+        helper cells (E5 = Σ resolved, E6 = Σ unresolved) as plain numeric
+        constants, so the live score equals the Python score exactly while
+        every toggleable row still flows through.
         """
         ws = wb_formulas['Summary']
         score_row = None
@@ -363,18 +365,41 @@ class TestHealthScoreScope:
                 break
         assert score_row is not None, "Final Health Score row not found"
         cell = ws.cell(row=score_row, column=3)
-        assert not (isinstance(cell.value, str) and cell.value.startswith('=')), (
-            "Health Score cell is a live formula, but TestOffice has no product "
-            "sheet for a COUNTIF to reference — it should be static."
+        assert isinstance(cell.value, str) and cell.value.startswith('='), (
+            "Health Score cell should be a live formula — TestOffice's "
+            "checkbox-less rows are carried as constants, not a reason to "
+            "fall back to a static score."
         )
-        assert isinstance(cell.value, (int, float))
+        # E5/E6 (rows 5-6, col E) hold the fleet sums; each must end in a
+        # numeric constant carrying TestOffice's 1 resolved / 1 unresolved row.
+        f_res   = ws.cell(row=5, column=5).value
+        f_unres = ws.cell(row=6, column=5).value
+        assert isinstance(f_res, str) and f_res.rstrip().endswith('+ 1'), (
+            f"E5 fleet resolved sum should end with the off-sheet constant '+ 1', got: {f_res!r}"
+        )
+        assert isinstance(f_unres, str) and f_unres.rstrip().endswith('+ 1'), (
+            f"E6 fleet unresolved sum should end with the off-sheet constant '+ 1', got: {f_unres!r}"
+        )
 
-    def test_footnote_does_not_claim_live_when_score_is_static(self, wb_values):
+    def test_health_score_cached_totals_match_python_scope(self, wb_values):
         """
-        The footnote's "⚡ Blue cells update automatically..." claim must be
-        absent whenever the score is static (see previous test) — otherwise
-        a reader could toggle a checkbox expecting the score to follow,
-        when it silently won't for the hidden-product component.
+        The cached values of the fleet-sum helper cells (what a data_only
+        reader sees before Excel recalculates) must equal the full health
+        scope: 3 resolved / 3 unresolved across all three products —
+        including TestOffice's off-sheet rows.
+        """
+        ws = wb_values['Summary']
+        assert ws.cell(row=5, column=5).value == EXPECTED['health_scope_resolved_rows']
+        assert ws.cell(row=6, column=5).value == (
+            EXPECTED['health_scope_total_rows'] - EXPECTED['health_scope_resolved_rows']
+        )
+
+    def test_footnote_claims_live_when_score_is_live(self, wb_values):
+        """
+        Inverse of the old static-footnote check: the score IS live now
+        (off-sheet rows carried as constants), so the footnote's
+        "⚡ Blue cells update automatically..." claim must be present —
+        a reader toggling ☑/☐ should be told the score will follow.
         """
         ws = wb_values['Summary']
         footnote_text = ''
@@ -384,7 +409,7 @@ class TestHealthScoreScope:
                 footnote_text = str(v)
                 break
         assert footnote_text, "Health Score footnote row not found"
-        assert 'update automatically' not in footnote_text.lower(), (
-            "Footnote claims cells update automatically, but the score is static "
-            "(TestOffice has no product sheet for a live formula to reference)."
+        assert 'update automatically' in footnote_text.lower(), (
+            "Score is live, but the footnote no longer tells the reader that "
+            "blue cells update automatically."
         )

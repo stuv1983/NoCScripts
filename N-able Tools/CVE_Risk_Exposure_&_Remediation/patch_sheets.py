@@ -285,10 +285,13 @@ def build_products_not_tracked_sheet(writer,
     ws.set_column('E:E', 14)
     ws.set_column('F:F', 45)
 
-    for i, row in enumerate(out.itertuples(), start=1):
-        n = row._2
+    # Name-based access (not itertuples positional row._2 / row._6) — the
+    # positional form silently reads the wrong column if the column order
+    # above ever changes.
+    for i, row in enumerate(out.to_dict('records'), start=1):
+        n = row['Devices Affected']
         ws.set_row(i, None, red if n >= 10 else amb)
-        ws.write(i, 5, row._6, code_fmt)
+        ws.write(i, 5, row['Suggested config.json entry'], code_fmt)
 
     note_row = len(out) + 2
     ws.merge_range(note_row, 0, note_row, 5,
@@ -428,9 +431,14 @@ def build_patch_failure_sheet(writer, failure_df: 'pd.DataFrame',
         ws2.set_column('G:G', 20); ws2.set_column('H:H', 55)
         ws2.set_row(0, None, hdr_red)
 
-        # Colour rows by failure severity
-        for i, row in enumerate(overlap.itertuples(index=False), start=1):
-            fc = getattr(row, 'Total_Device_Failures', 0) or 0
+        # Colour rows by failure severity.
+        # NOTE: read the column directly, NOT getattr(itertuples_row,
+        # 'Total_Device_Failures') — namedtuple fields can't contain spaces,
+        # so pandas renamed the field positionally and getattr always
+        # returned the 0 default, painting every row green regardless of
+        # failure count.
+        _fail_counts = pd.to_numeric(overlap['Total Device Failures'], errors='coerce').fillna(0)
+        for i, fc in enumerate(_fail_counts, start=1):
             ws2.set_row(i, None, red if fc >= 20 else amb if fc >= 5 else grn)
 
         ws2.write(len(overlap) + 2, 0,

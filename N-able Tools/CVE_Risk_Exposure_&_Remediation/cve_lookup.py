@@ -109,6 +109,33 @@ def _get_session() -> requests.Session:
     return session
 
 
+def _atomic_write_json(path, data) -> None:
+    """
+    Write JSON via a temp file in the same directory + os.replace.
+
+    config.json is BOTH the hand-maintained product/rules config AND the
+    on-disk cache this module writes to — a plain open('w') + json.dump that
+    gets interrupted (process killed, machine sleep, or a concurrent
+    `python cve_lookup.py` run alongside a GUI run) truncates the file, and
+    config.py hard-raises on malformed JSON, bricking the whole tool until
+    the file is restored. os.replace() is atomic on the same filesystem, so
+    readers always see either the old or the new complete file.
+    """
+    import tempfile
+    path = Path(path)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name, suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+            json.dump(data, fh, indent=2)
+        os.replace(tmp, str(path))
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _mask_key(value: str) -> str:
     """Return a safe display form for secrets, e.g. ****ABCD."""
     value = str(value or '').strip()
@@ -1209,8 +1236,7 @@ def enrich_config(cve_ids: Optional[list[str]] = None,
                     config_dirty = True
 
     if config_dirty and not dry_run:
-        with open(config_path, 'w', encoding='utf-8') as fh:
-            json.dump(cfg, fh, indent=2)
+        _atomic_write_json(config_path, cfg)
         n_results      = len(results)
         added_products = len(cfg.get('product_map', [])) - before_product_map_count
         log.info(
@@ -1314,8 +1340,7 @@ def fetch_cisa_kev_catalog(config_path: Optional[str] = None,
             'cve_ids':          sorted(cve_ids),
             'catalog_version':  data.get('catalogVersion', '') if isinstance(data, dict) else '',
         }
-        with open(config_path, 'w', encoding='utf-8') as fh:
-            json.dump(cfg_fresh, fh, indent=2)
+        _atomic_write_json(config_path, cfg_fresh)
     except Exception as exc:
         log.debug("cve_lookup: could not write CISA KEV cache: %s", exc)
 
@@ -1459,8 +1484,7 @@ def enrich_from_detections(cve_df: 'pd.DataFrame',
                     for _cve in _pre_no_data:
                         _ndc[_cve] = _dt.datetime.utcnow().strftime('%Y-%m-%d')
                     _cfg_nd['cve_no_data_cache'] = _ndc
-                    with open(config_path, 'w', encoding='utf-8') as _fh2:
-                        json.dump(_cfg_nd, _fh2, indent=2)
+                    _atomic_write_json(config_path, _cfg_nd)
                     log.info(
                         "cve_lookup: pre-screened %d CVE(s) — local repo has no version data, "
                         "cached as no-data (skipping NVD/OSV)",
@@ -1504,8 +1528,7 @@ def enrich_from_detections(cve_df: 'pd.DataFrame',
                             _added += 1
                 if _added:
                     _cfg2['cvss_score_cache'] = _csc
-                    with open(config_path, 'w', encoding='utf-8') as _fh:
-                        json.dump(_cfg2, _fh, indent=2)
+                    _atomic_write_json(config_path, _cfg2)
                     log.info('cve_lookup: CVSS pre-pass populated %d score(s) from local repo',
                              _added)
                 else:

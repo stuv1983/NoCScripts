@@ -20,9 +20,9 @@ import pandas as pd
 
 from config import CVE_PATTERN
 from data_pipeline import (
-    normalize_device_name, extract_cve_id,
+    normalize_device_name, extract_cve_id, get_col_letter,
 )
-from formatting import get_workbook_styles, build_legend_entries
+from formatting import get_workbook_styles, build_legend_entries, COLORS
 from resolution import (
     split_patch_pairs as _split_patch_pairs,
     get_sheet_product_key as _get_sheet_pk,
@@ -31,6 +31,7 @@ from resolution import (
     dedup_per_base_product as _dedup_per_base_product,
 )
 from sheet_helpers import write_nvd_links as _write_nvd_links
+from sheet_helpers import write_hs_subtotals as _write_hs_subtotals
 
 import logging
 log = logging.getLogger(__name__)
@@ -84,6 +85,48 @@ def compute_score_lift(
         lift += 0.5
 
     return round(lift, 2)
+
+def _hs_subtotal_counts(df: 'pd.DataFrame', all_resolved: bool = False) -> dict:
+    """
+    Generation-time values for the seven per-sheet health-score subtotals
+    (cached results for the local formulas written by write_hs_subtotals,
+    so openpyxl/pandas data_only readers see correct numbers).
+
+    all_resolved=True is used by Patch Confirmed sheets, where the builder
+    writes \u2611 into every row regardless of the DataFrame's own Resolved
+    values.
+    """
+    n = len(df)
+    _yes = {'yes', 'true', '1', 'y'}
+    if all_resolved or 'Resolved' not in df.columns:
+        res_mask = pd.Series([bool(all_resolved)] * n, index=df.index)
+    else:
+        res_mask = df['Resolved'].astype(str).str.strip() == '\u2611'
+    unres_mask = ~res_mask
+
+    if 'Vulnerability Score' in df.columns:
+        crit_mask = pd.to_numeric(df['Vulnerability Score'], errors='coerce') >= 9.0
+    else:
+        crit_mask = pd.Series([False] * n, index=df.index)
+    if 'Has Known Exploit' in df.columns:
+        exp_mask = df['Has Known Exploit'].astype(str).str.strip().str.lower().isin(_yes)
+    else:
+        exp_mask = pd.Series([False] * n, index=df.index)
+    if 'CISA KEV' in df.columns:
+        kev_mask = df['CISA KEV'].astype(str).str.strip().str.lower().isin(_yes)
+    else:
+        kev_mask = pd.Series([False] * n, index=df.index)
+
+    return {
+        'res':        int(res_mask.sum()),
+        'unres':      int(unres_mask.sum()),
+        'crit_res':   int((crit_mask & res_mask).sum()),
+        'crit_unres': int((crit_mask & unres_mask).sum()),
+        'exp_res':    int((exp_mask & res_mask).sum()),
+        'exp_unres':  int((exp_mask & unres_mask).sum()),
+        'kev_unres':  int((kev_mask & unres_mask).sum()),
+    }
+
 
 def _build_patch_confirmed_sheet(writer, sheet_name: str, product: str,
                                   out_df: 'pd.DataFrame', col_names: list) -> None:
@@ -165,6 +208,15 @@ def _build_patch_confirmed_sheet(writer, sheet_name: str, product: str,
                 ws.write(ri, ci, val if val is not None else '', grn_fmt)
 
     n_data = len(out_df)
+
+    # ── Health/resolution subtotal block (hidden cols Q/R, rows 1-7) ──────────
+    # Same fixed-location block the full triage sheets carry, so the Summary
+    # sheet's live formulas can sum one cell per sheet uniformly.  Built from
+    # THIS sheet's column order — confirmed sheets have no Score Lift column,
+    # so Vulnerability Score / Has Known Exploit sit one column left of a full
+    # triage sheet's layout.  all_resolved=True: every data row is written ☑.
+    _write_hs_subtotals(ws, wb, col_names,
+                        _hs_subtotal_counts(out_df, all_resolved=True))
 
     # Column widths (mirrors full triage sheet)
     _widths = {
@@ -494,6 +546,7 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
         if 'Device Type'        in cl: ws.set_column(cl.index('Device Type'),        cl.index('Device Type'),        15)
         if 'Baseline Compliance' in cl: ws.set_column(cl.index('Baseline Compliance'), cl.index('Baseline Compliance'), 22)
         if _vs_idx is not None:
+            _vs_col = get_col_letter(_vs_idx)
             ws.set_column(_vs_idx, _vs_idx, 8)
             # CVSS score colour coding — matches the Risk Rating matrix exactly:
             # Critical 9.0-10.0 = red, High 7.0-8.9 = gold, Medium 4.0-6.9 = yellow,
@@ -519,6 +572,15 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
             ws.conditional_format(1, _vs_idx, _last, _vs_idx, {
                 'type': 'cell', 'criteria': 'between', 'minimum': 0.1, 'maximum': 3.9,
                 'format': _low_fmt})
+
+        # ── Health/resolution subtotal block (hidden cols Q/R, rows 1-7) ───────
+        # Totals this sheet's ☑/☐ counts once, locally, so the Summary sheet's
+        # live formulas (Resolution Status table always; Patching Health Score
+        # when enabled) can reference ONE cell per sheet instead of embedding a
+        # COUNTIFS per sheet — which blew past Excel's 8,192-char formula limit
+        # on workbooks with many product sheets. Written unconditionally: the
+        # Resolution Status table is live regardless of include_health_score.
+        _write_hs_subtotals(ws, wb_, final_cols, _hs_subtotal_counts(group))
 
         legend_row = len(group) + 3
         l_title = wb_.add_format({'bold': True, 'font_size': 9, 'bg_color': '#F2F2F2', 'border': 1})

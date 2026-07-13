@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import tempfile
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -29,6 +31,22 @@ from pathlib import Path
 from typing import Callable, Optional
 
 log = logging.getLogger(__name__)
+
+
+def _atomic_write_json(path, data) -> None:
+    """Write JSON via a temp file + os.replace so a crash or concurrent run
+    can never leave config.json truncated — a malformed config.json hard-fails
+    the entire tool at import (see config.py)."""
+    path = Path(path)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name, suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+            json.dump(data, fh, indent=2)
+        os.replace(tmp, str(path))
+    except Exception:
+        try: os.unlink(tmp)
+        except OSError: pass
+        raise
 
 _UA = 'Mozilla/5.0 N-able-CVE-Dashboard/1.0 (automated; contact s.villanti@kenstra.com)'
 _TIMEOUT = 10  # seconds
@@ -150,6 +168,11 @@ def sync_baselines(config_path: Optional[str] = None,
         if product not in fvr:
             skipped.append(product)
             continue
+        if not isinstance(fvr[product], dict):
+            # Malformed rules value — the orchestrator's config health check
+            # only warns about these; don't crash the sync on .get() below.
+            log.warning("version_sync: fixed_version_rules[%r] is not an object — skipping", product)
+            continue
 
         log.info("version_sync: fetching %s ...", product)
         new_version = fetcher()
@@ -158,15 +181,27 @@ def sync_baselines(config_path: Optional[str] = None,
             log.warning("version_sync: could not fetch %s — baseline unchanged", product)
             continue
 
-        old_version = fvr[product].get('_baseline', '(not set)')
+        old_version = fvr[product].get('_baseline', '')
+
+        # Never move a baseline backwards: if a vendor API hiccups and returns
+        # an older release than what's already recorded, keep the current one.
+        try:
+            from data_pipeline import _version_gte
+            if old_version and _version_gte(old_version, new_version) is True \
+                    and old_version != new_version:
+                log.warning("version_sync: %s fetched %s but current baseline %s is newer — keeping current",
+                            product, new_version, old_version)
+                continue
+        except Exception:
+            pass  # comparison failure → fall through and accept the fetched value
+
         fvr[product]['_baseline'] = new_version
         updated[product] = new_version
-        log.info("version_sync: %-10s  %s  →  %s", product, old_version, new_version)
+        log.info("version_sync: %-10s  %s  →  %s", product, old_version or '(not set)', new_version)
 
     if updated and not dry_run:
         cfg['fixed_version_rules'] = fvr
-        with open(config_path, 'w', encoding='utf-8') as fh:
-            json.dump(cfg, fh, indent=2)
+        _atomic_write_json(config_path, cfg)
         log.info("version_sync: config.json updated (%d product(s))", len(updated))
     elif dry_run:
         log.info("version_sync: dry run — no changes written")

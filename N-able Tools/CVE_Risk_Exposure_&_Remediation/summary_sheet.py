@@ -15,6 +15,8 @@ import logging
 
 import pandas as pd
 
+from sheet_helpers import hs_subtotal_ref as _hs_ref
+
 log = logging.getLogger(__name__)
 
 def compute_patching_health_score(
@@ -288,7 +290,9 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     # confirmed resolved by a --patch report but not yet reflected in
     # N-able's own scan would count as unresolved there while correctly
     # showing ☑ everywhere else in the workbook.
-    from resolution import (split_patch_pairs as _split_patch_pairs_sum,
+    from resolution import (get_sheet_product_key as _get_sheet_pk_sum,
+                            split_patch_pairs as _split_patch_pairs_sum,
+                            compute_resolved_flags as _compute_flags_sum,
                             compute_resolved_series as _compute_resolved_series_shared)
     _p2s_sum   = product_to_sheet or {}
     _patch_2d_sum, _patch_3d_sum = _split_patch_pairs_sum(patch_resolved_pairs)
@@ -551,122 +555,215 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         _hs_live = bool(_p2s_hs_vals)
 
         # health_triage_df is deliberately broader than the report's own
-        # threshold (e.g. CVSS ≥ 7.0 even when the report itself is ≥ 9.0),
-        # so _score_scope can legitimately contain a Base Product with no
-        # entry in product_to_sheet at all — no dedicated sheet, no ☑/☐
-        # column, nothing a COUNTIF formula could reference. The Python-side
-        # score (_phs, above) already accounts for these "hidden" products
-        # correctly via compute_resolved_series(). But a LIVE formula only
-        # ever sums COUNTIFs over _p2s_hs_vals (existing sheets) — so if we
-        # built one anyway, it would silently drop those products' rows the
-        # moment Excel recalculates (e.g. the reader toggles any unrelated
-        # checkbox), producing a number that visibly disagrees with the
-        # correct one this workbook was generated with. Rather than ship a
-        # formula that can drift wrong on first interaction, fall back to
-        # the same static-value path already used when a formula is too
-        # long for Excel's limit.
-        if _hs_live and 'Base Product' in _score_scope.columns:
-            _hs_hidden_products = set(_score_scope['Base Product'].unique()) - set((product_to_sheet or {}).keys())
-            if _hs_hidden_products:
+        # threshold (CVSS ≥ 7.0 even when the report itself is ≥ 9.0), so
+        # _score_scope can contain rows that exist on NO product sheet:
+        #   (a) whole products with nothing at the report threshold — no
+        #       sheet, no entry in product_to_sheet at all; and
+        #   (b) 7.0–8.9 rows of products that DO have a sheet, because
+        #       product sheets are built from triage_df at the report's own
+        #       threshold, not the health scope.
+        # None of these rows has a ☑/☐ checkbox, so their resolved state can
+        # never change inside Excel — it is frozen at generation time. So
+        # rather than disabling live scoring (the old behaviour), their
+        # generation-time counts are folded into the fleet sums as plain
+        # numeric constants. The live score then equals the Python score
+        # exactly at generation, and stays live for every row the reader can
+        # actually toggle.
+        #
+        # The one case constants can NOT fix is the reverse direction: a
+        # report threshold BELOW the health scope (e.g. 1.0) puts sub-7.0
+        # rows — with toggleable checkboxes — onto the sheets, and the
+        # per-sheet subtotal cells would count them into the health score as
+        # they're toggled. Live scoring stays disabled there.
+        _hs_residual = {'res': 0, 'unres': 0, 'crit_res': 0,
+                        'crit_unres': 0, 'exp_res': 0, 'exp_unres': 0,
+                        'kev_unres': 0}
+        _hs_key_cols = ['Base Product', 'Name', 'Vulnerability Name']
+        if _hs_live and threshold < _score_scope_threshold:
+            log.info(
+                "Patching Health Score live formulas disabled: report threshold %.1f is "
+                "below the health-score scope (CVSS ≥ %.1f), so product sheets "
+                "contain toggleable rows outside the score's scope. Static score values "
+                "will be written instead.",
+                threshold, _score_scope_threshold,
+            )
+            _hs_live = False
+        elif _hs_live and not all(c in _score_scope.columns for c in _hs_key_cols):
+            log.info(
+                "Patching Health Score live formulas disabled: health scope is missing "
+                "one of %s, so off-sheet rows can't be matched. Static score values "
+                "will be written instead.", _hs_key_cols,
+            )
+            _hs_live = False
+        elif _hs_live:
+            # Rows present on a product sheet = triage_dedup rows for products
+            # that have a sheet (product sheets dedup by Name + Vulnerability
+            # Name per product, which is exactly how triage_dedup is built).
+            _on_sheet = triage_dedup[triage_dedup['Base Product'].isin(set((product_to_sheet or {}).keys()))] \
+                if 'Base Product' in triage_dedup.columns else triage_dedup.iloc[0:0]
+            _sheet_idx = pd.MultiIndex.from_frame(_on_sheet[_hs_key_cols].astype(str)) \
+                if not _on_sheet.empty else pd.MultiIndex.from_arrays([[], [], []], names=_hs_key_cols)
+            _off_mask = ~pd.MultiIndex.from_frame(_score_scope[_hs_key_cols].astype(str)).isin(_sheet_idx)
+            _off_mask = pd.Series(_off_mask, index=_score_scope.index)
+            if _off_mask.any():
+                if 'Vulnerability Score' in _score_scope.columns:
+                    _hcm = pd.to_numeric(_score_scope['Vulnerability Score'], errors='coerce') >= 9.0
+                else:
+                    _hcm = pd.Series(False, index=_score_scope.index)
+                if 'Has Known Exploit' in _score_scope.columns:
+                    _hem = _score_scope['Has Known Exploit'].astype(str).str.strip().str.lower().isin(
+                        ['yes', 'true', '1', 'y'])
+                else:
+                    _hem = pd.Series(False, index=_score_scope.index)
+                if 'CISA KEV' in _score_scope.columns:
+                    _hkm = _score_scope['CISA KEV'].astype(str).str.strip().str.lower().isin(
+                        ['yes', 'true', '1', 'y'])
+                else:
+                    _hkm = pd.Series(False, index=_score_scope.index)
+                _hs_residual = {
+                    'res':        int((_off_mask & _hs_is_res).sum()),
+                    'unres':      int((_off_mask & _hs_is_unr).sum()),
+                    'crit_res':   int((_off_mask & _hcm & _hs_is_res).sum()),
+                    'crit_unres': int((_off_mask & _hcm & _hs_is_unr).sum()),
+                    'exp_res':    int((_off_mask & _hem & _hs_is_res).sum()),
+                    'exp_unres':  int((_off_mask & _hem & _hs_is_unr).sum()),
+                    # Off-sheet unresolved KEV rows can never be ticked, so if
+                    # any exist the live KEV cell $E$11 correctly never reaches
+                    # 0 and the grade cap/penalty correctly never lift.
+                    'kev_unres':  int((_off_mask & _hkm & _hs_is_unr).sum()),
+                }
                 log.info(
-                    "Patching Health Score live formulas disabled: %d product(s) in the "
-                    "health scope have no dedicated sheet (%s) — a live COUNTIF formula "
-                    "can't reference rows that don't exist on any sheet. Static score "
-                    "values will be written instead.",
-                    len(_hs_hidden_products), ', '.join(sorted(_hs_hidden_products)),
+                    "Patching Health Score: %d health-scope row(s) exist on no product "
+                    "sheet (broader CVSS ≥ %.1f scope vs report threshold %.1f, plus any "
+                    "products with no sheet). They have no checkboxes and can never "
+                    "change in Excel, so their counts are folded into the live fleet "
+                    "sums as fixed constants. Live scoring remains enabled.",
+                    int(_off_mask.sum()), health_score_threshold, threshold,
                 )
-                _hs_live = False
 
         if _hs_live:
-            # ── Component 1: Resolution rate across ALL product sheets ──────────
-            # Totals = ☑ + ☐ (avoids counting header/legend rows that COUNTA would hit)
-            _f_hs_res   = ' + '.join([f"COUNTIF('{s}'!A:A,\"☑\")" for s in _p2s_hs_vals])
-            _f_hs_unres = ' + '.join([f"COUNTIF('{s}'!A:A,\"☐\")" for s in _p2s_hs_vals])
-            _f_hs_total = f'({_f_hs_res}) + ({_f_hs_unres})'
+            # ── Live totals via per-sheet subtotal cells ─────────────────────────
+            # Each product sheet carries a hidden subtotal block (col R rows 1-7,
+            # written by product_sheets via sheet_helpers.write_hs_subtotals):
+            # short LOCAL COUNTIF/COUNTIFS over that sheet only, so toggling ☑/☐
+            # still flows through live.  The fleet totals here are therefore one
+            # short cell reference per sheet ('Sheet'!$R$1 + ...) instead of a
+            # full COUNTIFS per sheet — the old approach produced 20k+ character
+            # formulas on big fleets, far above Excel's 8,192-char stored-formula
+            # limit, which permanently forced the score back to static values.
+            #
+            # The six fleet sums are written ONCE into hidden helper cells
+            # E5:E10 (next to the E4 score helper).  Every visible formula
+            # references $E$5..$E$10, so visible formulas stay constant-size no
+            # matter how many product sheets exist.  A second win: each sheet's
+            # subtotals are built from its OWN column layout — Patch Confirmed
+            # sheets have no Score Lift column, so the old Summary-side G:G/I:I
+            # hard-coding silently tested the wrong columns there.
+            # Each sum is one short cell ref per sheet, plus (when the health
+            # scope contains products with no sheet — see _hs_residual above)
+            # a single numeric constant carrying those frozen rows.
+            def _fleet_sum(_key):
+                _s = ' + '.join(_hs_ref(sn, _key) for sn in _p2s_hs_vals)
+                if _hs_residual.get(_key):
+                    _s = f"{_s} + {_hs_residual[_key]}"
+                return _s
 
-            # ── Component 2: Critical CVE coverage (CVSS ≥ 9) ─────────────────
-            # Count rows where Resolved=☑ AND Vulnerability Score ≥ 9  (col G)
-            # Count rows where (☑ OR ☐)   AND Vulnerability Score ≥ 9  → total critical rows
-            _f_crit_res = ' + '.join(
-                [f"COUNTIFS('{s}'!A:A,\"☑\",'{s}'!G:G,\">=\"&9)" for s in _p2s_hs_vals]
-            )
-            _f_crit_total = ' + '.join(
-                [f"COUNTIFS('{s}'!G:G,\">=\"&9,'{s}'!A:A,\"<>\")" for s in _p2s_hs_vals]
-            )
-            # Subtract 1 per sheet for the header row that COUNTIFS would include via "<>"
-            # Header cell in col G is text ("Vulnerability Score") so ">="&9 already
-            # excludes it — no correction needed for crit_total.
-            # For the "<>" total we do need to subtract the header rows:
-            _f_crit_total = (
-                ' + '.join([f"COUNTIFS('{s}'!G:G,\">=\"&9,'{s}'!A:A,\"☑\")"
-                            for s in _p2s_hs_vals])
-                + ' + '
-                + ' + '.join([f"COUNTIFS('{s}'!G:G,\">=\"&9,'{s}'!A:A,\"☐\")"
-                              for s in _p2s_hs_vals])
-            )
+            _f_sum_res        = _fleet_sum('res')
+            _f_sum_unres      = _fleet_sum('unres')
+            _f_sum_crit_res   = _fleet_sum('crit_res')
+            _f_sum_crit_unres = _fleet_sum('crit_unres')
+            _f_sum_exp_res    = _fleet_sum('exp_res')
+            _f_sum_exp_unres  = _fleet_sum('exp_unres')
+            # Live count of unresolved CISA KEV rows (per-sheet R7 cells plus
+            # the off-sheet constant) — drives the live grade cap and the KEV
+            # penalty lift below via hidden helper cell $E$11.
+            _f_sum_kev_unres  = _fleet_sum('kev_unres')
 
-            # ── Component 3: Known-exploit coverage (col I = Has Known Exploit) ─
-            _f_exp_res = ' + '.join(
-                [f"COUNTIFS('{s}'!A:A,\"☑\",'{s}'!I:I,\"Yes\")" for s in _p2s_hs_vals]
-            )
-            _f_exp_total = (
-                ' + '.join([f"COUNTIFS('{s}'!I:I,\"Yes\",'{s}'!A:A,\"☑\")"
-                            for s in _p2s_hs_vals])
-                + ' + '
-                + ' + '.join([f"COUNTIFS('{s}'!I:I,\"Yes\",'{s}'!A:A,\"☐\")"
-                              for s in _p2s_hs_vals])
-            )
+            # Helper cell layout (col E = index 4, rows 4-11 in Excel terms):
+            #   E4  live score          E5  Σ res        E6  Σ unres
+            #   E7  Σ crit res          E8  Σ crit unres
+            #   E9  Σ exp res           E10 Σ exp unres
+            #   E11 Σ unresolved CISA KEV rows (drives cap/penalty lift)
+            _helper_row = 3
+            _helper_col = 4
+            _helper_ref = '$E$4'
+            _kev_live_ref = '$E$11'
+            _hr = {'res': '$E$5', 'unres': '$E$6', 'crit_res': '$E$7',
+                   'crit_unres': '$E$8', 'exp_res': '$E$9', 'exp_unres': '$E$10'}
+
+            _f_hs_res     = _hr['res']
+            _f_hs_total   = f"({_hr['res']}+{_hr['unres']})"
+            _f_crit_res   = _hr['crit_res']
+            _f_crit_total = f"({_hr['crit_res']}+{_hr['crit_unres']})"
+            _f_exp_res    = _hr['exp_res']
+            _f_exp_total  = f"({_hr['exp_res']}+{_hr['exp_unres']})"
 
             # Static penalty values (cannot be recalculated from the sheet columns)
             _pen_persist_pts = _phs_pens.get('persisting_cves', {}).get('pts', 0.0)
             _pen_kev_pts     = _phs_pens.get('kev_unresolved',  {}).get('pts', 0.0)
-            _total_pen       = _pen_persist_pts + _pen_kev_pts
 
             # -- Live score formula -------------------------------------------------
             # Mirrors compute_patching_health_score:
             #   pts_res  = IF(total>0, res/total, 0) * 60
             #   pts_crit = IF(crit_total>0, crit_res/crit_total, 1) * 20
             #   pts_exp  = IF(exp_total>0,  exp_res/exp_total,   1) * 20
-            #   score    = MAX(0, INT(ROUND(pts_res + pts_crit + pts_exp - penalties, 0)))
+            #   score    = MIN(cap, MAX(0, INT(ROUND(pts - penalties, 0))))
             #
-            # IMPORTANT: embedding _f_score into _f_grade would repeat the full
-            # cross-sheet COUNTIF expression 4+ times, easily exceeding Excel's
-            # 8,192-char formula limit and corrupting the XLSX XML.
-            # Fix: write the score into a hidden helper cell (col E, row 4 --
-            # outside the visible 4-col A-D layout) and reference $E$4 everywhere.
-            _f_pts_res  = f'IF(({_f_hs_total})>0,({_f_hs_res})/({_f_hs_total}),0)*60'
-            _f_pts_crit = f'IF(({_f_crit_total})>0,({_f_crit_res})/({_f_crit_total}),1)*20'
-            _f_pts_exp  = f'IF(({_f_exp_total})>0,({_f_exp_res})/({_f_exp_total}),1)*20'
-            _f_raw      = f'({_f_pts_res})+({_f_pts_crit})+({_f_pts_exp})-{_total_pen}'
-            _f_score    = f'MAX(0,INT(ROUND({_f_raw},0)))'
+            # The persisting-CVE penalty is genuinely static (depends on trend
+            # data that isn't in the workbook). The KEV penalty is conditionally
+            # live: the Python penalty counts unique unresolved KEV CVE *types*
+            # (−1 each, cap −5), which no in-sheet formula can deduplicate — but
+            # the boundary IS exact: unresolved KEV rows = 0 ⇔ unresolved KEV
+            # types = 0. So `IF($E$11>0, pts, 0)` keeps the generation-time
+            # penalty for intermediate states and lifts it precisely when the
+            # last KEV row is ticked ☑ (or keeps it forever if any unresolved
+            # KEV row is off-sheet, where it can never be ticked — correct).
+            _f_pts_res  = f"IF(({_f_hs_total})>0,({_f_hs_res})/({_f_hs_total}),0)*60"
+            _f_pts_crit = f"IF(({_f_crit_total})>0,({_f_crit_res})/({_f_crit_total}),1)*20"
+            _f_pts_exp  = f"IF(({_f_exp_total})>0,({_f_exp_res})/({_f_exp_total}),1)*20"
+            _f_pen      = f"({_pen_persist_pts}+IF({_kev_live_ref}>0,{_pen_kev_pts},0))"
+            _f_raw      = f"({_f_pts_res})+({_f_pts_crit})+({_f_pts_exp})-{_f_pen}"
 
-            # Helper cell E4 (row=3, col=4): holds the live numeric score.
-            # Grade IFS and final score row both reference $E$4 -- short formulas.
-            _helper_row = 3
-            _helper_col = 4
-            _helper_ref = '$E$4'
+            # KEV grade caps — compute_patching_health_score caps the numeric
+            # score at 74 (KEV ≥ 3, or any KEV with no patch report) / 89 (any
+            # unresolved KEV).  The cap *tier* (74 vs 89) stays a generation-time
+            # constant, but *whether* it applies is live: it lifts the moment
+            # the live unresolved-KEV count $E$11 reaches 0 — i.e. every KEV
+            # row on every sheet is ticked ☑ and none exist off-sheet. Without
+            # the live condition, a fully-remediated workbook stayed pinned at
+            # the ceiling (74/89) no matter what the reader resolved.
+            _kev_cnt_live = _phs_pens.get('kev_unresolved', {}).get('count', 0)
+            if _kev_cnt_live >= 3 or (_kev_cnt_live > 0 and not _phs_conf.get('has_patch_report')):
+                _score_cap = 74
+            elif _kev_cnt_live > 0:
+                _score_cap = 89
+            else:
+                _score_cap = None
+            _f_score = f"MAX(0,INT(ROUND({_f_raw},0)))"
+            if _score_cap is not None:
+                _f_score = f"MIN(IF({_kev_live_ref}>0,{_score_cap},100),{_f_score})"
+
+            # Nested IF rather than IFS(): IFS is an Excel 2019+ "future
+            # function" that xlsxwriter writes verbatim — Excel stores such
+            # functions internally as _xlfn.IFS, so a bare IFS renders as
+            # #NAME?.  Nested IF is equivalent and works in every Excel and
+            # LibreOffice version.
             _f_grade = (
-                f'IFS({_helper_ref}>=90,"A",{_helper_ref}>=75,"B",'
-                f'{_helper_ref}>=60,"C",{_helper_ref}>=40,"D",TRUE,"F")'
+                f'IF({_helper_ref}>=90,"A",IF({_helper_ref}>=75,"B",'
+                f'IF({_helper_ref}>=60,"C",IF({_helper_ref}>=40,"D","F"))))'
             )
             _f_score_ref = f'={_helper_ref}'
 
-            # Excel's stored formula limit is 8,192 characters. With many product
-            # sheets the live cross-sheet COUNTIFS for the health score can exceed
-            # that limit, which causes Excel to show "We found a problem with some
-            # content" and repair/remove the formulas when opening the workbook.
-            # When any health-score formula is too long, fall back to the static
-            # generation-time values rather than writing an invalid workbook.
+            # Excel's stored formula limit is 8,192 characters.  With the
+            # subtotal-cell design the only formulas that still grow with the
+            # sheet count are the six helper-cell sums (one short cell ref per
+            # sheet, ~25 chars each) — it would take ~250 max-length sheet
+            # names to trip this, but keep the guard as a safety net: an
+            # over-limit formula makes Excel "repair" (strip) formulas on open.
             _candidate_live_formulas = [
-                _f_score,
-                _f_grade,
-                _f_score_ref,
-                f'IF(({_f_hs_total})>0,({_f_hs_res})/({_f_hs_total}),1)',
-                _f_pts_res,
-                f'IF(({_f_crit_total})>0,({_f_crit_res})/({_f_crit_total}),1)',
-                _f_pts_crit,
-                f'IF(({_f_exp_total})>0,({_f_exp_res})/({_f_exp_total}),1)',
-                _f_pts_exp,
+                _f_sum_res, _f_sum_unres, _f_sum_crit_res,
+                _f_sum_crit_unres, _f_sum_exp_res, _f_sum_exp_unres,
+                _f_sum_kev_unres, _f_score, _f_grade, _f_score_ref,
             ]
             _max_formula_len = max(len(str(f or '')) + 1 for f in _candidate_live_formulas)
             if _max_formula_len > 8192:
@@ -679,18 +776,21 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
                 _hs_live = False
 
         # ── Format objects ──────────────────────────────────────────────────────
-        # Score box and grade box: colour is driven by static _phs_colour at
-        # generation time (correct for the initial state).  After toggling ☑/☐
-        # the numeric score and grade letter update live; the background colour
-        # is updated via conditional formatting rules added below.
-        _live_score_bg   = '#1F4E79'   # neutral dark blue for the live score container
+        # Score box and grade box background (v0.29):
+        #   live   → neutral dark blue; the formula-based conditional-format
+        #            rules below recolour both boxes from the live $E$4 score.
+        #   static → the generation-time grade colour (_phs_colour) — no
+        #            conditional formatting exists in static mode, so the box
+        #            must carry the correct colour itself.
+        _live_score_bg = '#1F4E79'   # neutral dark blue for the live score container
+        _box_bg        = _live_score_bg if _hs_live else _phs_colour
         _score_box_fmt = workbook.add_format({
             'bold': True, 'font_size': 36, 'align': 'center', 'valign': 'vcenter',
-            'font_color': 'white', 'bg_color': _live_score_bg, 'border': 2,
+            'font_color': 'white', 'bg_color': _box_bg, 'border': 2,
         })
         _grade_box_fmt = workbook.add_format({
             'bold': True, 'font_size': 28, 'align': 'center', 'valign': 'vcenter',
-            'font_color': 'white', 'bg_color': _live_score_bg, 'border': 2,
+            'font_color': 'white', 'bg_color': _box_bg, 'border': 2,
         })
         _score_lbl_fmt = workbook.add_format({
             'bold': True, 'font_size': 10, 'align': 'center', 'valign': 'vcenter',
@@ -745,23 +845,58 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         ws.set_row(row + 1, 14)
 
         # Score box (cols A-B) -- live formula or static fallback.
-        # xlsxwriter supports formulas in merge_range by passing the formula string
-        # as the data argument directly. Calling write_formula on the same cell
-        # afterwards corrupts the XLSX XML, so we use a single merge_range call.
+        # merge_range cannot store a cached formula result, so readers that
+        # don't recalculate on open (data_only tooling, some viewers) would
+        # display 0 in the box. Merge a blank, then overwrite the top-left
+        # cell via write_formula with the correct cached result — the
+        # documented xlsxwriter pattern for formulas in merged ranges; this
+        # write order produces a single cell entry in the sheet XML (v0.29).
         _score_box_row = row   # remember for conditional formatting below
         if _hs_live:
-            # Write the full score formula into hidden helper cell E4 first.
-            # All visible cells reference $E$4 to stay under the 8192-char limit.
+            # Hidden helper cells: E4 = live score; E5:E10 = the six fleet
+            # sums over the per-sheet subtotal cells.  All visible cells
+            # reference these, so every visible formula stays tiny.
+            _helper_fmt = workbook.add_format({'num_format': '0', 'font_color': 'white',
+                                               'bg_color': 'white'})
+            # Cached generation-time values so data_only readers see numbers
+            # (Excel recalculates the formulas on open regardless).
+            _cache_res   = int(_hs_is_res.sum())
+            _cache_unres = int(_hs_is_unr.sum())
+            if 'Vulnerability Score' in _score_scope.columns:
+                _cm = pd.to_numeric(_score_scope['Vulnerability Score'], errors='coerce') >= 9.0
+            else:
+                _cm = pd.Series(False, index=_score_scope.index)
+            if 'Has Known Exploit' in _score_scope.columns:
+                _em = _score_scope['Has Known Exploit'].astype(str).str.strip().str.lower().isin(
+                    ['yes', 'true', '1', 'y'])
+            else:
+                _em = pd.Series(False, index=_score_scope.index)
+            if 'CISA KEV' in _score_scope.columns:
+                _km = _score_scope['CISA KEV'].astype(str).str.strip().str.lower().isin(
+                    ['yes', 'true', '1', 'y'])
+            else:
+                _km = pd.Series(False, index=_score_scope.index)
+            for _hrow, _hf, _hcache in [
+                (4,  _f_sum_res,        _cache_res),
+                (5,  _f_sum_unres,      _cache_unres),
+                (6,  _f_sum_crit_res,   int((_cm & _hs_is_res).sum())),
+                (7,  _f_sum_crit_unres, int((_cm & _hs_is_unr).sum())),
+                (8,  _f_sum_exp_res,    int((_em & _hs_is_res).sum())),
+                (9,  _f_sum_exp_unres,  int((_em & _hs_is_unr).sum())),
+                (10, _f_sum_kev_unres,  int((_km & _hs_is_unr).sum())),
+            ]:
+                ws.write_formula(_hrow, _helper_col, f'={_hf}', _helper_fmt, _hcache)
             ws.write_formula(_helper_row, _helper_col, f'={_f_score}',
-                             workbook.add_format({'num_format': '0', 'font_color': 'white',
-                                                  'bg_color': 'white'}), _phs_score)
-            ws.merge_range(row, 0, row + 1, 1, _f_score_ref, _score_box_fmt)
+                             _helper_fmt, _phs_score)
+            ws.merge_range(row, 0, row + 1, 1, '', _score_box_fmt)
+            ws.write_formula(row, 0, _f_score_ref, _score_box_fmt, _phs_score)
         else:
             ws.merge_range(row, 0, row + 1, 1, _phs_score, _score_box_fmt)
 
         # Grade box (col C) -- same pattern
         if _hs_live:
-            ws.merge_range(row, 2, row + 1, 2, f'={_f_grade}', _grade_box_fmt)
+            ws.merge_range(row, 2, row + 1, 2, '', _grade_box_fmt)
+            ws.write_formula(row, 2, f'={_f_grade}', _grade_box_fmt, _phs_grade)
         else:
             ws.merge_range(row, 2, row + 1, 2, _phs_grade, _grade_box_fmt)
 
@@ -772,7 +907,12 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         # Applied to the top-left cell of each merged region (xlsxwriter targets the
         # top-left cell; Excel applies the format to the entire merged range).
         if _hs_live:
-            _cf_base = {'type': 'cell', 'multi_range': f'A{_score_box_row+1} C{_score_box_row+1}'}
+            # Formula-based rules on the live $E$4 score — the previous
+            # numeric 'cell between' rules could never match the grade cell's
+            # TEXT value ("A".."F"), so the grade box stayed neutral dark blue
+            # forever.  A formula rule evaluates $E$4 regardless of what the
+            # formatted cell itself contains, so score box and grade box
+            # recolour together.
             for _cf_min, _cf_max, _cf_bg in [
                 (90, 100, '#375623'),   # A — dark green
                 (75,  89, '#70AD47'),   # B — green
@@ -784,8 +924,8 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
                     'bold': True, 'font_color': 'white', 'bg_color': _cf_bg, 'border': 2,
                 })
                 ws.conditional_format(_score_box_row, 0, _score_box_row + 1, 2, {
-                    'type': 'cell', 'criteria': 'between',
-                    'minimum': _cf_min, 'maximum': _cf_max,
+                    'type': 'formula',
+                    'criteria': f'=AND($E$4>={_cf_min},$E$4<={_cf_max})',
                     'format': _cf_fmt,
                 })
 
@@ -830,20 +970,32 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
             ws.write(row, 3, f'/ {_max}', _comp_lbl_fmt)
             row += 1
 
-        # ── Penalty rows (always static — depend on external data) ─────────────
-        for _plbl, _pkey, _punit in [
+        # ── Penalty rows ────────────────────────────────────────────────────────
+        # Persisting-CVE penalty is static (depends on trend data outside the
+        # workbook). The KEV penalty display is live when the score is live:
+        # =IF($E$11>0, −pts, 0) — it visibly clears alongside the score/cap
+        # the moment the last KEV row is ticked ☑ (see the live-score formula
+        # comment above for why the boundary is exact).
+        for _plbl, _pkey, _punit, _plive in [
             ('Persisting CVE types (\u22120.5 each, max \u22125)  \u2013 fixed at generation',
-             'persisting_cves', 'CVE types'),
-            ('Unresolved CISA KEV CVEs (\u22121 each, max \u22125)  \u2013 fixed at generation',
-             'kev_unresolved',  'KEV CVEs'),
+             'persisting_cves', 'CVE types', False),
+            ('Unresolved CISA KEV CVEs (\u22121 each, max \u22125)  \u2013 lifts when all KEV rows are \u2611'
+             if _hs_live else
+             'Unresolved CISA KEV CVEs (\u22121 each, max \u22125)  \u2013 fixed at generation',
+             'kev_unresolved',  'KEV CVEs', True),
         ]:
             _pen  = _phs_pens.get(_pkey, {})
             _ppts = _pen.get('pts', 0)
             _pcnt = _pen.get('count', 0)
             ws.write(row, 0, _plbl,               _comp_lbl_italic_fmt)
             ws.write(row, 1, f'{_pcnt} {_punit}', _comp_lbl_italic_fmt)
-            ws.write(row, 2, -_ppts if _ppts > 0 else None,
-                     _pen_neg_fmt if _ppts > 0 else _pen_zero_fmt)
+            if _hs_live and _plive and _ppts > 0:
+                ws.write_formula(row, 2,
+                    f'=IF({_kev_live_ref}>0,{-_ppts},0)',
+                    _pen_neg_fmt, -_ppts)
+            else:
+                ws.write(row, 2, -_ppts if _ppts > 0 else None,
+                         _pen_neg_fmt if _ppts > 0 else _pen_zero_fmt)
             ws.write(row, 3, 'penalty',            _comp_lbl_italic_fmt)
             row += 1
 
@@ -871,7 +1023,8 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
             _kev_cap_note = '  ·  Unresolved KEV CVEs: grade cap active.'
         _live_note_hs = (
             '\u26a1 Blue cells update automatically when \u2610/\u2611 are toggled in product sheets.  '
-            'Penalties are fixed at report generation (depend on trend/KEV data).  '
+            'The KEV grade cap and KEV penalty lift when every KEV row is \u2611; '
+            'the persisting-CVE penalty is fixed at report generation (depends on trend data).  '
         ) if _hs_live else ''
         ws.merge_range(row, 0, row, 3,
             f'{_live_note_hs}'
@@ -1225,22 +1378,37 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     ws.set_row(row, 28)
     row += 2
 
-    # Build COUNTIF formula strings — these make both tables live when ☐/☑ are toggled
+    # Build live formula strings — these make both tables live when ☐/☑ are toggled.
+    # Each product sheet carries hidden per-sheet subtotal cells (col R rows 1-2,
+    # written by product_sheets via sheet_helpers.write_hs_subtotals), so the
+    # fleet totals here are one short cell reference per sheet rather than a
+    # COUNTIF per sheet.  The sums are written ONCE into two hidden helper
+    # cells next to the table (col G) and every visible formula references
+    # those — so visible formulas stay constant-size no matter how many
+    # product sheets exist (Excel's stored-formula limit is 8,192 chars; the
+    # old COUNTIF-chain approach had NO length guard here and could silently
+    # ship a corrupt workbook on big fleets).
     _p2s = product_to_sheet or {}
     if _p2s:
-        # Row A = Resolved checkbox, col C = Name, col D = Device Type (0-indexed → A,C,D)
-        _f_res   = ' + '.join([f"COUNTIF('{s}'!A:A,\"☑\")" for s in _p2s.values()])
-        _f_unres = ' + '.join([f"COUNTIF('{s}'!A:A,\"☐\")" for s in _p2s.values()])
-        # Total = ☑ + ☐ only — COUNTA overcounts due to legend/header rows in each sheet
-        _f_total = f'({_f_res}) + ({_f_unres})'
-        # Device type unresolved: count rows where Resolved=☐ AND DevType matches
-        _f_srv_unr = None   # device unique-count across sheets needs SUMPRODUCT — kept static
-        _f_wks_unr = None
-        _f_srv_all = None
-        _f_wks_all = None
-        _live = True
+        _f_sum_rs_res   = ' + '.join(_hs_ref(sn, 'res')   for sn in _p2s.values())
+        _f_sum_rs_unres = ' + '.join(_hs_ref(sn, 'unres') for sn in _p2s.values())
+        _live = max(len(_f_sum_rs_res), len(_f_sum_rs_unres)) + 1 <= 8192
+        if not _live:
+            log.warning(
+                "Resolution Status live formulas disabled: helper sum is %d characters, "
+                "above Excel's 8,192 character limit. Static values will be written.",
+                max(len(_f_sum_rs_res), len(_f_sum_rs_unres)) + 1,
+            )
     else:
         _live = False
+    if _live:
+        # Helper cells are written just before the table rows below (the row
+        # position isn't known yet); the visible formulas use these refs.
+        _rs_helper_col = 6                     # col G — table itself uses A-D
+        _f_res   = None                        # set once helper row is known
+        _f_unres = None
+        _f_total = None
+    else:
         _f_res   = None   # guard: prevents UnboundLocalError when no product sheets exist
         _f_unres = None
         _f_total = None
@@ -1355,6 +1523,19 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     _tot = _rr + _ur
 
     res_row = row
+    if _live:
+        # Hidden helper cells (col G, alongside the Resolved/Unresolved rows):
+        # G holds the two long-ish per-sheet sums once; visible cells reference
+        # them.  White-on-white so they don't visually clutter the Summary.
+        _rs_helper_fmt = workbook.add_format({'num_format': '#,##0',
+                                              'font_color': 'white', 'bg_color': 'white'})
+        ws.write_formula(res_row,     _rs_helper_col, f'={_f_sum_rs_res}',
+                         _rs_helper_fmt, _rr_confirmed)
+        ws.write_formula(res_row + 1, _rs_helper_col, f'={_f_sum_rs_unres}',
+                         _rs_helper_fmt, _ur)
+        _f_res   = f'$G${res_row + 1}'          # Excel 1-indexed rows
+        _f_unres = f'$G${res_row + 2}'
+        _f_total = f'({_f_res}+{_f_unres})'
     ws.write(row, 0, 'Resolved',   lbl_fmt)
     if _live:
         _f_res_combined = f'({_f_res}) + {_trend_resolved_pairs}' if _trend_resolved_pairs else _f_res

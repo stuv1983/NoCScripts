@@ -34,12 +34,13 @@ def write_nvd_links(ws, vuln_name_series, col_idx, link_fmt):
 
 # ── Patching Health Score per-sheet subtotals ────────────────────────────────
 # Each product sheet totals its own ☑/☐ counts ONCE, in a hidden block at a
-# fixed location (labels in col Q, values in col R, rows 1-6).  The Summary
-# sheet's live health-score formulas then reference one cell per sheet
-# ('Sheet'!$R$1 + 'Sheet'!$R$1 + ...) instead of embedding one or two full
-# COUNTIFS expressions per sheet.  With many product sheets the old approach
-# produced formulas of 20k+ characters — far above Excel's 8,192-character
-# stored-formula limit — which forced the Summary score back to static values.
+# fixed location (labels in col Q, values in col R, rows 1-7).  The Summary
+# sheet's live health-score / Resolution Status formulas then reference one
+# cell per sheet ('Sheet'!$R$1 + 'Sheet'!$R$1 + ...) instead of embedding one
+# or two full COUNTIFS expressions per sheet.  With many product sheets the
+# old approach produced formulas of 20k+ characters — far above Excel's
+# 8,192-character stored-formula limit — which forced the Summary score back
+# to static values.
 #
 # A second benefit: each sheet's subtotal formulas are built from that sheet's
 # OWN column layout.  Patch Confirmed sheets have no Score Lift column, so
@@ -55,8 +56,8 @@ HS_SUBTOTAL_ROWS = {       # key → 0-indexed row  (R1..R7 in Excel terms)
     'crit_unres': 3,   # R4  ☐ rows with Vulnerability Score ≥ 9
     'exp_res':    4,   # R5  ☑ rows with Has Known Exploit = Yes
     'exp_unres':  5,   # R6  ☐ rows with Has Known Exploit = Yes
-    'kev_unres':  6,   # R7  ☐ rows with CISA KEV = Yes — drives the live
-                       #     lift of the KEV penalty & grade cap on Summary
+    'kev_unres':  6,   # R7  ☐ rows with CISA KEV = Yes (reserved for live
+                       #     KEV penalty work; penalties are static today)
 }
 _HS_SUBTOTAL_LABELS = {
     'res':        'HS subtotal: resolved rows (☑)',
@@ -79,23 +80,23 @@ def hs_subtotal_ref(sheet_name: str, key: str) -> str:
 
 def write_hs_subtotals(ws, workbook, col_names, counts: dict) -> None:
     """
-    Write the six health-score subtotal cells onto a product sheet.
+    Write the seven health-score subtotal cells onto a product sheet.
 
-    ws        : xlsxwriter worksheet (data already written; header in row 0,
-                ☑/☐ values in the 'Resolved' column)
-    col_names : the sheet's actual column order — used to derive THIS sheet's
-                column letters for Vulnerability Score / Has Known Exploit
-                (full triage sheets and Patch Confirmed sheets differ)
-    counts    : generation-time values for each HS_SUBTOTAL_ROWS key, written
-                as the cached formula results so the workbook shows correct
-                numbers even before Excel recalculates
+    Each value cell holds a LOCAL formula over this sheet's own columns
+    (so it stays live when ☑/☐ are toggled) with the generation-time count
+    as the cached result (so data_only readers see correct values).  If a
+    column needed by a formula doesn't exist on this sheet, the static
+    count is written instead — a cell is ALWAYS written so cross-sheet
+    references from the Summary sheet never point at an empty cell.
 
-    Each cell holds a short LOCAL formula (COUNTIF/COUNTIFS over this sheet's
-    own columns) so the subtotals track ☑/☐ toggles live.  Columns Q and R are
-    hidden — the block is machinery for the Summary sheet, not for readers.
+    Columns Q and R are hidden; labels are kept for anyone unhiding them.
     """
     def _col_letter(name):
-        return chr(ord('A') + col_names.index(name)) if name in col_names else None
+        try:
+            i = col_names.index(name)
+        except ValueError:
+            return None
+        return chr(ord('A') + i) if i < 26 else None
 
     _c_res   = _col_letter('Resolved')
     _c_score = _col_letter('Vulnerability Score')
@@ -125,15 +126,13 @@ def write_hs_subtotals(ws, workbook, col_names, counts: dict) -> None:
         return f'=COUNTIFS({base},${_c_exp}:${_c_exp},"Yes")'
 
     for key, r in HS_SUBTOTAL_ROWS.items():
+        static = int(counts.get(key, 0))
         ws.write(r, HS_SUBTOTAL_LBL_COL, _HS_SUBTOTAL_LABELS[key], _hidden_fmt)
         f = _formula(key)
-        cached = int(counts.get(key, 0))
         if f is not None:
-            ws.write_formula(r, HS_SUBTOTAL_VAL_COL, f, _hidden_fmt, cached)
+            ws.write_formula(r, HS_SUBTOTAL_VAL_COL, f, _hidden_fmt, static)
         else:
-            # Column missing on this sheet — nothing live to count; the static
-            # generation-time value is the whole truth.
-            ws.write_number(r, HS_SUBTOTAL_VAL_COL, cached, _hidden_fmt)
+            ws.write_number(r, HS_SUBTOTAL_VAL_COL, static, _hidden_fmt)
 
     ws.set_column(HS_SUBTOTAL_LBL_COL, HS_SUBTOTAL_VAL_COL, None, None,
                   {'hidden': True})

@@ -1,8 +1,31 @@
+# Python
 __pycache__/
 *.pyc
 *.pyo
-snapshots/
+*.egg-info/
+.venv/
+venv/
+
+# Report inputs/outputs — client vulnerability data must never be committed
 *.xlsx
+*.xls
 *.csv
+snapshots/
 *.log
+
+# Local CVE list clone (multi-GB git repo — never commit into this repo)
+cvelistV5/
+
+# Secrets / environment
 .env
+*.key
+
+# Editor/IDE
+.vscode/
+.idea/
+.DS_Store
+
+# NOTE: config.json IS tracked on purpose (it's the product-rules source of
+# truth) — but it must not contain secrets. Keep the NVD API key in the
+# NVD_API_KEY environment variable (cve_lookup.py already prefers it), not
+# in config.json's "api" block.
