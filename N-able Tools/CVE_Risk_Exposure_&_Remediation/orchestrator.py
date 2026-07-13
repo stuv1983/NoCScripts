@@ -5,7 +5,9 @@ Receives a DashboardRequest, runs the pipeline, writes the workbook,
 and returns a DashboardResult.
 
 No tkinter. No filedialog. Fully testable headless.
-Business logic lives in: data_pipeline, diagnostics, snapshot, excel_builder.
+Business logic lives in: data_pipeline, diagnostics, snapshot, and the
+sheet-builder modules (summary_sheet, product_sheets, patch_sheets,
+trend_sheets, device_sheets, formatting).
 
 Author : Stu Villanti <s.villanti@kenstra.com>
 """
@@ -24,7 +26,6 @@ from config import FIXED_VERSION_RULES
 from data_pipeline import (
     load_vulnerability_data, load_rmm_data, merge_data,
     process_patch_match, load_previous_report, compute_trends,
-    check_customer_consistency,
     normalize_device_name, extract_cve_id, clean_sheet_name,
     load_patch_failure_report, build_patch_failure_lookup,
     load_patch_check_report, build_patch_check_failure_lookup,
@@ -32,16 +33,18 @@ from data_pipeline import (
 )
 from diagnostics import compute_patch_diagnostics, classify_root_cause
 import snapshot as snap_store
-from excel_builder import (
-    get_workbook_styles,
-    build_client_summary_sheet,
-    build_trend_summary_sheet, build_trend_detail_sheets,
-    build_product_sheets, build_stale_excluded_sheet,
-    build_stale_cves_sheet,
+from formatting import get_workbook_styles
+from summary_sheet import build_client_summary_sheet
+from trend_sheets import build_trend_summary_sheet, build_trend_detail_sheets
+from product_sheets import build_product_sheets
+from patch_sheets import (
     build_patch_sheets, build_diagnostics_sheets,
     build_patch_failure_sheet, build_patch_check_failure_sheet,
     build_products_not_tracked_sheet,
     # build_patch_resolved_sheet,   # commented out — large sheet, slow to write
+)
+from device_sheets import (
+    build_stale_excluded_sheet, build_stale_cves_sheet,
     build_device_report_sheet,
 )
 
@@ -205,6 +208,11 @@ def run(request: DashboardRequest) -> DashboardResult:
     try:
         log.info("Dashboard run started — output: %s", request.output_path)
 
+        # Single timestamp for the whole run — every "days since" style
+        # column (Days Since Last Response, N Days Exposed) is anchored to
+        # this so the workbook is internally consistent and reproducible.
+        run_ts = datetime.now()
+
         import json as _json
         try:
             with open(Path(__file__).parent / 'config.json', encoding='utf-8') as _fh:
@@ -265,15 +273,9 @@ def run(request: DashboardRequest) -> DashboardResult:
             df_rmm = load_rmm_data(request.rmm_path)
             log.info("  %d devices loaded", len(df_rmm))
 
-            # Safety net: abort if the device report belongs to a
-            # different customer than the detections export.
-            check_customer_consistency({
-                'Detections export': df_vuln,
-                'Device report':     df_rmm,
-            })
-
         merged_df = merge_data(df_vuln, df_rmm, request.skip_rmm,
-                               exclude_missing_rmm=request.exclude_missing_rmm)
+                               exclude_missing_rmm=request.exclude_missing_rmm,
+                               as_of_date=run_ts)
         log.info("Merged dataset: %d rows", len(merged_df))
 
         raw_df         = merged_df.copy()
@@ -308,22 +310,26 @@ def run(request: DashboardRequest) -> DashboardResult:
                 request.cutoff_date, len(merged_df), len(all_stale_names),
             )
 
-        # ── Approaching stale: DISABLED FOR TESTING ─────────────────────────────
+        # ── Approaching stale ────────────────────────────────────────────────
+        # Re-enabled: this was commented out "FOR TESTING" while the product
+        # sheet legend and the GUI's stale-warning-days input still advertised
+        # the feature, so users saw a legend entry for a row colour that could
+        # never appear.
         warning_days = max(1, int(request.stale_warning_days))
         approaching_stale_names: set = set()
-        # if 'Days Since Last Response' in merged_df.columns:
-        #     _days_col_ap  = pd.to_numeric(merged_df['Days Since Last Response'], errors='coerce')
-        #     _active_mask  = merged_df['Last Response'] != 'Not Found in RMM'
-        #     approaching_stale_names = set(
-        #         merged_df.loc[
-        #             _active_mask & (_days_col_ap >= warning_days),
-        #             'Name'
-        #         ].unique()
-        #     )
-        # log.info(
-        #     "%d device(s) flagged as approaching stale (offline >= %d days)",
-        #     len(approaching_stale_names), warning_days,
-        # )
+        if 'Days Since Last Response' in merged_df.columns:
+            _days_col_ap  = pd.to_numeric(merged_df['Days Since Last Response'], errors='coerce')
+            _active_mask  = merged_df['Last Response'] != 'Not Found in RMM'
+            approaching_stale_names = set(
+                merged_df.loc[
+                    _active_mask & (_days_col_ap >= warning_days),
+                    'Name'
+                ].unique()
+            )
+        log.info(
+            "%d device(s) flagged as approaching stale (offline >= %d days)",
+            len(approaching_stale_names), warning_days,
+        )
 
         if merged_df.empty:
             msg = (
@@ -383,7 +389,8 @@ def run(request: DashboardRequest) -> DashboardResult:
         if request.include_patch and request.patch_path:
             log.info("Running patch match: %s", request.patch_path)
             p_ov, p_full, p_raw, tot_r, filt_r = process_patch_match(
-                request.patch_path, merged_df.copy(), min_score=request.threshold)
+                request.patch_path, merged_df.copy(), min_score=request.threshold,
+                as_of_date=run_ts)
             patch_data = (p_ov, p_full, p_raw, tot_r, filt_r)
             log.info("  Patch match: %d total rows, %d above threshold", tot_r, filt_r)
 
@@ -394,13 +401,6 @@ def run(request: DashboardRequest) -> DashboardResult:
             log.info("Loading previous report for trend: %s", request.prev_report_path)
             prev_df, prev_resolved_pairs, prev_source_type = load_previous_report(request.prev_report_path)
             prev_report_name = Path(request.prev_report_path).name
-
-            # Safety net: abort if the previous report belongs to a
-            # different customer than this run's detections export.
-            check_customer_consistency({
-                'Detections export (current)': df_vuln,
-                'Previous report':             prev_df,
-            })
             inventory_set    = (set(df_rmm['Device_Join'].unique())
                                 if df_rmm is not None else None)
 
@@ -564,17 +564,6 @@ def run(request: DashboardRequest) -> DashboardResult:
             log.debug("Raw RESOLVED injection skipped — export has status column; "
                       "product sheets read it directly (avoids large-set performance issue)")
 
-        patch_confirmed_count = 0
-        if patch_resolved_pairs:
-            from data_pipeline import _detect_product as _dp_detect
-            triage_keys = set(zip(
-                triage_df['Name'].apply(normalize_device_name),
-                triage_df['Vulnerability Name'].apply(extract_cve_id),
-                triage_df['Affected Products'].astype(str).apply(_dp_detect),
-            ))
-            _confirmed_3tuples = patch_resolved_pairs & triage_keys
-            patch_confirmed_count = len({(d, v) for d, v, _ in _confirmed_3tuples})
-
         failure_df     = None
         failure_lookup = {}
         failure_devices: set = set()
@@ -663,7 +652,6 @@ def run(request: DashboardRequest) -> DashboardResult:
             styles     = get_workbook_styles(wb)
             link_fmt   = styles['link']
             header_fmt = styles['header']
-            miss_fmt   = styles['row_missing']
 
             _not_in_rmm_mask = filtered_df['Last Response'] == 'Not Found in RMM'
             _not_in_rmm_cve_rows = int(_not_in_rmm_mask.sum()) if 'Last Response' in filtered_df.columns else 0

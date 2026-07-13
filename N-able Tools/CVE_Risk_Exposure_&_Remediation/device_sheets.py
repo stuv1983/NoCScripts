@@ -50,7 +50,6 @@ def build_all_detections_sheet(writer, merged_df, link_fmt, missing_row_fmt):
         })
     if 'N Days Exposed' in cl:
         nde_idx  = cl.index('N Days Exposed')
-        nde_col  = get_col_letter(nde_idx)
         ws.set_column(nde_idx, nde_idx, 15)
         wb = writer.book
         # >180 days unpatched — critical (dark red)
@@ -169,8 +168,6 @@ def build_stale_cves_sheet(writer, df, link_fmt, not_in_rmm_cves_df=None) -> Non
     hdr_fmt    = wb.add_format({'bold': True, 'bg_color': '#2E75B6', 'font_color': 'white', 'border': 1})
     row_stale  = wb.add_format({'bg_color': '#F5F5F5', 'border': 1})
     row_nirm   = wb.add_format({'bg_color': '#FFEBEE', 'font_color': '#9C0006', 'border': 1})
-    link_stale = wb.add_format({'bg_color': '#F5F5F5', 'border': 1, 'font_color': '#0563C1', 'underline': True})
-    link_nirm  = wb.add_format({'bg_color': '#FFEBEE', 'border': 1, 'font_color': '#9C0006', 'underline': True})
     note_fmt   = wb.add_format({'italic': True, 'font_color': '#595959', 'font_size': 9})
 
     for ci, col_nm in enumerate(headers):
@@ -205,7 +202,6 @@ def build_stale_cves_sheet(writer, df, link_fmt, not_in_rmm_cves_df=None) -> Non
         _reason = str(row[-1]) if hasattr(row, '_fields') else ''
         _is_nirm = 'Not Found' in _reason
         _rfmt  = row_nirm  if _is_nirm else row_stale
-        _lfmt  = link_nirm if _is_nirm else link_stale
         row_vals = list(row)
         for ci, col_nm in enumerate(headers):
             _ci_src = cl.index(col_nm) if col_nm in cl else None

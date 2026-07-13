@@ -11,7 +11,7 @@ import json
 import logging
 import re
 from pathlib import Path
-from typing import Optional, Set, Tuple
+from typing import Set
 
 log = logging.getLogger(__name__)
 
@@ -72,9 +72,14 @@ def _load_config(strict: bool = True) -> dict:
         ) from e
 
 
-# Use strict=False when running under pytest (PYTEST_CURRENT_TEST is set by pytest)
-import os as _os
-_strict = 'PYTEST_CURRENT_TEST' not in _os.environ
+# Use strict=False when running under pytest. NOTE: do NOT test for the
+# PYTEST_CURRENT_TEST env var here — pytest only sets it while a test is
+# actually executing, and this module is imported at collection time (before
+# any test runs), so that check never engages and a missing config.json would
+# still hard-crash test collection. Checking sys.modules is reliable: pytest
+# is always importable/imported before it collects test modules.
+import sys as _sys
+_strict = 'pytest' not in _sys.modules
 _CONFIG = _load_config(strict=_strict)
 
 _raw_pm = _CONFIG.get('product_map', [])
@@ -90,7 +95,7 @@ PRODUCT_MAP: list = [(str(k).lower(), str(v).lower()) for k, v in _raw_pm]
 # { canonical_name: { CVE-ID: minimum_fixed_version } }
 FIXED_VERSION_RULES: dict = _CONFIG.get('fixed_version_rules', {})
 
-# Patch-status constants — used by both data_pipeline and excel_builder
+# Patch-status constants — used by data_pipeline and the sheet builders
 STATUS_RANK: dict = {
     'Installed': 6, 'Reboot Required': 5, 'Installing': 4,
     'Pending': 3,   'Missing': 2,          'Failed': 1,

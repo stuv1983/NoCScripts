@@ -8,8 +8,7 @@ Author : Stu Villanti <s.villanti@kenstra.com>
 import logging
 import os
 import re
-from datetime import datetime
-from typing import Optional, Set, Tuple
+from typing import Optional, Set
 
 import pandas as pd
 
@@ -106,6 +105,66 @@ def load_data(file_path: str) -> pd.DataFrame:
     return pd.read_csv(file_path)
 
 
+# Approximate CVSS scores derived from N-able's Severity text labels, used
+# when an export ships Severity (CRITICAL/IMPORTANT/MODERATE/LOW) but no
+# numeric CVSS column. Single definition — shared by load_vulnerability_data
+# and load_previous_report so the two can never drift apart.
+_SEVERITY_SCORE_MAP = {
+    'critical':  9.0,
+    'important': 7.0,
+    'moderate':  5.0,
+    'low':       2.0,
+}
+
+# Canonical column name -> lowercase source aliases. Single source of truth
+# for CVE-export column normalisation — used by both load_vulnerability_data
+# and load_previous_report (they previously carried separate, already-drifting
+# copies of this mapping).
+_CVE_COLUMN_ALIASES = [
+    ('Name',                   ('asset name', 'device name', 'endpoint')),
+    ('Vulnerability Name',     ('vulnerability id', 'cve id', 'cve')),
+    ('Vulnerability Score',    ('cvss score', 'cvss v3.1 base score',
+                                'cvss v3 base score', 'base score', 'score')),
+    ('Affected Products',      ('affected products', 'product')),
+    ('Vulnerability Severity', ('severity', 'risk')),
+    ('Threat Status',          ('threat status',)),
+    ('Customer',               ('customer name', 'client name', 'account name', 'client')),
+    ('Site',                   ('site name', 'location name')),
+    ('Has Known Exploit',      ('has exploit', 'exploit')),
+    ('CISA KEV',               ('cisa kev',)),
+    ('First detected',         ('first detected',)),
+    ('Last updated',           ('last updated',)),
+    ('Update Available',       ('updates available', 'update available')),
+    ('Operating System Role',  ('operating system role', 'os role')),
+]
+
+
+def _rename_cve_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalise CVE-export column names in place using _CVE_COLUMN_ALIASES.
+
+    Each canonical target is assigned at most once: if the target column
+    already exists (exact name), or an earlier alias already claimed it,
+    remaining aliases are left untouched. This also fixes a latent bug in
+    the previous per-loader copies, where an export containing e.g. both
+    'Client' and 'Customer Name' had BOTH renamed to 'Customer', producing
+    duplicate columns.
+    """
+    rename = {}
+    assigned = set(df.columns)
+    for target, aliases in _CVE_COLUMN_ALIASES:
+        if target in assigned:
+            continue
+        for col in df.columns:
+            if str(col).strip().lower() in aliases and col != target:
+                rename[col] = target
+                assigned.add(target)
+                break
+    if rename:
+        df.rename(columns=rename, inplace=True)
+    return df
+
+
 def normalize_device_name(name: str) -> str:
     """Strip domain components and uppercase a single device name string."""
     name = str(name).strip().upper()
@@ -139,9 +198,11 @@ def clean_sheet_name(name: str, used_names: Set[str]) -> str:
     if pd.isna(name) or str(name).strip() == '': name = 'Unknown Product'
     clean = _SHEET_CHARS.sub('', str(name)).strip()[:31].strip()
     if not clean: clean = 'Unknown Product'
+    # Build the lowercase comparison set once per call — previously rebuilt
+    # inside the while loop on every collision (O(n²) across many products).
+    used_lower = {n.lower() for n in used_names}
     final, counter = clean, 1
-    _used_lower = {n.lower() for n in used_names}
-    while final.lower() in _used_lower:
+    while final.lower() in used_lower:
         suffix = f'_{counter}'
         final = clean[:31 - len(suffix)] + suffix
         counter += 1
@@ -244,12 +305,6 @@ def _extract_best_version(text) -> str:
     if not versions: return ''
     return sorted(versions, key=lambda v: (len(v.split('.')), [int(x) for x in v.split('.')]))[-1]
 
-try:
-    from packaging.version import Version as _PkgVersion
-except ImportError:
-    _PkgVersion = None
-
-
 def _parse_version(value) -> Optional[tuple]:
     """
     Parse a version string into a comparable tuple using packaging.version.
@@ -258,8 +313,9 @@ def _parse_version(value) -> Optional[tuple]:
     Returns None when no version can be parsed.
     """
     try:
+        from packaging.version import Version
         v = str(value).strip().lstrip('v')
-        return _PkgVersion(v).release   # tuple of ints, e.g. (136, 0, 7103, 116)
+        return Version(v).release   # tuple of ints, e.g. (136, 0, 7103, 116)
     except Exception:
         parts = _DIGITS_RE.findall(str(value).strip())
         return tuple(int(p) for p in parts) if parts else None
@@ -275,9 +331,10 @@ def _version_gte(left, right):
     comparison when packaging cannot parse either side.
     """
     try:
+        from packaging.version import Version
         lv = str(left).strip().lstrip('v')
         rv = str(right).strip().lstrip('v')
-        return _PkgVersion(lv) >= _PkgVersion(rv)
+        return Version(lv) >= Version(rv)
     except Exception:
         # Fall back to plain digit-tuple comparison (handles build-number-only strings)
         l, r = _parse_version(left), _parse_version(right)
@@ -375,88 +432,11 @@ def _vec_pes(status_s, vcr_s, inst_dt_s, cve_max_s):
     out = []
     for status, vcr, inst_dt, cve_max in zip(status_s, vcr_s, inst_dt_s, cve_max_s):
         if status not in INSTALLED_STATUSES: out.append('Unresolved'); continue
-        if vcr in ('Below fixed version', 'No fixed baseline defined', ''): out.append('Unresolved'); continue
+        if vcr in ('Below fixed version', ''): out.append('Unresolved'); continue
         if 'version compliant' not in vcr.lower(): out.append('Unresolved'); continue
         if pd.isna(inst_dt) or pd.isna(cve_max): out.append('Unresolved'); continue
         out.append('Patch confirmed - pending rescan' if inst_dt >= cve_max else 'Unresolved')
     return out
-
-
-# ==============================================================================
-# CUSTOMER CONSISTENCY SAFETY NET
-# ==============================================================================
-
-# Column-name variants checked, in priority order. Detections exports are
-# normalised to 'Customer' by load_vulnerability_data / load_previous_report;
-# the device report keeps its raw header, typically 'Customer Name'.
-_CUSTOMER_COL_CANDIDATES = ('Customer', 'Customer Name', 'Client', 'Client Name',
-                            'Account Name')
-
-
-def _extract_customers(df) -> dict:
-    """
-    Return {casefolded_name: original_name} for every distinct, non-blank
-    customer value in the first recognisable customer column of df.
-    Returns {} when df is None/empty or has no usable customer column.
-    """
-    if df is None or len(df) == 0:
-        return {}
-    col_lower = {str(c).strip().lower(): c for c in df.columns}
-    for want in _CUSTOMER_COL_CANDIDATES:
-        col = col_lower.get(want.lower())
-        if col is None:
-            continue
-        vals = df[col].dropna().astype(str).str.strip()
-        vals = vals[(vals != '') & (~vals.str.lower().isin(('nan', 'none', 'n/a')))]
-        if vals.empty:
-            continue
-        out: dict = {}
-        for v in vals.unique():
-            out.setdefault(v.casefold(), v)
-        return out
-    return {}
-
-
-def check_customer_consistency(named_frames: dict) -> None:
-    """
-    Safety net: ensure every input file belongs to the same customer, so a
-    device report or previous report from a different client can never be
-    silently merged into this customer's dashboard.
-
-    named_frames maps a human-readable file label (e.g. 'Detections export',
-    'Device report', 'Previous report') to its loaded DataFrame (or None).
-    Files with no recognisable customer column, or only blank values, are
-    skipped -- they cannot be checked. Comparison is case- and
-    whitespace-insensitive.
-
-    Raises ValueError listing each file's customer(s) when they disagree
-    (this also fires if a single file contains more than one customer).
-
-    Deliberately NOT applied to the advanced-option inputs (patch report,
-    patch failure report, patch check report) -- those exports frequently
-    lack a reliable customer column.
-    """
-    per_file = {label: _extract_customers(df) for label, df in named_frames.items()}
-    per_file = {label: cust for label, cust in per_file.items() if cust}
-    if len(per_file) < 2 and sum(len(c) for c in per_file.values()) <= 1:
-        return
-
-    union: dict = {}
-    for cust in per_file.values():
-        union.update(cust)
-    if len(union) <= 1:
-        return
-
-    detail = '\n'.join(
-        f"  - {label}: {', '.join(sorted(cust.values()))}"
-        for label, cust in per_file.items()
-    )
-    raise ValueError(
-        "Customer mismatch between input files:\n"
-        f"{detail}\n\n"
-        "All files must be exports for the same customer.\n"
-        "Run aborted to prevent mixing data between customers."
-    )
 
 
 # ==============================================================================
@@ -486,39 +466,7 @@ def load_vulnerability_data(file_path: str) -> pd.DataFrame:
             #            the default (numpy-backed) CSV reader.
             df = pd.read_csv(file_path)
 
-    rename = {}
-    for col in df.columns:
-        c = str(col).strip().lower()
-        if   c in ('asset name', 'device name', 'endpoint'):
-            rename[col] = 'Name'
-        elif c in ('vulnerability id', 'cve id', 'cve'):
-            rename[col] = 'Vulnerability Name'
-        elif c in ('cvss score', 'cvss v3.1 base score', 'cvss v3 base score',
-                   'base score', 'score'):
-            rename[col] = 'Vulnerability Score'
-        elif c in ('affected products', 'product'):
-            rename[col] = 'Affected Products'
-        elif c in ('severity', 'risk'):
-            rename[col] = 'Vulnerability Severity'
-        elif c in ('threat status',):
-            rename[col] = 'Threat Status'
-        elif c in ('customer name', 'client name', 'account name', 'client'):
-            rename[col] = 'Customer'
-        elif c in ('site name', 'location name'):
-            rename[col] = 'Site'
-        elif c in ('has exploit', 'exploit') and 'Has Known Exploit' not in df.columns:
-            rename[col] = 'Has Known Exploit'
-        elif c == 'cisa kev' and col != 'CISA KEV' and 'CISA KEV' not in df.columns:
-            rename[col] = 'CISA KEV'
-        elif c == 'first detected' and col != 'First detected':
-            rename[col] = 'First detected'
-        elif c == 'last updated' and col != 'Last updated':
-            rename[col] = 'Last updated'
-        elif c in ('updates available', 'update available'):
-            rename[col] = 'Update Available'
-        elif c in ('operating system role', 'os role'):
-            rename[col] = 'Operating System Role'
-    df.rename(columns=rename, inplace=True)
+    df = _rename_cve_columns(df)
 
     # Flag whether a real numeric score column existed in the source file.
     # Checked BEFORE defaults so we can distinguish 'column was present but zero'
@@ -536,15 +484,8 @@ def load_vulnerability_data(file_path: str) -> pd.DataFrame:
 
     # ── Score derivation ────────────────────────────────────────────────────
     # Step 1: if all scores are zero (no numeric CVSS column in the export),
-    # derive approximate scores from the Severity text label.
-    # This handles N-able exports that ship Severity (CRITICAL/IMPORTANT/
-    # MODERATE/LOW) instead of a CVSS float column.
-    _SEVERITY_SCORE_MAP = {
-        'critical':  9.0,
-        'important': 7.0,
-        'moderate':  5.0,
-        'low':       2.0,
-    }
+    # derive approximate scores from the Severity text label — see the
+    # module-level _SEVERITY_SCORE_MAP.
     if not _had_score_col and 'Vulnerability Severity' in df.columns:
         df['Vulnerability Score'] = (
             df['Vulnerability Severity']
@@ -652,7 +593,7 @@ def load_rmm_data(file_path):
 
     return df.drop_duplicates(subset=['Device_Join'], keep='first')
 
-def merge_data(df_vuln, df_rmm, skip_rmm, exclude_missing_rmm=True, as_of_date=None):
+def merge_data(df_vuln, df_rmm, skip_rmm, exclude_missing_rmm=False, as_of_date=None):
     vuln_has_lr = 'Last Response' in df_vuln.columns
     vuln_has_dt = 'Device Type'   in df_vuln.columns
 
@@ -863,9 +804,14 @@ def _apply_cascade_resolution(df: pd.DataFrame) -> pd.DataFrame:
         return df
 
     cascade_applied = 0
-    for idx, row in df.iterrows():
-        if str(row.get('Patch Evidence Status', '')).strip() != 'Unresolved':
-            continue
+    # Only Unresolved rows can be cascade-resolved — iterate just those
+    # instead of the entire frame (the previous full-frame iterrows dominated
+    # patch-match time on 40k-row Chrome/Edge datasets).
+    if 'Patch Evidence Status' in df.columns:
+        _unresolved = df[df['Patch Evidence Status'].astype(str).str.strip() == 'Unresolved']
+    else:
+        _unresolved = df.iloc[0:0]
+    for idx, row in _unresolved.iterrows():
         device  = str(row['Name'])
         pk      = str(row.get('_cascade_pk', ''))
         cve_ids = [c.upper() for c in _extract_cves(str(row.get('Vulnerability Name', '')))]
@@ -909,7 +855,15 @@ def _apply_cascade_resolution(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def process_patch_match(patch_path, cve_df, min_score=9.0):
+def process_patch_match(patch_path, cve_df, min_score=9.0, as_of_date=None):
+    """
+    Match CVE detections against a patch report.
+
+    as_of_date — optional report-generation timestamp. Used as the anchor for
+    'N Days Exposed' so the count is frozen at the time the report was built
+    (matching merge_data's Days Since Last Response behaviour) rather than
+    recalculated on every run. Defaults to now.
+    """
     patch  = load_data(patch_path)
     miss_p = {'Client', 'Site', 'Device', 'Status', 'Patch',
               'Discovered / Install Date'} - set(patch.columns)
@@ -1028,13 +982,24 @@ def process_patch_match(patch_path, cve_df, min_score=9.0):
     # ── Patch Evidence Status (vectorised) ───────────────────────────────────
     _vcr_s   = best['Version Check Result'].astype(str).str.strip()
     _inst_dt = pd.to_datetime(best['Patch Install Date'], errors='coerce')
-    _cve_dates_max = best[['First detected', 'Date Published']].apply(
-        lambda col: pd.to_datetime(
-            col.astype(str).str.replace(' UTC', '', regex=False),
-            errors='coerce', utc=True
-        ).dt.tz_localize(None) if col.name in best.columns else pd.NaT,
-        axis=0,
-    ).max(axis=1)
+    # Only select date columns that actually exist — N-able exports don't
+    # always include 'First detected', and 'Date Published' is only present
+    # when cve_lookup enrichment has run. Selecting a missing column with
+    # best[[...]] raises KeyError, which previously crashed the whole patch
+    # match for exports lacking both columns.
+    _cve_date_cols = [c for c in ('First detected', 'Date Published') if c in best.columns]
+    if _cve_date_cols:
+        _cve_dates_max = best[_cve_date_cols].apply(
+            lambda col: pd.to_datetime(
+                col.astype(str).str.replace(' UTC', '', regex=False),
+                errors='coerce', utc=True
+            ).dt.tz_localize(None),
+            axis=0,
+        ).max(axis=1)
+    else:
+        # No CVE-side dates at all — _vec_pes will treat every row as
+        # 'Unresolved' (install date cannot be tied to the CVE's timeline).
+        _cve_dates_max = pd.Series(pd.NaT, index=best.index)
 
     best['Patch Evidence Status'] = _vec_pes(_status_s, _vcr_s, _inst_dt, _cve_dates_max)
 
@@ -1045,7 +1010,8 @@ def process_patch_match(patch_path, cve_df, min_score=9.0):
     # from CVE.org/NVD).  Falls back to First detected when Date Published is
     # missing (conservative — N-able may detect later than disclosure).
     # Patched rows show '✓ Patched' so the column remains useful in every row.
-    _today_ts = pd.Timestamp.now().normalize()
+    _today_ts = (pd.Timestamp(as_of_date) if as_of_date is not None
+                 else pd.Timestamp.now()).normalize()
 
     def _n_days_exposed(row):
         # Skip rows already confirmed patched
@@ -1186,19 +1152,8 @@ def load_previous_report(file_path):
                 "Please load a dashboard generated by this tool."
             )
 
-        prev_rename = {}
-        for col in df.columns:
-            c = str(col).strip().lower()
-            if c in ('customer name', 'client name', 'client') and 'Customer' not in df.columns:
-                prev_rename[col] = 'Customer'
-            elif c in ('site name', 'location name') and 'Site' not in df.columns:
-                prev_rename[col] = 'Site'
-            elif c == 'first detected' and col != 'First detected':
-                prev_rename[col] = 'First detected'
-            elif c == 'last updated' and col != 'Last updated':
-                prev_rename[col] = 'Last updated'
-        if prev_rename:
-            df.rename(columns=prev_rename, inplace=True)
+        # Shared normalisation — same helper as load_vulnerability_data.
+        df = _rename_cve_columns(df)
 
         df['_Name_Key'] = _normalize_device_col(df['Name'])
         df['_CVE_Key']  = df['Vulnerability Name'].astype(str).apply(extract_cve_id)
@@ -1289,30 +1244,7 @@ def load_previous_report(file_path):
 
     # Apply the same column rename logic as load_vulnerability_data so column
     # names are normalised before the missing-column check.
-    rename = {}
-    for col in df.columns:
-        c = str(col).strip().lower()
-        if   c in ('asset name', 'device name', 'endpoint'):
-            rename[col] = 'Name'
-        elif c in ('vulnerability id', 'cve id', 'cve'):
-            rename[col] = 'Vulnerability Name'
-        elif c in ('cvss score', 'cvss v3.1 base score', 'cvss v3 base score',
-                   'base score', 'score'):
-            rename[col] = 'Vulnerability Score'
-        elif c in ('affected products', 'product'):
-            rename[col] = 'Affected Products'
-        elif c in ('severity', 'risk'):
-            rename[col] = 'Vulnerability Severity'
-        elif c in ('customer name', 'client name', 'account name', 'client'):
-            rename[col] = 'Customer'
-        elif c in ('site name', 'location name'):
-            rename[col] = 'Site'
-        elif c == 'first detected' and col != 'First detected':
-            rename[col] = 'First detected'
-        elif c == 'last updated' and col != 'Last updated':
-            rename[col] = 'Last updated'
-    if rename:
-        df.rename(columns=rename, inplace=True)
+    df = _rename_cve_columns(df)
 
     # Validate minimum required columns — give a clear error if it looks wrong
     missing = {'Name', 'Vulnerability Name'} - set(df.columns)
@@ -1334,8 +1266,8 @@ def load_previous_report(file_path):
         _sheets_str = (', '.join(xl.sheet_names[:6]) + (' ...' if len(xl.sheet_names) > 6 else ''))  if xl is not None else '(CSV file — no sheets)'
         raise ValueError(f"Cannot use '{fname}' as a previous report.\n\n{_hint}\n\nSheets found: {_sheets_str}")
 
-    # Derive Vulnerability Score from Severity if no numeric score column present
-    _SEVERITY_SCORE_MAP = {'critical': 9.0, 'important': 7.0, 'moderate': 5.0, 'low': 2.0}
+    # Derive Vulnerability Score from Severity if no numeric score column
+    # present — same module-level _SEVERITY_SCORE_MAP as load_vulnerability_data.
     if 'Vulnerability Score' not in df.columns and 'Vulnerability Severity' in df.columns:
         df['Vulnerability Score'] = (
             df['Vulnerability Severity'].astype(str).str.strip().str.lower()

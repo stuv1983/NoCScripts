@@ -14,9 +14,8 @@ of this refactor's scope.
 
 Author : Stu Villanti <s.villanti@kenstra.com>
 """
-from typing import Optional
-
 import pandas as pd
+from typing import Optional
 
 def build_diagnostics_sheets(writer, diagnostics: dict) -> None:
     wb = writer.book
@@ -221,7 +220,7 @@ def build_patch_resolved_sheet(writer, patch_full_df: 'pd.DataFrame') -> None:
 
 def build_products_not_tracked_sheet(writer,
                                       patch_full_df: 'pd.DataFrame') -> None:
-    import pandas as pd, re
+    import re
     from data_pipeline import get_base_product, _detect_product, _norm_text
 
     wb       = writer.book
@@ -452,7 +451,7 @@ def build_patch_sheets(writer, overview_df, full_df, patch_df):
 
 def build_patch_check_failure_sheet(writer, check_df: 'pd.DataFrame',
                                     check_lookup: dict,
-                                    cve_device_overlap: 'Optional[pd.DataFrame]' = None,
+                                    cve_device_overlap: Optional['pd.DataFrame'] = None,
                                     inventory_devices: 'set | None' = None) -> None:
     """
     Builds the 'Patch Check Failures' sheet from an RMM monitoring-check

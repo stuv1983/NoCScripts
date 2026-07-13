@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry

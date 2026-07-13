@@ -20,9 +20,9 @@ import pandas as pd
 
 from config import CVE_PATTERN
 from data_pipeline import (
-    normalize_device_name, extract_cve_id, get_col_letter,
+    normalize_device_name, extract_cve_id,
 )
-from formatting import get_workbook_styles, build_legend_entries, COLORS
+from formatting import get_workbook_styles, build_legend_entries
 from resolution import (
     split_patch_pairs as _split_patch_pairs,
     get_sheet_product_key as _get_sheet_pk,
@@ -30,47 +30,10 @@ from resolution import (
     compute_resolved_series as _compute_resolved_series,
     dedup_per_base_product as _dedup_per_base_product,
 )
-from sheet_helpers import (
-    write_nvd_links as _write_nvd_links,
-    write_hs_subtotals as _write_hs_subtotals,
-)
+from sheet_helpers import write_nvd_links as _write_nvd_links
 
 import logging
 log = logging.getLogger(__name__)
-
-
-def _hs_subtotal_counts(df: 'pd.DataFrame') -> dict:
-    """
-    Generation-time values for one sheet's six health-score subtotal cells
-    (see sheet_helpers.write_hs_subtotals).  Deliberately mirrors the LOCAL
-    Excel formulas those cells hold — COUNTIF on ☑/☐, CVSS ≥ 9, and a
-    case-insensitive "Yes" match on Has Known Exploit — so the cached values
-    equal what Excel computes on first recalculation.
-    """
-    _res_s = df['Resolved'].astype(str).str.strip() if 'Resolved' in df.columns else pd.Series(dtype=str)
-    _is_r  = _res_s == '☑'
-    _is_u  = _res_s == '☐'
-    if 'Vulnerability Score' in df.columns:
-        _crit = pd.to_numeric(df['Vulnerability Score'], errors='coerce') >= 9.0
-    else:
-        _crit = pd.Series(False, index=df.index)
-    if 'Has Known Exploit' in df.columns:
-        _exp = df['Has Known Exploit'].astype(str).str.strip().str.lower() == 'yes'
-    else:
-        _exp = pd.Series(False, index=df.index)
-    if 'CISA KEV' in df.columns:
-        _kev = df['CISA KEV'].astype(str).str.strip().str.lower() == 'yes'
-    else:
-        _kev = pd.Series(False, index=df.index)
-    return {
-        'res':        int(_is_r.sum()),
-        'unres':      int(_is_u.sum()),
-        'crit_res':   int((_is_r & _crit).sum()),
-        'crit_unres': int((_is_u & _crit).sum()),
-        'exp_res':    int((_is_r & _exp).sum()),
-        'exp_unres':  int((_is_u & _exp).sum()),
-        'kev_unres':  int((_is_u & _kev).sum()),
-    }
 
 
 def compute_score_lift(
@@ -223,14 +186,6 @@ def _build_patch_confirmed_sheet(writer, sheet_name: str, product: str,
     }
     for ci, col in enumerate(col_names):
         ws.set_column(ci, ci, _widths.get(col, 16))
-
-    # ── Health/resolution subtotal block (hidden cols Q/R, rows 1-6) ──────────
-    # Same fixed-location block the full triage sheets carry, so the Summary
-    # sheet's live formulas can sum one cell per sheet uniformly.  Built from
-    # THIS sheet's column order — confirmed sheets have no Score Lift column,
-    # so Vulnerability Score / Has Known Exploit sit one column left of a full
-    # triage sheet's layout.
-    _write_hs_subtotals(ws, wb, col_names, _hs_subtotal_counts(out_df))
 
     # Footer note
     foot_fmt = wb.add_format({'italic': True, 'font_color': '#595959', 'font_size': 8})
@@ -418,15 +373,6 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
 
         ws.autofilter(0, 0, len(group), len(final_cols) - 1)
 
-        # ── Health/resolution subtotal block (hidden cols Q/R, rows 1-6) ───────
-        # Totals this sheet's ☑/☐ counts once, locally, so the Summary sheet's
-        # live formulas (Resolution Status table always; Patching Health Score
-        # when enabled) can reference ONE cell per sheet instead of embedding a
-        # COUNTIFS per sheet — which blew past Excel's 8,192-char formula limit
-        # on workbooks with many product sheets. Written unconditionally: the
-        # Resolution Status table is live regardless of include_health_score.
-        _write_hs_subtotals(ws, wb_, final_cols, _hs_subtotal_counts(group))
-
         styles_           = get_workbook_styles(wb_)
         patch_res_fmt     = styles_['row_blue']
         exploit_fmt       = wb_.add_format({'bg_color': '#FFE0CC'})
@@ -548,7 +494,6 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
         if 'Device Type'        in cl: ws.set_column(cl.index('Device Type'),        cl.index('Device Type'),        15)
         if 'Baseline Compliance' in cl: ws.set_column(cl.index('Baseline Compliance'), cl.index('Baseline Compliance'), 22)
         if _vs_idx is not None:
-            _vs_col = get_col_letter(_vs_idx)
             ws.set_column(_vs_idx, _vs_idx, 8)
             # CVSS score colour coding — matches the Risk Rating matrix exactly:
             # Critical 9.0-10.0 = red, High 7.0-8.9 = gold, Medium 4.0-6.9 = yellow,

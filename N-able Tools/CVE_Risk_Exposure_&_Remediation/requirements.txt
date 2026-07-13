@@ -7,9 +7,17 @@
 
 pandas>=2.0
 xlsxwriter>=3.1
-openpyxl>=3.1       # pandas needs this engine to read .xlsx files
-pyarrow>=14         # optional but recommended: cuts string-column RAM in CSV loads
-                    # (dtype_backend='pyarrow' in load_vulnerability_data)
+openpyxl>=3.1        # pandas needs this engine to read .xlsx files
+packaging>=23        # version comparison in data_pipeline._parse_version /
+                     # _version_gte (usually present transitively, but the
+                     # code imports it directly so it must be declared)
+pyarrow>=14          # optional but recommended: cuts string-column RAM in CSV loads
+                     # (dtype_backend='pyarrow' in load_vulnerability_data)
+python-calamine>=0.2 # optional but recommended: 4-5x faster .xlsx reads
+                     # (data_pipeline auto-falls back to openpyxl if absent)
 
-requests>=2.31      # HTTP client with connection pooling, retry, and backoff
-loguru>=0.7         # Structured logging with automatic file rotation and retention
+requests>=2.31       # HTTP client for cve_lookup / version_sync
+
+# GUI (main.py) — not needed for headless runs via run_dashboard.py
+customtkinter>=5.2
+tkcalendar>=1.6

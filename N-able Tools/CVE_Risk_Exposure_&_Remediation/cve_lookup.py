@@ -1398,8 +1398,6 @@ def enrich_from_detections(cve_df: 'pd.DataFrame',
         with open(config_path, 'r', encoding='utf-8') as fh:
             cfg = json.load(fh)
         fvr          = cfg.get('fixed_version_rules', {})
-        product_map  = [(str(k).lower(), str(v).lower())
-                        for k, v in cfg.get('product_map', [])]
 
         # Build set of CVE IDs already fully covered in config.json
         known: set[str] = set()

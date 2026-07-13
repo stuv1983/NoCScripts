@@ -73,7 +73,7 @@ def select_file(label_var, filetypes=None):
 # BACKGROUND WORKER
 # ===========================================================================
 
-def _run_in_thread(request, progress_bar):
+def _run_in_thread(request):
     try:
         log.info("Background thread started")
         result = run_dashboard(request)
@@ -217,7 +217,7 @@ def process_reports():
     generate_btn.configure(state="disabled")
     status_var.set("Generating dashboard... please wait")
     show_progress()
-    threading.Thread(target=_run_in_thread, args=(request, progress_bar), daemon=True).start()
+    threading.Thread(target=_run_in_thread, args=(request,), daemon=True).start()
 
 
 # ===========================================================================

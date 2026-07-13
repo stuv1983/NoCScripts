@@ -2,8 +2,8 @@
 formatting.py — named color palette and shared xlsxwriter format factories
 for the dashboard workbook.
 
-Note: excel_builder.py still has many local add_format() calls using the
-same hex colors under different names — not yet all migrated to COLORS
+Note: some sheet-builder modules still have local add_format() calls using
+the same hex colors under different names — not yet all migrated to COLORS
 below.
 """
 from __future__ import annotations
