@@ -522,20 +522,17 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         # rows — with toggleable checkboxes — onto the sheets, and the
         # per-sheet subtotal cells would count them into the health score as
         # they're toggled. Live scoring stays disabled there.
-        _hs_residual = {'res': 0, 'unres': 0, 'crit_res': 0,
+        _hs_residual = {'hs_res': 0, 'hs_unres': 0, 'crit_res': 0,
                         'crit_unres': 0, 'exp_res': 0, 'exp_unres': 0,
                         'kev_unres': 0}
         _hs_key_cols = ['Base Product', 'Name', 'Vulnerability Name']
-        if _hs_live and threshold < _score_scope_threshold:
-            log.info(
-                "Patching Health Score live formulas disabled: report threshold %.1f is "
-                "below the health-score scope (CVSS ≥ %.1f), so product sheets "
-                "contain toggleable rows outside the score's scope. Static score values "
-                "will be written instead.",
-                threshold, _score_scope_threshold,
-            )
-            _hs_live = False
-        elif _hs_live and not all(c in _score_scope.columns for c in _hs_key_cols):
+        # A report threshold BELOW the health scope (e.g. 1.0) puts sub-7.0
+        # rows with toggleable checkboxes on the sheets — but the fleet sums
+        # only reference the scoped subtotal cells (R5-R9 carry the
+        # 'Vulnerability Score >= 7' criterion inside their COUNTIFS), so
+        # those rows can never feed the score and live scoring stays on at
+        # ANY report threshold (v0.35).
+        if _hs_live and not all(c in _score_scope.columns for c in _hs_key_cols):
             log.info(
                 "Patching Health Score live formulas disabled: health scope is missing "
                 "one of %s, so off-sheet rows can't be matched. Static score values "
@@ -568,8 +565,10 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
                 else:
                     _hkm = pd.Series(False, index=_score_scope.index)
                 _hs_residual = {
-                    'res':        int((_off_mask & _hs_is_res).sum()),
-                    'unres':      int((_off_mask & _hs_is_unr).sum()),
+                    # Off-sheet rows are all within the health scope by
+                    # construction, so they carry the hs_* keys.
+                    'hs_res':     int((_off_mask & _hs_is_res).sum()),
+                    'hs_unres':   int((_off_mask & _hs_is_unr).sum()),
                     'crit_res':   int((_off_mask & _hcm & _hs_is_res).sum()),
                     'crit_unres': int((_off_mask & _hcm & _hs_is_unr).sum()),
                     'exp_res':    int((_off_mask & _hem & _hs_is_res).sum()),
@@ -615,8 +614,11 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
                     _s = f"{_s} + {_hs_residual[_key]}"
                 return _s
 
-            _f_sum_res        = _fleet_sum('res')
-            _f_sum_unres      = _fleet_sum('unres')
+            # 'hs_res'/'hs_unres' (R8/R9) — NOT the whole-sheet R1/R2, which
+            # include sub-scope rows when the report threshold is below the
+            # health scope. R1/R2 remain the Resolution Status table's source.
+            _f_sum_res        = _fleet_sum('hs_res')
+            _f_sum_unres      = _fleet_sum('hs_unres')
             _f_sum_crit_res   = _fleet_sum('crit_res')
             _f_sum_crit_unres = _fleet_sum('crit_unres')
             _f_sum_exp_res    = _fleet_sum('exp_res')

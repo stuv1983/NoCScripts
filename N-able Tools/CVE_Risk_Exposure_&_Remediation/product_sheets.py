@@ -82,9 +82,10 @@ def compute_score_lift(
 
     return round(lift, 2)
 
-def _hs_subtotal_counts(df: 'pd.DataFrame', all_resolved: bool = False) -> dict:
+def _hs_subtotal_counts(df: 'pd.DataFrame', all_resolved: bool = False,
+                        health_threshold: float = 7.0) -> dict:
     """
-    Generation-time values for the seven per-sheet health-score subtotals
+    Generation-time values for the nine per-sheet health-score subtotals
     (cached results for the local formulas written by write_hs_subtotals,
     so openpyxl/pandas data_only readers see correct numbers).
 
@@ -101,9 +102,12 @@ def _hs_subtotal_counts(df: 'pd.DataFrame', all_resolved: bool = False) -> dict:
     unres_mask = ~res_mask
 
     if 'Vulnerability Score' in df.columns:
-        crit_mask = pd.to_numeric(df['Vulnerability Score'], errors='coerce') >= 9.0
+        _sc = pd.to_numeric(df['Vulnerability Score'], errors='coerce')
+        crit_mask = _sc >= 9.0
+        hs_mask   = _sc >= health_threshold
     else:
         crit_mask = pd.Series([False] * n, index=df.index)
+        hs_mask   = pd.Series([False] * n, index=df.index)
     if 'Has Known Exploit' in df.columns:
         exp_mask = df['Has Known Exploit'].astype(str).str.strip().str.lower().isin(_yes)
     else:
@@ -118,9 +122,15 @@ def _hs_subtotal_counts(df: 'pd.DataFrame', all_resolved: bool = False) -> dict:
         'unres':      int(unres_mask.sum()),
         'crit_res':   int((crit_mask & res_mask).sum()),
         'crit_unres': int((crit_mask & unres_mask).sum()),
-        'exp_res':    int((exp_mask & res_mask).sum()),
-        'exp_unres':  int((exp_mask & unres_mask).sum()),
-        'kev_unres':  int((kev_mask & unres_mask).sum()),
+        # exploit / KEV / hs counts are scoped to the health threshold so
+        # sub-scope rows (present when the report threshold is lower) can
+        # never feed the health score — mirrors the COUNTIFS criteria in
+        # sheet_helpers.write_hs_subtotals.
+        'exp_res':    int((exp_mask & hs_mask & res_mask).sum()),
+        'exp_unres':  int((exp_mask & hs_mask & unres_mask).sum()),
+        'kev_unres':  int((kev_mask & hs_mask & unres_mask).sum()),
+        'hs_res':     int((hs_mask & res_mask).sum()),
+        'hs_unres':   int((hs_mask & unres_mask).sum()),
     }
 
 

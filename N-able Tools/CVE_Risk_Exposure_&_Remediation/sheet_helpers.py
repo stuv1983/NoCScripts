@@ -23,19 +23,31 @@ Author : Stu Villanti <s.villanti@kenstra.com>
 # for every sheet and silently tested the wrong columns on confirmed sheets.
 HS_SUBTOTAL_LBL_COL = 16   # col Q (hidden) — human-readable labels
 HS_SUBTOTAL_VAL_COL = 17   # col R (hidden) — the subtotal values/formulas
-HS_SUBTOTAL_ROWS = {       # key → 0-indexed row  (R1..R7 in Excel terms)
-    'res':        0,   # R1  ☑ rows
-    'unres':      1,   # R2  ☐ rows
+# The health score is scoped to CVSS ≥ HEALTH_SCORE_THRESHOLD regardless of
+# the report's own threshold, so a report built at (say) 1.0 puts sub-7.0
+# rows — with toggleable checkboxes — onto the sheets. Rows R5-R9 therefore
+# carry the score criterion INSIDE their COUNTIFS so those rows can never
+# feed the health score, while R1/R2 stay whole-sheet (they drive the
+# Summary's Resolution Status table, which is scoped to the report itself).
+# R3/R4 need no extra criterion: ≥ 9 already implies ≥ 7.
+HEALTH_SCORE_THRESHOLD = 7.0
+
+HS_SUBTOTAL_ROWS = {       # key → 0-indexed row  (R1..R9 in Excel terms)
+    'res':        0,   # R1  ☑ rows (whole sheet — Resolution Status table)
+    'unres':      1,   # R2  ☐ rows (whole sheet — Resolution Status table)
     'crit_res':   2,   # R3  ☑ rows with Vulnerability Score ≥ 9
     'crit_unres': 3,   # R4  ☐ rows with Vulnerability Score ≥ 9
-    'exp_res':    4,   # R5  ☑ rows with Has Known Exploit = Yes
-    'exp_unres':  5,   # R6  ☐ rows with Has Known Exploit = Yes
-    'kev_unres':  6,   # R7  ☐ rows with CISA KEV = Yes (reserved for live
-                       #     KEV penalty work; penalties are static today)
+    'exp_res':    4,   # R5  ☑ rows, Has Known Exploit = Yes, score ≥ 7
+    'exp_unres':  5,   # R6  ☐ rows, Has Known Exploit = Yes, score ≥ 7
+    'kev_unres':  6,   # R7  ☐ rows, CISA KEV = Yes, score ≥ 7 (live KEV cap)
+    'hs_res':     7,   # R8  ☑ rows with score ≥ 7 (health resolution rate)
+    'hs_unres':   8,   # R9  ☐ rows with score ≥ 7 (health resolution rate)
 }
 _HS_SUBTOTAL_LABELS = {
     'res':        'HS subtotal: resolved rows (☑)',
     'unres':      'HS subtotal: unresolved rows (☐)',
+    'hs_res':     'HS subtotal: ☑ rows at CVSS ≥ 7',
+    'hs_unres':   'HS subtotal: ☐ rows at CVSS ≥ 7',
     'crit_res':   'HS subtotal: resolved CVSS ≥ 9 rows',
     'crit_unres': 'HS subtotal: unresolved CVSS ≥ 9 rows',
     'exp_res':    'HS subtotal: resolved known-exploit rows',
@@ -52,9 +64,10 @@ def hs_subtotal_ref(sheet_name: str, key: str) -> str:
     return f"'{safe}'!${col}${row}"
 
 
-def write_hs_subtotals(ws, workbook, col_names, counts: dict) -> None:
+def write_hs_subtotals(ws, workbook, col_names, counts: dict,
+                       health_threshold: float = HEALTH_SCORE_THRESHOLD) -> None:
     """
-    Write the seven health-score subtotal cells onto a product sheet.
+    Write the nine health-score subtotal cells onto a product sheet.
 
     Each value cell holds a LOCAL formula over this sheet's own columns
     (so it stays live when ☑/☐ are toggled) with the generation-time count
@@ -79,25 +92,32 @@ def write_hs_subtotals(ws, workbook, col_names, counts: dict) -> None:
 
     _hidden_fmt = workbook.add_format({'font_color': '#BFBFBF', 'font_size': 8})
 
+    _ht = health_threshold
     def _formula(key):
         """Local formula string for one subtotal, or None if not computable."""
         if _c_res is None:
             return None
-        mark = '☑' if key in ('res', 'crit_res', 'exp_res') else '☐'
+        mark = '☑' if key in ('res', 'crit_res', 'exp_res', 'hs_res') else '☐'
         base = f'${_c_res}:${_c_res},"{mark}"'
+        _scope = (f',${_c_score}:${_c_score},">="&{_ht:g}'
+                  if _c_score is not None else None)
         if key in ('res', 'unres'):
             return f'=COUNTIF({base})'
         if key in ('crit_res', 'crit_unres'):
             if _c_score is None:
                 return None
             return f'=COUNTIFS({base},${_c_score}:${_c_score},">="&9)'
-        if key == 'kev_unres':
-            if _c_kev is None:
+        if key in ('hs_res', 'hs_unres'):
+            if _scope is None:
                 return None
-            return f'=COUNTIFS({base},${_c_kev}:${_c_kev},"Yes")'
-        if _c_exp is None:
+            return f'=COUNTIFS({base}{_scope})'
+        if key == 'kev_unres':
+            if _c_kev is None or _scope is None:
+                return None
+            return f'=COUNTIFS({base},${_c_kev}:${_c_kev},"Yes"{_scope})'
+        if _c_exp is None or _scope is None:
             return None
-        return f'=COUNTIFS({base},${_c_exp}:${_c_exp},"Yes")'
+        return f'=COUNTIFS({base},${_c_exp}:${_c_exp},"Yes"{_scope})'
 
     for key, r in HS_SUBTOTAL_ROWS.items():
         static = int(counts.get(key, 0))
