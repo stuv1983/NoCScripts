@@ -28,21 +28,17 @@ log = logging.getLogger(__name__)
 from formatting import get_workbook_styles, get_band_formats, build_legend_entries, COLORS  # noqa: E402,F401
 
 
-# _write_cve_links / _write_nvd_links moved to sheet_helpers.py (shared by
-# excel_builder.py and product_sheets.py without either importing the other).
-from sheet_helpers import write_cve_links as _write_cve_links, write_nvd_links as _write_nvd_links  # noqa: E402,F401
-
 # build_product_sheets, _build_patch_confirmed_sheet, and compute_score_lift
 # moved to product_sheets.py — re-exported here so existing
 # `from excel_builder import build_product_sheets` imports (orchestrator.py)
 # keep working unchanged.
 from product_sheets import build_product_sheets  # noqa: E402,F401
 
-# build_trend_summary_sheet and build_trend_detail_sheets moved to
-# trend_sheets.py — re-exported here so existing
-# `from excel_builder import build_trend_summary_sheet, build_trend_detail_sheets`
-# imports (orchestrator.py) keep working unchanged.
-from trend_sheets import build_trend_summary_sheet, build_trend_detail_sheets  # noqa: E402,F401
+# build_trend_detail_sheets moved to trend_sheets.py — re-exported here so
+# existing `from excel_builder import build_trend_detail_sheets` imports
+# keep working unchanged. (build_trend_summary_sheet removed in v0.33 —
+# the Summary sheet's month-over-month sections replaced it.)
+from trend_sheets import build_trend_detail_sheets  # noqa: E402,F401
 
 # build_client_summary_sheet and compute_patching_health_score moved to
 # summary_sheet.py — re-exported here so existing
@@ -61,13 +57,12 @@ from patch_sheets import (  # noqa: E402,F401
     build_patch_sheets, build_patch_check_failure_sheet,
 )
 
-# build_all_detections_sheet, build_stale_excluded_sheet,
-# build_stale_cves_sheet, build_device_report_sheet, and
-# build_raw_data_sheet moved to device_sheets.py — re-exported here so
-# existing `from excel_builder import ...` imports (orchestrator.py)
-# keep working unchanged.
+# build_stale_excluded_sheet, build_stale_cves_sheet,
+# build_device_report_sheet, and build_raw_data_sheet moved to
+# device_sheets.py — re-exported here so existing
+# `from excel_builder import ...` imports keep working unchanged.
+# (build_all_detections_sheet removed in v0.33 — dead code, never called.)
 from device_sheets import (  # noqa: E402,F401
-    build_all_detections_sheet, build_stale_excluded_sheet,
-    build_stale_cves_sheet, build_device_report_sheet,
-    build_raw_data_sheet,
+    build_stale_excluded_sheet, build_stale_cves_sheet,
+    build_device_report_sheet, build_raw_data_sheet,
 )

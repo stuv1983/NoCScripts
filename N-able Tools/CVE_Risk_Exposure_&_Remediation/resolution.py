@@ -9,7 +9,6 @@ Precedence (first match wins):
   1. Patch evidence    — (device, cve[, product]) in patch_resolved_pairs
   2. Raw export status — Threat Status / Status column == 'RESOLVED'
   3. Neither           — unresolved (☐)
-Override: an approaching-stale device is always forced to ☐.
 
 Trend-inferred resolution (a device/CVE pair unresolved last report and
 now absent) is handled separately in data_pipeline.compute_trends() —
@@ -67,7 +66,6 @@ def compute_resolved_flags(
     sheet_product_key: str,
     patch_2d: Set[Tuple[str, str]],
     patch_3d: Dict[str, Set[Tuple[str, str]]],
-    approaching_stale_names: Optional[Set[str]] = None,
 ) -> List[bool]:
     """
     Return a list[bool] aligned to df's row order — True means resolved (☑).
@@ -81,8 +79,6 @@ def compute_resolved_flags(
     build_client_summary_sheet (Resolution Status table) must call — do not
     reimplement this logic at either call site.
     """
-    approaching_stale_names = approaching_stale_names or set()
-
     nk_list = [normalize_device_name(str(n)) for n in df['Name']]
     ck_list = [extract_cve_id(str(v)) for v in df['Vulnerability Name']]
 
@@ -105,14 +101,6 @@ def compute_resolved_flags(
             df[status_col].astype(str).str.strip().str.upper().eq('RESOLVED').tolist()
         )
         res_bool = [res_bool[i] or status_resolved[i] for i in range(len(res_bool))]
-
-    # Override: approaching-stale devices always ☐
-    if approaching_stale_names:
-        name_list = df['Name'].tolist()
-        res_bool = [
-            False if name_list[i] in approaching_stale_names else res_bool[i]
-            for i in range(len(res_bool))
-        ]
 
     return res_bool
 
@@ -158,7 +146,6 @@ def compute_resolved_series(
     df: pd.DataFrame,
     product_to_sheet: Optional[dict] = None,
     patch_resolved_pairs: Optional[set] = None,
-    approaching_stale_names: Optional[Set[str]] = None,
 ) -> pd.Series:
     """
     Whole-dataframe version of compute_resolved_flags(): groups df by
@@ -185,7 +172,6 @@ def compute_resolved_series(
 
     Do not reimplement this locally.
     """
-    approaching_stale_names = approaching_stale_names or set()
     patch_2d, patch_3d = split_patch_pairs(patch_resolved_pairs)
 
     if 'Base Product' not in df.columns:
@@ -193,11 +179,9 @@ def compute_resolved_series(
         # still correctly aligned since there's no groupby involved.
         status_col = ('Threat Status' if 'Threat Status' in df.columns
                       else 'Status' if 'Status' in df.columns else None)
-        is_approaching = (df['Name'].isin(approaching_stale_names)
-                          if 'Name' in df.columns else pd.Series(False, index=df.index))
         is_resolved = (df[status_col].astype(str).str.strip().str.upper().eq('RESOLVED')
                        if status_col else pd.Series(False, index=df.index))
-        return is_resolved & ~is_approaching
+        return is_resolved
 
     flags: List[bool] = []
     flag_index: list = []
@@ -205,8 +189,7 @@ def compute_resolved_series(
         raw_pnames = (group['Affected Products'].dropna().astype(str).unique().tolist()
                       if 'Affected Products' in group.columns else [])
         sheet_pk = get_sheet_product_key(raw_pnames, base_product)
-        flags.extend(compute_resolved_flags(group, sheet_pk, patch_2d, patch_3d,
-                                            approaching_stale_names=approaching_stale_names))
+        flags.extend(compute_resolved_flags(group, sheet_pk, patch_2d, patch_3d))
         flag_index.extend(group.index.tolist())
 
     if len(flags) != len(df):
@@ -215,11 +198,9 @@ def compute_resolved_series(
         # than raise mid-report-generation.
         status_col = ('Threat Status' if 'Threat Status' in df.columns
                       else 'Status' if 'Status' in df.columns else None)
-        is_approaching = (df['Name'].isin(approaching_stale_names)
-                          if 'Name' in df.columns else pd.Series(False, index=df.index))
         is_resolved = (df[status_col].astype(str).str.strip().str.upper().eq('RESOLVED')
                        if status_col else pd.Series(False, index=df.index))
-        return is_resolved & ~is_approaching
+        return is_resolved
 
     # Build from (label, flag) pairs, then reindex to df's original row
     # order — pandas aligns by index LABEL here, not position, so this is

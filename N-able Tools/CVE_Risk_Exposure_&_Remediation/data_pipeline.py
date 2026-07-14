@@ -6,7 +6,6 @@ Author : Stu Villanti <s.villanti@kenstra.com>
 """
 
 import logging
-import os
 from pathlib import Path
 import re
 from typing import Optional, Set

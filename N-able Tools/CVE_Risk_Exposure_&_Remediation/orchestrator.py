@@ -34,9 +34,8 @@ from data_pipeline import (
 )
 from diagnostics import compute_patch_diagnostics, classify_root_cause
 import snapshot as snap_store
-from formatting import get_workbook_styles
 from summary_sheet import build_client_summary_sheet
-from trend_sheets import build_trend_summary_sheet, build_trend_detail_sheets
+from trend_sheets import build_trend_detail_sheets
 from product_sheets import build_product_sheets
 from patch_sheets import (
     build_patch_sheets, build_diagnostics_sheets,
@@ -126,7 +125,6 @@ class DashboardRequest:
     sync_baselines:       bool           = False
     exclude_missing_rmm:  bool           = False
     report_month:         str            = ''
-    stale_warning_days:   int            = 14   # flag active devices within this many days of going stale
     include_health_score: bool           = False  # beta — show Patching Health Score on Summary sheet
 
 @dataclass
@@ -286,7 +284,6 @@ def run(request: DashboardRequest) -> DashboardResult:
 
         raw_df         = merged_df.copy()
         stale_excluded = pd.DataFrame()
-        approaching_stale_names: set = set()
 
         if not request.show_all_dates and request.cutoff_date:
             cutoff = pd.to_datetime(request.cutoff_date, dayfirst=True, errors='coerce')
@@ -315,27 +312,6 @@ def run(request: DashboardRequest) -> DashboardResult:
                 "Date filter applied (>= %s): %d rows kept, %d stale device(s) excluded",
                 request.cutoff_date, len(merged_df), len(all_stale_names),
             )
-
-        # ── Approaching stale ────────────────────────────────────────────────
-        # Re-enabled: this was commented out "FOR TESTING" while the product
-        # sheet legend and the GUI's stale-warning-days input still advertised
-        # the feature, so users saw a legend entry for a row colour that could
-        # never appear.
-        warning_days = max(1, int(request.stale_warning_days))
-        approaching_stale_names: set = set()
-        if 'Days Since Last Response' in merged_df.columns:
-            _days_col_ap  = pd.to_numeric(merged_df['Days Since Last Response'], errors='coerce')
-            _active_mask  = merged_df['Last Response'] != 'Not Found in RMM'
-            approaching_stale_names = set(
-                merged_df.loc[
-                    _active_mask & (_days_col_ap >= warning_days),
-                    'Name'
-                ].unique()
-            )
-        log.info(
-            "%d device(s) flagged as approaching stale (offline >= %d days)",
-            len(approaching_stale_names), warning_days,
-        )
 
         if merged_df.empty:
             msg = (
@@ -659,9 +635,6 @@ def run(request: DashboardRequest) -> DashboardResult:
         log.info("Writing workbook: %s", request.output_path)
         with pd.ExcelWriter(request.output_path, engine='xlsxwriter') as writer:  # do NOT use constant_memory=True — corrupts data in xlsxwriter 3.x
             wb = writer.book
-            styles     = get_workbook_styles(wb)
-            link_fmt   = styles['link']
-            header_fmt = styles['header']
 
             _not_in_rmm_mask = filtered_df['Last Response'] == 'Not Found in RMM'
             _not_in_rmm_cve_rows = int(_not_in_rmm_mask.sum()) if 'Last Response' in filtered_df.columns else 0
@@ -678,8 +651,6 @@ def run(request: DashboardRequest) -> DashboardResult:
                 not_in_rmm_unique_cves=_not_in_rmm_unique_cves,
                 not_in_rmm_df=not_in_rmm_df if not not_in_rmm_df.empty else None,
                 report_month=report_month_val,
-                approaching_stale_names=approaching_stale_names,
-                stale_warning_days=request.stale_warning_days,
                 product_to_sheet=product_to_sheet,
                 include_health_score=request.include_health_score,
                 patch_resolved_pairs=patch_resolved_pairs,
@@ -690,31 +661,18 @@ def run(request: DashboardRequest) -> DashboardResult:
                 patch_check_active_df=patch_check_active_df if not patch_check_active_df.empty else None,
                 patch_check_active_names=check_active_names,
             )
+            # v0.33: the 'Trend Summary' sheet was removed — the Summary
+            # sheet's Month-over-Month Remediation Summary and Patching
+            # Progress sections cover the same metrics in one place.
             if trend_data:
-                build_trend_summary_sheet(wb, trend_data, request.threshold,
-                                          prev_report_name, header_fmt,
-                                          customer_name=customer_name)
+                build_trend_detail_sheets(writer, wb, trend_data)
 
-            if trend_data:
-                build_trend_detail_sheets(writer, wb, trend_data, link_fmt,
-                                          sheets_subset={'New This Month', 'Persisting CVEs'})
-
-            build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
+            build_product_sheets(writer, triage_df, product_to_sheet,
                                   patch_resolved_pairs=patch_resolved_pairs,
                                   patch_gap_pairs=patch_gap_pairs,
-                                  approaching_stale_names=approaching_stale_names,
-                                  stale_warning_days=request.stale_warning_days,
                                   health_triage_df=health_triage_df,
                                   trend_data=trend_data,
                                   include_health_score=request.include_health_score)
-
-            # 'Resolved Since Previous Report' is placed after all product sheets —
-            # each product sheet tracks its own ☑/☐ Resolved column, so this
-            # cross-product, trend-inferred rollup reads more naturally as a
-            # follow-on to that per-product tracking than as a lead-in to it.
-            if trend_data:
-                build_trend_detail_sheets(writer, wb, trend_data, link_fmt,
-                                          sheets_subset={'Resolved Since Previous Report'})
 
             if not stale_excluded.empty or not not_in_rmm_df.empty:
                 build_stale_excluded_sheet(writer, stale_excluded,
@@ -743,7 +701,7 @@ def run(request: DashboardRequest) -> DashboardResult:
                 else:
                     not_in_rmm_cves = not_in_rmm_raw.copy()
 
-                build_stale_cves_sheet(writer, stale_unresolved_cves, link_fmt,
+                build_stale_cves_sheet(writer, stale_unresolved_cves,
                                        not_in_rmm_cves_df=not_in_rmm_cves if not not_in_rmm_cves.empty else None)
 
             _status_col_wb = ('Threat Status' if 'Threat Status' in merged_df.columns

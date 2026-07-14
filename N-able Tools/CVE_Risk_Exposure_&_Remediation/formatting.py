@@ -115,15 +115,12 @@ def get_band_formats(wb) -> dict:
     }
 
 
-def build_legend_entries(stale_warning_days: int) -> list:
+def build_legend_entries() -> list:
     """The row-color legend shown at the bottom of every product sheet."""
     C = COLORS
     return [
         (C['STEEL_BLUE_BG'], 'blue row',   'Patch via RMM — install confirmed after CVE first detected'),
         (C['LIGHT_ORANGE_BG'], 'orange row', 'Known active exploit — unresolved, prioritise immediately'),
-        (C['LIGHT_AMBER_BG'], 'amber-orange row',
-         f'Approaching stale — device offline \u2265 {stale_warning_days}d; '
-         f'patch confirmation unreliable (overrides blue)'),
         (C['AMBER_BG'], 'yellow row', 'Coverage gap — device not in patch report'),
         (C['PEACH_BG'], 'peach row',  'Unmanaged app — product not tracked in patch report'),
         (C['PINK_BG'], 'pink row',   'Detection mismatch — CVE detected but no matching patch found'),

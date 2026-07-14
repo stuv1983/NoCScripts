@@ -177,8 +177,6 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
                                not_in_rmm_unique_cves=0,
                                not_in_rmm_df: 'Optional[pd.DataFrame]' = None,
                                report_month='',
-                               approaching_stale_names: Optional[Set[str]] = None,
-                               stale_warning_days: int = 14,
                                product_to_sheet: Optional[dict] = None,
                                include_health_score: bool = False,
                                patch_resolved_pairs: Optional[set] = None,
@@ -270,8 +268,6 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     else:
         triage_dedup = triage_df.drop_duplicates(subset=['Name', 'Vulnerability Name']).copy()
 
-    _approaching_set = approaching_stale_names or set()
-
     # ── Compute resolved/unresolved by replaying the exact same ☑/☐ logic
     # that build_product_sheets writes into column A of each product sheet.
     # This guarantees the cached values supplied to write_formula() match what
@@ -290,9 +286,7 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     # confirmed resolved by a --patch report but not yet reflected in
     # N-able's own scan would count as unresolved there while correctly
     # showing ☑ everywhere else in the workbook.
-    from resolution import (get_sheet_product_key as _get_sheet_pk_sum,
-                            split_patch_pairs as _split_patch_pairs_sum,
-                            compute_resolved_flags as _compute_flags_sum,
+    from resolution import (split_patch_pairs as _split_patch_pairs_sum,
                             compute_resolved_series as _compute_resolved_series_shared)
     _p2s_sum   = product_to_sheet or {}
     _patch_2d_sum, _patch_3d_sum = _split_patch_pairs_sum(patch_resolved_pairs)
@@ -302,8 +296,7 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         Delegates to resolution.compute_resolved_series(), the single
         index-safe implementation shared with product_sheets.py — see that
         function's docstring for the row-misalignment bug this replaced."""
-        return _compute_resolved_series_shared(df, _p2s_sum, patch_resolved_pairs,
-                                               approaching_stale_names=_approaching_set)
+        return _compute_resolved_series_shared(df, _p2s_sum, patch_resolved_pairs)
 
     _is_res = _compute_resolved_series(triage_dedup)
     _is_unr = ~_is_res
@@ -316,11 +309,6 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     crit_rows      = int(crit_mask.sum())
     crit_cves      = int(triage_dedup.loc[crit_mask, 'Vulnerability Name'].nunique()) if score_col and 'Vulnerability Name' in triage_dedup.columns else unique_cves
 
-    exploit_col     = 'Has Known Exploit' if 'Has Known Exploit' in triage_dedup.columns else None
-    exploit_mask    = triage_dedup[exploit_col].astype(str).str.strip().str.lower().isin(['yes','true','1','y']) if exploit_col else pd.Series([False]*len(triage_dedup), index=triage_dedup.index)
-    exploit_count   = int(exploit_mask.sum())
-    exploit_patched = int((exploit_mask & _is_res).sum())
-    exploit_unpatch = int((exploit_mask & _is_unr).sum())
 
     # CISA KEV — Known Exploited Vulnerabilities catalog. Distinct from the
     # generic 'Has Known Exploit' column above: KEV is CISA's authoritative
@@ -330,25 +318,11 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     kev_mask       = triage_dedup[kev_col].astype(str).str.strip().str.lower().isin(['yes','true','1','y']) if kev_col else pd.Series([False]*len(triage_dedup), index=triage_dedup.index)
     kev_rows       = int(kev_mask.sum())
     kev_cves       = int(triage_dedup.loc[kev_mask, 'Vulnerability Name'].nunique()) if kev_col and 'Vulnerability Name' in triage_dedup.columns else 0
-    kev_patched    = int((kev_mask & _is_res).sum())
-    kev_unpatch    = int((kev_mask & _is_unr).sum())
-
-    # Server/workstation exploit breakdowns — detection row counts, active scope only
-    if 'Device Type' in triage_dedup.columns:
-        _srv_mask = triage_dedup['Device Type'].astype(str).str.lower().str.contains('server',      na=False)
-        _wks_mask = triage_dedup['Device Type'].astype(str).str.lower().str.contains('workstation', na=False)
-        srv_exp_total   = int((exploit_mask & _srv_mask).sum())
-        srv_exp_patched = int((exploit_mask & _srv_mask & _is_res).sum())
-        srv_exp_unpatch = int((exploit_mask & _srv_mask & _is_unr).sum())
-        wks_exp_total   = int((exploit_mask & _wks_mask).sum())
-        wks_exp_patched = int((exploit_mask & _wks_mask & _is_res).sum())
-        wks_exp_unpatch = int((exploit_mask & _wks_mask & _is_unr).sum())
-    else:
-        srv_exp_total = srv_exp_patched = srv_exp_unpatch = 0
-        wks_exp_total = wks_exp_patched = wks_exp_unpatch = 0
 
     # Device-type counts for Device Breakdown sub-table (unique devices)
     if 'Device Type' in triage_dedup.columns and 'Name' in triage_dedup.columns:
+        _srv_mask = triage_dedup['Device Type'].astype(str).str.lower().str.contains('server',      na=False)
+        _wks_mask = triage_dedup['Device Type'].astype(str).str.lower().str.contains('workstation', na=False)
         srv_total   = int(triage_dedup.loc[_srv_mask,           'Name'].nunique())
         srv_unpatch = int(triage_dedup.loc[_srv_mask & _is_unr, 'Name'].nunique())
         wks_total   = int(triage_dedup.loc[_wks_mask,           'Name'].nunique())
@@ -363,41 +337,23 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         _stale_wks = int(stale_excluded_df[stale_excluded_df['Device Type'].astype(str).str.lower().str.contains('workstation', na=False)]['Name'].nunique())
 
     # Stale + NIRM counts for Key Metrics math rows — computed once, reused in waterfall
-    _stale_rows = int(len(stale_excluded_df)) if stale_excluded_df is not None and not stale_excluded_df.empty else 0
     _stale_devs = int(stale_excluded_df['Name'].nunique()) if stale_excluded_df is not None and not stale_excluded_df.empty and 'Name' in stale_excluded_df.columns else 0
-    _stale_crit = 0   # detection rows at CVSS 9+ on stale devices
-    _stale_crit_cves = 0  # unique CVE types at CVSS 9+ on stale devices
-    if stale_excluded_df is not None and not stale_excluded_df.empty and score_col and score_col in stale_excluded_df.columns:
-        _stale_sc = pd.to_numeric(stale_excluded_df[score_col], errors='coerce')
-        _stale_crit      = int((_stale_sc >= 9.0).sum())
-        _stale_crit_cves = int(stale_excluded_df.loc[_stale_sc >= 9.0, 'Vulnerability Name'].nunique()) if 'Vulnerability Name' in stale_excluded_df.columns else 0
     # NIRM (not_in_rmm_cve_count already passed in as detection rows; compute CVSS 9+ subset from filtered_df)
     _nirm_devs  = not_in_rmm_count
+    _nirm_mask  = (filtered_df['Last Response'] == 'Not Found in RMM') \
+                  if 'Last Response' in filtered_df.columns \
+                  else pd.Series(False, index=filtered_df.index)
     _nirm_crit  = 0
-    _nirm_crit_cves = 0
-    if 'Last Response' in filtered_df.columns and score_col and score_col in filtered_df.columns:
-        _nirm_mask     = filtered_df['Last Response'] == 'Not Found in RMM'
-        _nirm_sc       = pd.to_numeric(filtered_df.loc[_nirm_mask, score_col], errors='coerce')
-        _nirm_crit     = int((_nirm_sc >= 9.0).sum())
-        _nirm_crit_cves = int(filtered_df.loc[_nirm_mask & (pd.to_numeric(filtered_df[score_col], errors='coerce') >= 9.0), 'Vulnerability Name'].nunique()) if 'Vulnerability Name' in filtered_df.columns else 0
+    if score_col and score_col in filtered_df.columns:
+        _nirm_sc   = pd.to_numeric(filtered_df.loc[_nirm_mask, score_col], errors='coerce')
+        _nirm_crit = int((_nirm_sc >= 9.0).sum())
 
     # Stale + NIRM CISA KEV counts, mirroring the CVSS 9+ pattern above so
     # KEV gets the same All / Active / Excluded reconciliation.
-    _stale_kev = 0
-    _stale_kev_cves = 0
-    if stale_excluded_df is not None and not stale_excluded_df.empty and kev_col and kev_col in stale_excluded_df.columns:
-        _stale_kev_mask  = stale_excluded_df[kev_col].astype(str).str.strip().str.lower().isin(['yes','true','1','y'])
-        _stale_kev       = int(_stale_kev_mask.sum())
-        _stale_kev_cves  = int(stale_excluded_df.loc[_stale_kev_mask, 'Vulnerability Name'].nunique()) if 'Vulnerability Name' in stale_excluded_df.columns else 0
     _nirm_kev  = 0
-    _nirm_kev_cves = 0
-    if 'Last Response' in filtered_df.columns and kev_col and kev_col in filtered_df.columns:
-        _nirm_kev_mask   = filtered_df[kev_col].astype(str).str.strip().str.lower().isin(['yes','true','1','y'])
-        _nirm_kev        = int((_nirm_mask & _nirm_kev_mask).sum())
-        _nirm_kev_cves   = int(filtered_df.loc[_nirm_mask & _nirm_kev_mask, 'Vulnerability Name'].nunique()) if 'Vulnerability Name' in filtered_df.columns else 0
-    _excl_devs       = _stale_devs + _nirm_devs
-    _excl_crit       = _stale_crit + _nirm_crit
-    _excl_crit_cves  = _stale_crit_cves + _nirm_crit_cves   # note: may overlap; shown as informational
+    if kev_col and kev_col in filtered_df.columns:
+        _nirm_kev_mask = filtered_df[kev_col].astype(str).str.strip().str.lower().isin(['yes','true','1','y'])
+        _nirm_kev      = int((_nirm_mask & _nirm_kev_mask).sum())
 
     # ── Key Metrics — 4-column grid: Metric | All | Active | Excluded ───────────
     # "All" = entire dataset (no stale/NIRM filter), "Active" = triage_df scope,
@@ -431,7 +387,6 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     _all_rows      = len(_all_df)          # = total_rows + stale_dedup_rows — math correct
     _all_cves      = int(_all_df['Vulnerability Name'].nunique()) if 'Vulnerability Name' in _all_df.columns else 0
     _all_devs      = int(_all_df['Name'].nunique())               if 'Name'               in _all_df.columns else 0
-    _all_sc        = pd.to_numeric(_all_df.get(score_col, pd.Series(dtype=float)), errors='coerce') if score_col else pd.Series(dtype=float)
 
     # For CVSS 9+ counts use the FULL stale_excluded_df (deduplicated Name+CVE),
     # NOT _stale_dedup which filters to _p2s_keys (active products only).
@@ -470,12 +425,6 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     _all_kev      = kev_rows + _stale_full_kev
     _all_kev_cves = kev_cves + _stale_full_kev_cves
 
-    # stale crit rows from _stale_dedup directly (consistent with _all_rows)
-    if not _stale_dedup.empty and score_col and score_col in _stale_dedup.columns:
-        _stale_crit_dedup = int((pd.to_numeric(_stale_dedup[score_col], errors='coerce') >= 9.0).sum())
-    else:
-        _stale_crit_dedup = _stale_crit
-
     # Uses the deduped not-in-RMM row count (matches how _all_rows is now built)
     # when the actual dataframe was passed; falls back to the pre-computed
     # scalar for callers that haven't been updated to pass not_in_rmm_df yet.
@@ -483,9 +432,7 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     _excl_rows          = len(_stale_dedup) + _nirm_excl_rows
     _excl_devs_tot      = _stale_devs + _nirm_devs
     _excl_crit_tot      = _stale_full_crit + _nirm_crit        # full stale, not _p2s_keys-filtered
-    _excl_crit_cves_tot = _stale_full_crit_cves + _nirm_crit_cves
     _excl_kev_tot       = _stale_full_kev + _nirm_kev          # full stale, not _p2s_keys-filtered
-    _excl_kev_cves_tot  = _stale_full_kev_cves + _nirm_kev_cves
 
     # ── Patching Health Score (beta) ──────────────────────────────────────────
     # Only rendered when include_health_score=True (opt-in checkbox in the GUI).
@@ -1048,8 +995,7 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
 
     # ── Month-over-Month Remediation Summary ────────────────────────────────────
     # Only rendered when a previous report was supplied. The point of this
-    # section is to make remediation WORK visible without opening Trend
-    # Summary — the Resolution Status table below only shows the current
+    # section is to make remediation WORK visible in one place — the Resolution Status table below only shows the current
     # snapshot, which can make a month of real patching look like "only
     # dropped by a few hundred rows" if new detections landed at the same
     # time.
@@ -1311,14 +1257,9 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     # device that still shows "unresolved" here can be checked against how
     # recently it actually checked in — a device that's gone quiet may simply
     # not have reported a fresh scan showing the CVE patched, rather than
-    # genuinely still being vulnerable. Devices within stale_warning_days of
-    # going stale get the same ⚠ / orange treatment as Top At-Risk Devices.
+    # genuinely still being vulnerable.
     _kev_has_lr   = 'Last Response' in triage_dedup.columns
     _kev_has_days = 'Days Since Last Response' in triage_dedup.columns
-    _kev_approach = approaching_stale_names or set()
-    _kev_td_approach   = workbook.add_format({'border': 1, 'bg_color': '#FFF3E0', 'font_color': '#7B3F00'})
-    _kev_td_approach_r = workbook.add_format({'border': 1, 'bg_color': '#FFF3E0', 'font_color': '#7B3F00',
-                                               'align': 'right', 'num_format': '#,##0'})
 
     ws.merge_range(row, 0, row, 5,
                    '  Devices with Unpatched Known Exploited Vulnerabilities  (CISA KEV)',
@@ -1344,9 +1285,8 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
                              if _kev_has_days else ('Name', lambda s: ''))
                     .sort_values('cves', ascending=False))
         for dev, dr in _dev_grp.iterrows():
-            _near_stale = dev in _kev_approach
-            _bf, _nf = (_kev_td_approach, _kev_td_approach_r) if _near_stale else (_kev_td, _kev_td_r)
-            _name_label = f'⚠ {dev}' if _near_stale else str(dev)
+            _bf, _nf = _kev_td, _kev_td_r
+            _name_label = str(dev)
             _days_val = (
                 int(dr['days_since']) if _kev_has_days
                 and not (isinstance(dr['days_since'], float) and pd.isna(dr['days_since']))
@@ -1362,15 +1302,10 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     else:
         ws.merge_range(row, 0, row, 5, 'No devices with unpatched KEV CVEs.', note_fmt)
         row += 1
-    _kev_approach_note = (
-        f'  \U0001f7e7 Orange = offline \u2265 {stale_warning_days}d (\u26a0 prefix on name) \u2014 '
-        'check Last Response before assuming the CVE is still genuinely unpatched.  '
-        if _kev_approach else ''
-    )
     ws.merge_range(row, 0, row, 5,
                    '\u2139  Full list \u2014 not capped, unlike Top At-Risk Devices further below. '
                    'Includes every active device with at least one unresolved CISA KEV CVE, '
-                   f'fixed at report generation.  {_kev_approach_note}'
+                   'fixed at report generation.  '
                    'A device that has not checked in recently may still show as unresolved simply '
                    'because no newer scan has confirmed the patch \u2014 use Last Response / Days Since '
                    'Last Response to tell that apart from a genuinely still-vulnerable device.',
@@ -1413,9 +1348,6 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         _f_unres = None
         _f_total = None
 
-    _live_fmt  = workbook.add_format({'num_format': '#,##0', 'align': 'center',
-                                      'bg_color': '#EBF3FB', 'border': 1,
-                                      'font_color': '#1F3864'})  # blue tint = live formula cell
     _live_pct  = workbook.add_format({'num_format': '0%',   'align': 'center',
                                       'bg_color': '#EBF3FB', 'border': 1,
                                       'font_color': '#1F3864'})
@@ -1439,8 +1371,10 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     #      CVE — a fixed CVE just stops appearing — so #2 is often the ONLY
     #      way resolution ever shows up without a patch report. It's inferred,
     #      not proven: disappearance can also mean a device was decommissioned,
-    #      renamed, or dropped out of RMM. See the 'Resolved Since Previous Report' sheet
-    #      for the underlying device/CVE rows behind this number.
+    #      renamed, or dropped out of RMM. (The 'Resolved Since Previous
+    #      Report' detail sheet was removed in v0.33 — inferred resolution
+    #      double-reported work already tracked by the Patch Confirmed
+    #      sheets; this count remains as a metric only.)
     # Total is therefore Resolved + Unresolved, where Unresolved = still-active
     # rows this period and Resolved = confirmed + inferred — i.e. "of everything
     # tracked as of the last report, how much is now closed out."
@@ -1572,7 +1506,7 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     _trend_note = (
         ' \u2018Resolved\u2019 = confirmed this period (patch evidence / Status=RESOLVED) '
         '+ INFERRED (unresolved last report, absent this period \u2014 verify against a patch '
-        'report if uncertain; see \u2018Resolved Since Previous Report\u2019 for the underlying rows).'
+        'report if uncertain).'
         if trend_data else
         ' No previous report was supplied, so \u2018Resolved\u2019 reflects confirmed evidence only '
         '(patch data / Status=RESOLVED). Pass --previous to also infer resolutions from CVEs that '
@@ -1725,11 +1659,7 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
                     _seen.add(_r.Name); _top.append(_r)
                 if len(_top) >= 10: break
 
-            _approaching = approaching_stale_names or set()
             _check_active = patch_check_active_names or set()
-            _td_approach   = workbook.add_format({'border': 1, 'bg_color': '#FFF3E0', 'font_color': '#7B3F00'})
-            _td_approach_r = workbook.add_format({'border': 1, 'bg_color': '#FFF3E0', 'font_color': '#7B3F00',
-                                                   'align': 'right', 'num_format': '#,##0'})
             _td_chkfail    = workbook.add_format({'border': 1, 'bg_color': '#E4DFEC', 'font_color': '#4C3B6E'})
             _td_chkfail_r  = workbook.add_format({'border': 1, 'bg_color': '#E4DFEC', 'font_color': '#4C3B6E',
                                                    'align': 'right', 'num_format': '#,##0'})
@@ -1739,19 +1669,16 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
             for _r in _top:
                 _srv        = 'server' in str(_r.device_type).lower()
                 _exp        = str(_r.has_exploit).strip().lower() == 'yes'
-                _near_stale = _r.Name in _approaching
                 _chk_fail   = bool(_check_active) and _norm_dev_name(_r.Name) in _check_active
                 if _exp:
                     _bf, _nf = _td_exp, _td_exp_r
                 elif _chk_fail:
                     _bf, _nf = _td_chkfail, _td_chkfail_r
-                elif _near_stale:
-                    _bf, _nf = _td_approach, _td_approach_r
                 elif _srv:
                     _bf, _nf = _td_srv, _td_srv_r
                 else:
                     _bf, _nf = _td, _td_r
-                _prefix     = '\U0001f527 ' if _chk_fail else ('⚠ ' if _near_stale else '')
+                _prefix     = '\U0001f527 ' if _chk_fail else ''
                 _name_label = f'{_prefix}{_r.Name}'
                 _days_val   = int(_r.days_since) if hasattr(_r, 'days_since') and not (isinstance(_r.days_since, float) and pd.isna(_r.days_since)) else ''
                 ws.write(row, 0, _name_label,               _bf)
@@ -1763,10 +1690,6 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
                 ws.write(row, 6, _days_val,                  _nf)
                 row += 1
 
-            _approach_note = (
-                f'  🟧 Orange = offline \u2265 {stale_warning_days}d (⚠ prefix on name).  '
-                if _approaching else ''
-            )
             _chkfail_note = (
                 '  \U0001f7ea Purple = active device failing its RMM Patch Status Check '
                 '(\U0001f527 prefix on name) — see Patch Check Failures sheet.  '
@@ -1774,7 +1697,6 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
             )
             ws.merge_range(row, 0, row, 6,
                 f'ℹ  🟡 Amber = Server.  🟥 Red = known exploit.  '
-                f'{_approach_note}'
                 f'{_chkfail_note}'
                 f'Up to 10 devices. Unresolved CVE counts only.',
                 note_fmt)
@@ -1788,20 +1710,11 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     ws.set_column('C:C', 18); ws.set_column('D:D', 14); ws.set_column('E:E', 22)
     ws.set_column('F:F', 24); ws.set_column('G:G', 20)
 
-    # CVSS Score Split -- TODO: re-enable when layout is agreed
-    # (block commented out; score_split_data/start/end stubs kept for
-#  any downstream code that references these variables)
-    score_split_start = row
-    score_split_data  = []
-    score_split_end   = row - 1
-
     # Month-over-Month
-    mom_start_row=None; mom_data=[]
     if trend_data:
         m=trend_data['metrics']
         row+=1
         ws.merge_range(row,0,row,3,'  Month-over-Month Patching Progress',sect_fmt); row+=1
-        mom_start_row=row
         ws.write(row,0,'Metric',hdr_fmt); ws.write(row,1,'Count',hdr_fmt)
         ws.write(row,2,'Direction',hdr_fmt); ws.write(row,3,'',hdr_fmt); row+=1
         for label,value,good in [
@@ -1816,7 +1729,7 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
             else:
                 vf=red_fmt if value>0 else val_fmt; ds=f'\u25b2  {value:,}  (increase)'    if value>0 else '\u2014  no change'; df2=trend_dn if value>0 else trend_eq
             ws.write(row,0,label,lbl_fmt); ws.write(row,1,value,vf); ws.merge_range(row,2,row,3,ds,df2)
-            mom_data.append((label,value)); row+=1
+            row+=1
 
     row+=1
     ws.write(row,0,'\u2139  All Key Metrics exclude stale devices and devices not found in RMM. '

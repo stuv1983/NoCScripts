@@ -14,15 +14,12 @@ resolution.py's docstring for why that separation matters.
 
 Author : Stu Villanti <s.villanti@kenstra.com>
 """
-from typing import Optional, Set, Tuple, Dict
+from typing import Optional, Tuple, Dict
 
 import pandas as pd
 
-from config import CVE_PATTERN
-from data_pipeline import (
-    normalize_device_name, extract_cve_id, get_col_letter,
-)
-from formatting import get_workbook_styles, build_legend_entries, COLORS
+from data_pipeline import normalize_device_name, extract_cve_id
+from formatting import get_workbook_styles, build_legend_entries
 from resolution import (
     split_patch_pairs as _split_patch_pairs,
     get_sheet_product_key as _get_sheet_pk,
@@ -30,7 +27,6 @@ from resolution import (
     compute_resolved_series as _compute_resolved_series,
     dedup_per_base_product as _dedup_per_base_product,
 )
-from sheet_helpers import write_nvd_links as _write_nvd_links
 from sheet_helpers import write_hs_subtotals as _write_hs_subtotals
 
 import logging
@@ -161,6 +157,12 @@ def _build_patch_confirmed_sheet(writer, sheet_name: str, product: str,
     n_cols = min(len(col_names) - 1, 9)
     ws.merge_range(0, 0, 0, n_cols,
                    f'\u2705  {product}  \u2014  All CVEs Patch Confirmed', banner_fmt)
+    # Navigation: internal link back to the Summary sheet, just past the banner.
+    _back_fmt = wb.add_format({'bold': True, 'font_color': '#0563C1',
+                               'underline': True, 'align': 'center', 'valign': 'vcenter'})
+    ws.write_url(0, n_cols + 1, "internal:'Summary'!A1",
+                 _back_fmt, string='\u2190 Summary')
+    ws.set_column(n_cols + 1, n_cols + 1, 12)
     ws.set_row(0, 28)
     ws.merge_range(1, 0, 1, n_cols,
                    'Every detected CVE for this product has patch evidence or is marked RESOLVED '
@@ -181,10 +183,6 @@ def _build_patch_confirmed_sheet(writer, sheet_name: str, product: str,
     grn_fmt = wb.add_format({'bg_color': '#E2EFDA', 'border': 1})
     grn_chk = wb.add_format({'bg_color': '#E2EFDA', 'border': 1,
                               'bold': True, 'align': 'center'})
-    link_fmt_cell = wb.add_format({
-        'font_color': '#0563C1', 'underline': True,
-        'bg_color': '#E2EFDA', 'border': 1,
-    })
 
     resolved_idx = col_names.index('Resolved') if 'Resolved' in col_names else None
     vuln_idx     = col_names.index('Vulnerability Name') if 'Vulnerability Name' in col_names else None
@@ -194,16 +192,11 @@ def _build_patch_confirmed_sheet(writer, sheet_name: str, product: str,
             if ci == resolved_idx:
                 ws.write(ri, ci, '\u2611', grn_chk)
             elif ci == vuln_idx:
+                # Plain text — CVE hyperlinks removed for write speed and to
+                # stay clear of xlsxwriter's 65,530-URL-per-sheet ceiling.
                 val_str = str(val) if val is not None else ''
-                m = CVE_PATTERN.search(val_str)
-                if m:
-                    cve_id  = m.group(1).upper()
-                    display = val_str[:255] if len(val_str) <= 255 else val_str[:252] + '...'
-                    ws.write_url(ri, ci,
-                                 f'https://www.cve.org/CVERecord?id={cve_id}',
-                                 link_fmt_cell, string=display)
-                else:
-                    ws.write(ri, ci, val_str, grn_fmt)
+                display = val_str[:255] if len(val_str) <= 255 else val_str[:252] + '...'
+                ws.write(ri, ci, display, grn_fmt)
             else:
                 ws.write(ri, ci, val if val is not None else '', grn_fmt)
 
@@ -234,7 +227,6 @@ def _build_patch_confirmed_sheet(writer, sheet_name: str, product: str,
         'Days Since Last Response':  22,
         'Affected Products':         30,
         'Baseline Compliance':       22,
-        'NVD':                       10,
     }
     for ci, col in enumerate(col_names):
         ws.set_column(ci, ci, _widths.get(col, 16))
@@ -250,11 +242,9 @@ def _build_patch_confirmed_sheet(writer, sheet_name: str, product: str,
     log.debug("Patch Confirmed sheet written for '%s': %d row(s)", product, n_data)
 
 
-def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
+def build_product_sheets(writer, triage_df, product_to_sheet,
                           patch_resolved_pairs=None,
                           patch_gap_pairs: Optional[Dict[Tuple[str, str], str]] = None,
-                          approaching_stale_names: Optional[Set[str]] = None,
-                          stale_warning_days: int = 14,
                           health_triage_df: 'Optional[pd.DataFrame]' = None,
                           trend_data: Optional[dict] = None,
                           include_health_score: bool = False):
@@ -262,8 +252,6 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
         patch_resolved_pairs = set()
     if patch_gap_pairs is None:
         patch_gap_pairs = {}
-    if approaching_stale_names is None:
-        approaching_stale_names = set()
 
     # ── Pre-split patch_resolved_pairs by product key ───────────────────────────
     # Moved ahead of the Score Lift block below (was after it) — the KEV
@@ -315,10 +303,9 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
         # would incorrectly grant a DIFFERENT row's Score Lift the +1.0
         # "clears the last unresolved KEV instance" bonus. Now uses
         # resolution.compute_resolved_series() — the same index-safe, three-source
-        # (patch evidence → status → approaching-stale override) computation the
+        # (patch evidence → status) computation the
         # ☑/☐ checkbox column and the Summary sheet's Resolution Status table use.
-        _sl_is_res = _compute_resolved_series(_sl_dedup, product_to_sheet, patch_resolved_pairs,
-                                              approaching_stale_names=approaching_stale_names)
+        _sl_is_res = _compute_resolved_series(_sl_dedup, product_to_sheet, patch_resolved_pairs)
         _sl_is_unr = ~_sl_is_res
 
         _kev_unres_by_cve: dict = {}
@@ -336,7 +323,7 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
                   'Vulnerability Name', 'Name', 'Device Type',
                   'Vulnerability Severity', 'Vulnerability Score', 'Risk Severity Index',
                   'Has Known Exploit', 'CISA KEV', 'Last Response', 'Days Since Last Response', 'Affected Products',
-                  'Baseline Compliance', 'NVD']
+                  'Baseline Compliance']
 
     def _chromium_sort_key(p: str) -> str:
         """Sort Chrome first, Edge immediately after (both are Chromium-based).
@@ -372,8 +359,7 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
         # ── Resolved column — shared three-source priority logic ───────────────────────────
         # See resolution.py for the precedence rules. Kept identical to the copy
         # build_client_summary_sheet uses, by construction — both call the same function.
-        _res_bool = _compute_flags(group, _sheet_pk, _patch_2d, _patch_3d,
-                                    approaching_stale_names=approaching_stale_names)
+        _res_bool = _compute_flags(group, _sheet_pk, _patch_2d, _patch_3d)
 
         _res_list = ['☑' if x else '☐' for x in _res_bool]
 
@@ -384,7 +370,6 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
         # xlsxwriter writes tabs in the correct order.
         if all(v == '☑' for v in _res_list):
             group.insert(0, 'Resolved', _res_list)
-            group['NVD'] = ''
             final_cols = [c for c in cols_order if c in group.columns]
             _out = group[final_cols]
             _deferred_confirmed.append((sheet_name, product, _out, final_cols))
@@ -408,7 +393,6 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
             _sort_asc  = [False, False, True]
 
         group = group.sort_values(by=_sort_cols, ascending=_sort_asc)
-        group['NVD'] = ''
 
         final_cols = [c for c in cols_order if c in group.columns]
         _out = group[final_cols]
@@ -420,6 +404,13 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
         ws  = wb_.add_worksheet(sheet_name)
         writer.sheets[sheet_name] = ws
         ws.write_row(0, 0, final_cols)
+        # Navigation: one internal link back to the Summary sheet, placed just
+        # past the last header so it sits outside the autofilter range.
+        _back_fmt = wb_.add_format({'bold': True, 'font_color': '#0563C1',
+                                    'underline': True, 'align': 'center'})
+        ws.write_url(0, len(final_cols), "internal:'Summary'!A1",
+                     _back_fmt, string='\u2190 Summary')
+        ws.set_column(len(final_cols), len(final_cols), 12)
         for _ri, _row in enumerate(_out.itertuples(index=False, name=None), start=1):
             ws.write_row(_ri, 0, _row)
 
@@ -432,7 +423,6 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
         unmanaged_fmt     = styles_['row_red']
         mismatch_fmt      = styles_['row_pink']
         installing_fmt    = styles_['row_teal']
-        approaching_fmt   = wb_.add_format({'bg_color': '#FFF3E0', 'font_color': '#7B3F00'})  # orange-tinted — approaching stale
 
         _GAP_FMTS = {
             'coverage_gap':        coverage_fmt,
@@ -505,28 +495,19 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
             })
 
         # ── Sparse colouring via set_row for Python-computed states ──
-        # Only approaching-stale and patch-gap rows need set_row; everything else is
-        # handled by the conditional_format rules above.  Skip the loop entirely when
-        # neither condition is active — that is the common case and saves ~80k iterations.
-        _approaching = approaching_stale_names or set()
-        if _approaching or patch_gap_pairs:
-            # Pre-build column arrays so we avoid per-row dict look-ups from iterrows
-            _name_arr    = group['Name'].tolist()    if 'Name'          in group.columns else [''] * len(group)
+        # Only patch-gap rows need set_row; everything else is handled by the
+        # conditional_format rules above.  Skip the loop entirely when no patch
+        # gaps exist — that is the common case and saves ~80k iterations.
+        if patch_gap_pairs:
             _exp_arr     = (group[_exp_col].astype(str).str.strip().str.lower().tolist()
                             if _exp_col in group.columns else [''] * len(group))
-            for _ri, (_nk, _ck, _nm, _rv, _ev) in enumerate(
-                zip(_nk_list, _ck_list, _name_arr, _res_list, _exp_arr), start=1
+            for _ri, (_nk, _ck, _rv, _ev) in enumerate(
+                zip(_nk_list, _ck_list, _res_list, _exp_arr), start=1
             ):
-                # Priority 1: approaching-stale overrides everything
-                if _nm in _approaching:
-                    _gap = patch_gap_pairs.get((_nk, _ck))
-                    ws.set_row(_ri, None, _GAP_FMTS.get(_gap, approaching_fmt)
-                               if _gap and _gap in _GAP_FMTS else approaching_fmt)
-                    continue
-                # Priority 2: resolved rows → handled by conditional_format
+                # Priority 1: resolved rows → handled by conditional_format
                 if _rv == '☑':
                     continue
-                # Priority 3: known exploit → handled by conditional_format
+                # Priority 2: known exploit → handled by conditional_format
                 if _ev in _TRUE_VALS:
                     continue
                 # Priority 4: patch gap types
@@ -536,17 +517,11 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
 
         if 'Vulnerability Name' in cl:
             vn_idx = cl.index('Vulnerability Name')
-            ws.set_column(vn_idx, vn_idx, 25, link_fmt)
-            # CVE text already written by to_excel(); set_column applies blue colour
-        if 'NVD' in cl:
-            nvd_idx = cl.index('NVD')
-            ws.set_column(nvd_idx, nvd_idx, 10, link_fmt)
-            _write_nvd_links(ws, group['Vulnerability Name'], nvd_idx, link_fmt)
+            ws.set_column(vn_idx, vn_idx, 25)
         if 'Name'               in cl: ws.set_column(cl.index('Name'),               cl.index('Name'),               25)
         if 'Device Type'        in cl: ws.set_column(cl.index('Device Type'),        cl.index('Device Type'),        15)
         if 'Baseline Compliance' in cl: ws.set_column(cl.index('Baseline Compliance'), cl.index('Baseline Compliance'), 22)
         if _vs_idx is not None:
-            _vs_col = get_col_letter(_vs_idx)
             ws.set_column(_vs_idx, _vs_idx, 8)
             # CVSS score colour coding — matches the Risk Rating matrix exactly:
             # Critical 9.0-10.0 = red, High 7.0-8.9 = gold, Medium 4.0-6.9 = yellow,
@@ -586,7 +561,7 @@ def build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
         l_title = wb_.add_format({'bold': True, 'font_size': 9, 'bg_color': '#F2F2F2', 'border': 1})
         l_cell  = wb_.add_format({'font_size': 9, 'border': 1})
 
-        legend_entries = build_legend_entries(stale_warning_days)
+        legend_entries = build_legend_entries()
         ws.write(legend_row, 0, 'Legend', l_title)
         for i, (colour, label, desc) in enumerate(legend_entries, start=1):
             fmt = wb_.add_format({'bg_color': colour, 'font_size': 9, 'border': 1})
