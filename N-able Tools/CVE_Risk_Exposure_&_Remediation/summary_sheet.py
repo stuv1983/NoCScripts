@@ -185,7 +185,11 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
                                has_patch_report: bool = False,
                                prev_report_name: str = '',
                                patch_check_active_df: 'Optional[pd.DataFrame]' = None,
-                               patch_check_active_names: Optional[Set[str]] = None):
+                               patch_check_active_names: Optional[Set[str]] = None,
+                               advanced_summary: bool = False,
+                               snapshot_history: Optional[list] = None,
+                               snapshot_current: Optional[dict] = None,
+                               root_cause_counts: Optional[dict] = None):
     """
     Client Summary sheet.
 
@@ -995,6 +999,43 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         # Health score disabled — Key Metrics starts at row 3
         row = 3
 
+    # ── Multi-Month Trend (advanced preview) ────────────────────────────────────
+    # Built from snapshots/ history next to the output file — accumulates
+    # across runs without needing previous workbooks. Advanced-only while
+    # the layout settles.
+    if advanced_summary and (snapshot_history or snapshot_current):
+        _adv_hdr = workbook.add_format({'bold': True, 'bg_color': '#D9D9D9', 'border': 1})
+        _adv_bold = workbook.add_format({'bold': True})
+        ws.merge_range(row, 0, row, 6, '  Multi-Month Trend  \u26a0 advanced preview', sect_fmt)
+        row += 1
+        for _c, _h in enumerate(['Month', 'Health Score', 'Grade', 'Unique CVEs',
+                                 'Unique Devices', 'Unresolved KEV CVEs', 'Unresolved pairs']):
+            ws.write(row, _c, _h, _adv_hdr)
+        row += 1
+
+        def _snap_val(rec, key):
+            v = rec.get(key)
+            return v if v is not None else '\u2014'
+
+        _SNAP_KEYS = ['health_score', 'health_grade', 'unique_cves',
+                      'unique_devices', 'kev_unresolved_cves', 'unresolved_pairs']
+        for _rec in (snapshot_history or []):
+            ws.write(row, 0, str(_rec.get('report_month') or _rec.get('run_date', '')[:7]), lbl_fmt)
+            for _c, _k in enumerate(_SNAP_KEYS, start=1):
+                ws.write(row, _c, _snap_val(_rec, _k), val_fmt)
+            row += 1
+        if snapshot_current:
+            ws.write(row, 0, f"{snapshot_current.get('report_month', '')} (this run)", _adv_bold)
+            for _c, _k in enumerate(_SNAP_KEYS, start=1):
+                ws.write(row, _c, _snap_val(snapshot_current, _k), _adv_bold)
+            row += 1
+        ws.merge_range(row, 0, row, 6,
+                       '\u2139  Built from the snapshots/ folder next to the output file. '
+                       'Months generated before this feature (or with it off) show \u2014 '
+                       'for score fields.',
+                       note_fmt)
+        row += 2
+
     # ── Month-over-Month Remediation Summary ────────────────────────────────────
     # Only rendered when a previous report was supplied. The point of this
     # section is to make remediation WORK visible in one place — the Resolution Status table below only shows the current
@@ -1064,9 +1105,29 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         ws.write(row, 0, 'New unresolved pairs introduced', lbl_fmt)
         ws.write(row, 1, '\u2014', val_fmt)
         ws.write(row, 2, _new_count, val_fmt)
-        ws.write(row, 3, '\u25b2  offset' if _new_count else '\u2014', _mom_up_fmt if _new_count else _mom_same_fmt)
+        ws.write(row, 3, f'\u25b2  {_new_count:,}' if _new_count else '\u2014',
+                 _mom_up_fmt if _new_count else _mom_same_fmt)
         ws.write(row, 4, 'Pairs that became unresolved for the first time this period.', def_fmt)
-        row += 2
+        row += 1
+
+        # Advanced: CVE-type level movement (pairs above are device+CVE level).
+        if advanced_summary:
+            for _lbl, _key, _defn in [
+                ('New CVE types introduced', 'new_cve_count',
+                 'Distinct CVE IDs seen this period but not last (common-product scope).'),
+                ('CVE types resolved', 'resolved_cve_count',
+                 'Distinct CVE IDs present last period and gone or resolved now.'),
+                ('Persisting CVE types', 'persisting_cve_count',
+                 'Distinct CVE IDs unresolved in both periods.'),
+            ]:
+                _v = int(_mom.get(_key, 0))
+                ws.write(row, 0, _lbl, lbl_fmt)
+                ws.write(row, 1, '\u2014', val_fmt)
+                ws.write(row, 2, _v, val_fmt)
+                ws.write(row, 3, '\u2014', _mom_same_fmt)
+                ws.write(row, 4, _defn, def_fmt)
+                row += 1
+        row += 1
 
     ws.merge_range(row, 0, row, 4, '  Key Metrics', sect_fmt)
     row += 1
@@ -1520,6 +1581,97 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
                    f'{_trend_note}',
                    note_fmt)
     ws.set_row(row, 60); row += 2
+
+    # ── N-Day Exposure Age (advanced preview) ────────────────────────────────────
+    # How long unresolved detections have been sitting. Age source, in order:
+    # 'N Days Exposed' (patch-match runs), else 'First detected' /
+    # 'Date Published' parsed against the current date.
+    if advanced_summary:
+        from formatting import get_band_formats
+        _age_days = None
+        _age_src  = None
+        if 'N Days Exposed' in triage_dedup.columns:
+            _age_days = pd.to_numeric(triage_dedup['N Days Exposed'], errors='coerce')
+            _age_src  = 'N Days Exposed'
+        else:
+            for _dc in ('First detected', 'Date Published'):
+                if _dc in triage_dedup.columns:
+                    _dts = pd.to_datetime(triage_dedup[_dc], errors='coerce', dayfirst=True)
+                    if _dts.notna().any():
+                        _age_days = (pd.Timestamp.now() - _dts).dt.days
+                        _age_src  = _dc
+                        break
+
+        ws.merge_range(row, 0, row, 3, '  N-Day Exposure Age  \u26a0 advanced preview', sect_fmt)
+        row += 1
+        if _age_days is None:
+            ws.merge_range(row, 0, row, 3,
+                           '\u2139  No age source in this export — needs a '
+                           "'First detected' column or a patch-match run "
+                           "(which adds 'N Days Exposed').", note_fmt)
+            row += 2
+        else:
+            _bands = get_band_formats(workbook)
+            _age_unres = ~_compute_resolved_series(triage_dedup)
+            _age_kev   = (triage_dedup['CISA KEV'].astype(str).str.strip().str.lower()
+                          .isin(['yes', 'y', 'true', '1'])
+                          if 'CISA KEV' in triage_dedup.columns
+                          else pd.Series(False, index=triage_dedup.index))
+            ws.write(row, 0, 'Age band',               _bands['header'])
+            ws.write(row, 1, 'Unresolved detections',  _bands['header'])
+            ws.write(row, 2, 'Unique CVEs',            _bands['header'])
+            ws.write(row, 3, 'Unresolved KEV CVEs',    _bands['header'])
+            row += 1
+            for _lbl, _fmt, _lo, _hi in [
+                ('90+ days',   _bands['critical'], 90,   None),
+                ('60\u201389 days', _bands['high'],     60,   90),
+                ('30\u201359 days', _bands['amber'],    30,   60),
+                ('Under 30 days',    _bands['ok'],        None, 30),
+            ]:
+                _m = _age_unres & _age_days.notna()
+                if _lo is not None: _m &= _age_days >= _lo
+                if _hi is not None: _m &= _age_days < _hi
+                _sub = triage_dedup[_m]
+                ws.write(row, 0, _lbl, _fmt)
+                ws.write(row, 1, int(_m.sum()), val_fmt)
+                ws.write(row, 2, int(_sub['Vulnerability Name'].nunique()) if not _sub.empty else 0, val_fmt)
+                ws.write(row, 3, int(_sub.loc[_age_kev[_m.index][_m], 'Vulnerability Name'].nunique())
+                                 if not _sub.empty else 0, val_fmt)
+                row += 1
+            _unknown = int((_age_unres & _age_days.isna()).sum())
+            if _unknown:
+                ws.write(row, 0, 'Unknown age', _bands['label'])
+                ws.write(row, 1, _unknown, val_fmt)
+                row += 1
+            ws.merge_range(row, 0, row, 3,
+                           f'\u2139  Age source: {_age_src}. Unresolved rows only, '
+                           'active scope, deduplicated per product. Fixed at generation.',
+                           note_fmt)
+            row += 2
+
+    # ── Top Patch-Gap Root Causes (advanced preview) ─────────────────────────────
+    # Why patches aren't landing — same classification the diagnostics
+    # sheets use, summarised for the client.
+    if advanced_summary and root_cause_counts:
+        _RC_LABELS = {
+            'coverage_gap':       'Coverage gap — device not in patch report',
+            'unmanaged_app':      'Unmanaged app — product not tracked in patch report',
+            'detection_mismatch': 'Detection mismatch — CVE detected but no matching patch found',
+            'patch_installing':   'Patch installing — awaiting next RMM sync',
+        }
+        ws.merge_range(row, 0, row, 1, '  Top Patch-Gap Root Causes  \u26a0 advanced preview', sect_fmt)
+        row += 1
+        ws.write(row, 0, 'Root cause',       hdr_fmt)
+        ws.write(row, 1, 'Device-CVE pairs', hdr_fmt)
+        row += 1
+        for _cause, _cnt in sorted(root_cause_counts.items(), key=lambda x: -x[1]):
+            ws.write(row, 0, _RC_LABELS.get(_cause, str(_cause)), lbl_fmt)
+            ws.write(row, 1, int(_cnt), val_fmt)
+            row += 1
+        ws.merge_range(row, 0, row, 3,
+                       '\u2139  From patch-evidence matching — see the diagnostics '
+                       'sheets for per-device detail.', note_fmt)
+        row += 2
 
     # ── Device Breakdown (active scope) — unique device counts ───────────────────
     ws.merge_range(row, 0, row, 3,

@@ -43,7 +43,12 @@ def save(output_path: str,
          unique_devices: int,
          trend_metrics: Optional[dict] = None,
          root_cause_summary: Optional[dict] = None,
-         report_month: Optional[str] = None) -> None:
+         report_month: Optional[str] = None,
+         health_score: Optional[int] = None,
+         health_grade: Optional[str] = None,
+         kev_unresolved_cves: Optional[int] = None,
+         unresolved_pairs: Optional[int] = None,
+         resolved_pairs: Optional[int] = None) -> None:
     """
     Persist a compact snapshot of this run.  Writes three files:
       - per-run timestamped JSON
@@ -82,6 +87,12 @@ def save(output_path: str,
             'unique_devices':    unique_devices,
             'trend_metrics':     trend_metrics,
             'root_cause_summary':root_cause_summary,
+            # Advanced-summary fields — None unless the run had it enabled.
+            'health_score':        health_score,
+            'health_grade':        health_grade,
+            'kev_unresolved_cves': kev_unresolved_cves,
+            'unresolved_pairs':    unresolved_pairs,
+            'resolved_pairs':      resolved_pairs,
         }
 
         # 1. Per-run file

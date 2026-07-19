@@ -83,6 +83,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help='Refresh rolling product baselines from vendor APIs before generating')
     p.add_argument('--exclude-missing-rmm', action='store_true',
                    help='Drop CVEs for devices not found in the RMM inventory (default: keep them)')
+    p.add_argument('--advanced-summary', action='store_true',
+                   help='Preview: adds Multi-Month Trend, N-Day Exposure Age, and '
+                        'Top Patch-Gap Root Causes sections to the Summary sheet, and '
+                        'records health-score history in snapshots/.')
     p.add_argument('--report-month', default='', metavar='MONTH',
                    help='Report label e.g. "April 2026". Defaults to current month. '
                         'Allows retroactive labelling when generating last month\'s report today.')
@@ -138,6 +142,7 @@ def main() -> int:
         sync_baselines         = args.sync_baselines,
         exclude_missing_rmm    = args.exclude_missing_rmm,
         report_month           = args.report_month,
+        advanced_summary       = args.advanced_summary,
     )
 
     log.info("Starting headless dashboard generation")

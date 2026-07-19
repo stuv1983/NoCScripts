@@ -130,6 +130,7 @@ class DashboardRequest:
     report_month:         str            = ''
     stale_warning_days:   int            = 14   # flag active devices within this many days of going stale
     include_health_score: bool           = False  # beta — show Patching Health Score on Summary sheet
+    advanced_summary:     bool           = False  # preview — extra Summary sections (multi-month trend, exposure age, root causes)
 
 @dataclass
 class DashboardResult:
@@ -432,6 +433,7 @@ def run(request: DashboardRequest) -> DashboardResult:
         diagnostics: dict = {'patch_lag_df': pd.DataFrame(),
                              'version_drift_df': pd.DataFrame(),
                              'root_cause_df': pd.DataFrame()}
+        root_cause_counts: dict = {}   # cause → device-CVE pair count (advanced Summary table)
 
         if patch_data:
             p_full = patch_data[1].copy()
@@ -456,7 +458,7 @@ def run(request: DashboardRequest) -> DashboardResult:
             for _, row in p_full[p_full['_root_cause'].notna()].iterrows():
                 patch_gap_pairs[(row['_nk'], row['_ck'])] = row['_root_cause']
 
-            cause_counts: dict[str, int] = {}
+            cause_counts = root_cause_counts
             for c in patch_gap_pairs.values():
                 cause_counts[c] = cause_counts.get(c, 0) + 1
             for cause, count in cause_counts.items():
@@ -550,6 +552,50 @@ def run(request: DashboardRequest) -> DashboardResult:
         elif _export_has_status_col:
             log.debug("Raw RESOLVED injection skipped — export has status column; "
                       "product sheets read it directly (avoids large-set performance issue)")
+
+        # ── Advanced Summary (preview) — health score + snapshot history ──
+        # Computed here (not in the sheet builder) so the same numbers feed
+        # both the Summary trend strip and the snapshot record.
+        adv_history: list = []
+        adv_current: Optional[dict] = None
+        if request.advanced_summary:
+            try:
+                from resolution import (dedup_per_base_product as _adv_dedup_fn,
+                                        compute_resolved_series as _adv_res_fn)
+                from summary_sheet import compute_patching_health_score as _adv_hs_fn
+                _adv_scope = _adv_dedup_fn(health_triage_df)
+                _adv_res   = _adv_res_fn(_adv_scope, product_to_sheet,
+                                         patch_resolved_pairs).astype(bool)
+                _adv_hs    = _adv_hs_fn(_adv_scope, _adv_res, ~_adv_res,
+                                        trend_data=trend_data,
+                                        has_patch_report=patch_data is not None)
+                adv_current = {
+                    'report_month':        report_month_val,
+                    'health_score':        _adv_hs['score'],
+                    'health_grade':        _adv_hs['grade'],
+                    'unique_cves':         int(filtered_df['Vulnerability Name'].nunique()),
+                    'unique_devices':      int(filtered_df['Name'].nunique()),
+                    'kev_unresolved_cves': _adv_hs['penalties'].get('kev_unresolved', {}).get('count'),
+                    'unresolved_pairs':    int((~_adv_res).sum()),
+                    'resolved_pairs':      int(_adv_res.sum()),
+                }
+
+                def _rec_month(r: dict) -> str:
+                    try:
+                        return datetime.strptime(str(r.get('report_month', '')).strip(),
+                                                 '%B %Y').strftime('%Y-%m')
+                    except ValueError:
+                        return str(r.get('run_date', ''))[:7]
+                try:
+                    _cur_month = datetime.strptime(report_month_val, '%B %Y').strftime('%Y-%m')
+                except ValueError:
+                    _cur_month = datetime.now().strftime('%Y-%m')
+                adv_history = [r for r in snap_store.load_history(request.output_path, months=7)
+                               if _rec_month(r) != _cur_month][-6:]
+            except Exception as _adv_e:
+                log.warning("Advanced summary pre-compute failed: %s", _adv_e)
+                adv_current = None
+                adv_history = []
 
         failure_df     = None
         failure_lookup = {}
@@ -655,6 +701,10 @@ def run(request: DashboardRequest) -> DashboardResult:
                 prev_report_name=prev_report_name,
                 patch_check_active_df=patch_check_active_df if not patch_check_active_df.empty else None,
                 patch_check_active_names=check_active_names,
+                advanced_summary=request.advanced_summary,
+                snapshot_history=adv_history,
+                snapshot_current=adv_current,
+                root_cause_counts=root_cause_counts,
             )
             # Trend Summary worksheet removed — metrics live on the Summary
             # sheet and the trend detail sheets.
@@ -795,6 +845,12 @@ def run(request: DashboardRequest) -> DashboardResult:
             unique_devices    = int(filtered_df['Name'].nunique()),
             trend_metrics     = trend_data['metrics'] if trend_data else None,
             root_cause_summary= rc_summary or None,
+            report_month      = request.report_month or None,
+            health_score      = adv_current.get('health_score') if adv_current else None,
+            health_grade      = adv_current.get('health_grade') if adv_current else None,
+            kev_unresolved_cves = adv_current.get('kev_unresolved_cves') if adv_current else None,
+            unresolved_pairs  = adv_current.get('unresolved_pairs') if adv_current else None,
+            resolved_pairs    = adv_current.get('resolved_pairs') if adv_current else None,
         )
 
         trend_summary = None

@@ -200,6 +200,7 @@ def process_reports():
         sync_baselines         = sync_baselines_var.get(),
         report_month           = report_month_var.get().strip(),
         include_health_score   = include_health_score_var.get(),
+        advanced_summary       = advanced_summary_var.get(),
     )
 
     log.info("Starting dashboard generation: %s", output_path)
@@ -387,6 +388,19 @@ def open_advanced_dialog():
                               "known-exploit coverage. Methodology may still change — "
                               "not recommended for formal client reporting yet.")
     ctk.CTkLabel(dlg, text="  Scoring methodology is experimental — not for formal reporting",
+                 font=("", 11), text_color="#7F6000").pack(anchor="w", padx=16, pady=(0, 4))
+
+    # ── Advanced Summary sections (preview) ──────────────────────────────────────
+    _adv_summary_cb = ctk.CTkCheckBox(dlg, text="Advanced Summary sections  ⚠ Preview",
+                                      variable=advanced_summary_var)
+    _adv_summary_cb.pack(anchor="w", padx=16, pady=(4, 0))
+    Tooltip(_adv_summary_cb, "Adds preview sections to the Summary sheet: Multi-Month "
+                             "Trend (from the snapshots folder), N-Day Exposure Age "
+                             "banding, extra CVE-type rows in Month-over-Month, and Top "
+                             "Patch-Gap Root Causes (patch-evidence runs). Also records "
+                             "health-score history in snapshots/ so trends accumulate. "
+                             "Layout may change while the feature settles.")
+    ctk.CTkLabel(dlg, text="  Layout and metrics may change — feedback welcome",
                  font=("", 11), text_color="#7F6000").pack(anchor="w", padx=16, pady=(0, 4))
 
     # ── Patch Status Check Report ────────────────────────────────────────────────
@@ -732,6 +746,7 @@ include_failure_var = tk.BooleanVar()
 include_browser_audit_var = tk.BooleanVar()
 include_patch_check_var = tk.BooleanVar()
 include_health_score_var = tk.BooleanVar()
+advanced_summary_var = tk.BooleanVar()
 patch_status_var = tk.StringVar(value="Patch evidence: not configured")
 status_var = tk.StringVar(value="Ready")
 
