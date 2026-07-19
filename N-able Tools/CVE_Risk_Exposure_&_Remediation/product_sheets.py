@@ -212,12 +212,8 @@ def _build_patch_confirmed_sheet(writer, sheet_name: str, product: str,
 
     n_data = len(out_df)
 
-    # ── Health/resolution subtotal block (hidden cols Q/R, rows 1-7) ──────────
-    # Same fixed-location block the full triage sheets carry, so the Summary
-    # sheet's live formulas can sum one cell per sheet uniformly.  Built from
-    # THIS sheet's column order — confirmed sheets have no Score Lift column,
-    # so Vulnerability Score / Has Known Exploit sit one column left of a full
-    # triage sheet's layout.  all_resolved=True: every data row is written ☑.
+    # Hidden subtotal block (cols Q/R) — same fixed location as triage
+    # sheets; built from THIS sheet's column order. all_resolved=True.
     _write_hs_subtotals(ws, wb, col_names,
                         _hs_subtotal_counts(out_df, all_resolved=True))
 
@@ -263,40 +259,18 @@ def build_product_sheets(writer, triage_df, product_to_sheet,
     if patch_gap_pairs is None:
         patch_gap_pairs = {}
 
-    # ── Pre-split patch_resolved_pairs by product key ───────────────────────────
-    # Moved ahead of the Score Lift block below (was after it) — the KEV
-    # unresolved-count fix needs these to correctly scope 3-tuple patch pairs.
-    # When patch evidence is present, splitting once here means each product sheet
-    # only checks its own small subset rather than the full global set.  This keeps
-    # membership checks cheap even if patch_resolved_pairs grows large in future.
-    # Shared with build_client_summary_sheet via resolution.py — see that module's
-    # docstring for why this must not be reimplemented locally.
+    # Split patch_resolved_pairs by product key once so each sheet checks
+    # only its own subset. Shared with the Summary sheet via resolution.py.
     _patch_2d, _patch_3d = _split_patch_pairs(patch_resolved_pairs)
 
-    # ── Fleet-level Score Lift context ────────────────────────────────────────────────────────
-    # Score Lift is a Health Score companion — it tells the reader "fixing
-    # this row moves the Health Score by X" — so there's no reason to pay
-    # for computing it (or show a column full of numbers nobody asked to
-    # see) when Health Score itself isn't enabled. Everything in this
-    # block, and the per-row Score Lift insert further down, is skipped
-    # entirely when include_health_score is False.
+    # Score Lift is a Health Score companion — skip all of it (including
+    # the per-row column below) when Health Score is off.
     if include_health_score:
-        # Pre-compute totals from the health scope once before the per-product loop
-        # so every sheet divides by the same fleet-wide denominators.
+        # Fleet-wide denominators, computed once so every sheet divides by the same totals.
         _sl_scope = health_triage_df if (health_triage_df is not None and not health_triage_df.empty) else triage_df
 
-        # Was: only kept Base Products already present in product_to_sheet
-        # — but product_to_sheet is built from triage_df, which uses the
-        # report's OWN (narrower) threshold, while health_triage_df is
-        # deliberately broader (CVSS ≥ 7.0 even when the report threshold
-        # is 9.0). A product with rows only in that 7.0–8.9 gap, and none
-        # at the report's own threshold, would never be a product_to_sheet
-        # key — so its rows were silently dropped from the Score Lift
-        # denominators despite Score Lift explicitly using the broader
-        # health scope. dedup_per_base_product() includes every Base
-        # Product unconditionally, and compute_resolved_series() no longer
-        # needs product_to_sheet to resolve a group correctly (see
-        # resolution.py) — so there's no reason to pre-filter here.
+        # Include every Base Product — the health scope (CVSS >= 7.0) can
+        # contain products with no rows at the report's own threshold.
         _sl_dedup = _dedup_per_base_product(_sl_scope)
 
         _sl_sc_col    = 'Vulnerability Score' if 'Vulnerability Score' in _sl_dedup.columns else None
@@ -306,15 +280,8 @@ def build_product_sheets(writer, triage_df, product_to_sheet,
         _sl_exp_total = int(_sl_dedup[_sl_exp_col].astype(str).str.strip().str.lower().isin(['yes','y','true','1']).sum()) if _sl_exp_col else 0
 
         # Unresolved KEV row counts per CVE ID for penalty-recovery lift.
-        #
-        # This used to check ONLY the raw Threat Status/Status column — a row
-        # already ☑ resolved via patch evidence (patch_resolved_pairs) could
-        # still be counted as an active unresolved KEV instance here, which
-        # would incorrectly grant a DIFFERENT row's Score Lift the +1.0
-        # "clears the last unresolved KEV instance" bonus. Now uses
-        # resolution.compute_resolved_series() — the same index-safe, three-source
-        # (patch evidence → status) computation the
-        # ☑/☐ checkbox column and the Summary sheet's Resolution Status table use.
+        # Uses compute_resolved_series() — same three-source logic as the
+        # ☑/☐ column and the Summary's Resolution Status table.
         _sl_is_res = _compute_resolved_series(_sl_dedup, product_to_sheet, patch_resolved_pairs)
         _sl_is_unr = ~_sl_is_res
 
@@ -360,24 +327,17 @@ def build_product_sheets(writer, triage_df, product_to_sheet,
         _raw_pnames = group['Affected Products'].dropna().astype(str).unique().tolist()
         _sheet_pk = _get_sheet_pk(_raw_pnames, product)
 
-        # ── Performance: pre-compute normalised keys ONCE per group ──────────────
-        # These are reused by both the Resolved column and the sparse set_row loop,
-        # eliminating the duplicate regex work that apply + iterrows previously caused.
+        # Normalised keys for the sparse set_row loop below.
         _nk_list = [normalize_device_name(str(n)) for n in group['Name']]
         _ck_list = [extract_cve_id(str(v))        for v in group['Vulnerability Name']]
 
-        # ── Resolved column — shared three-source priority logic ───────────────────────────
-        # See resolution.py for the precedence rules. Kept identical to the copy
-        # build_client_summary_sheet uses, by construction — both call the same function.
+        # Resolved column — shared three-source logic, see resolution.py.
         _res_bool = _compute_flags(group, _sheet_pk, _patch_2d, _patch_3d)
 
         _res_list = ['☑' if x else '☐' for x in _res_bool]
 
-        # ── Fully-patched: defer to end of product sheets ──────────────────────
-        # Accumulate confirmed products and write them after all active (partially-
-        # unresolved) sheets so the tab order is: active products → confirmed
-        # products → stale/NIRM sheets.  Sheet registration is deferred so
-        # xlsxwriter writes tabs in the correct order.
+        # Fully-patched products deferred so tab order is:
+        # active → confirmed → stale/NIRM.
         if all(v == '☑' for v in _res_list):
             group.insert(0, 'Resolved', _res_list)
             final_cols = [c for c in cols_order if c in group.columns]
@@ -389,9 +349,8 @@ def build_product_sheets(writer, triage_df, product_to_sheet,
 
         # ── Score Lift ─────────────────────────────────────────────────────────────────
         if include_health_score:
-            # Build minimal per-row dicts from only the five columns
-            # compute_score_lift reads — group.to_dict('records') boxed every
-            # cell of every column and dominated Score Lift time at scale.
+            # Only the five columns compute_score_lift reads —
+            # to_dict('records') boxed every cell and dominated at scale.
             _sl_cols = ['Resolved', 'Vulnerability Name', 'Vulnerability Score',
                         'Has Known Exploit', 'CISA KEV']
             _sl_data = {c: (group[c].tolist() if c in group.columns
@@ -415,9 +374,8 @@ def build_product_sheets(writer, triage_df, product_to_sheet,
         final_cols = [c for c in cols_order if c in group.columns]
         _out = group[final_cols]
 
-        # Direct write_row bypasses pandas to_excel overhead (~1.6× faster).
-        # Register the sheet in writer.sheets so all subsequent set_column /
-        # conditional_format / autofilter calls work exactly as before.
+        # Direct write_row (faster than to_excel); register in writer.sheets
+        # so later set_column / conditional_format / autofilter calls work.
         wb_ = writer.book
         ws  = wb_.add_worksheet(sheet_name)
         writer.sheets[sheet_name] = ws
@@ -460,22 +418,11 @@ def build_product_sheets(writer, triage_df, product_to_sheet,
 
         unresolved_fmt = wb_.add_format({'bg_color': '#FFCCCC', 'font_color': '#8B0000'})  # coral red — unresolved, clearly distinct from blue
 
-        # ── Bulk colouring via conditional_format (Excel XML — no Python loop needed) ──
-        # Rules are evaluated in the order added — first added = highest priority in Excel.
-        # IMPORTANT: range starts at Excel row 2 (xlsxwriter row index 1), so formula
-        # must reference row 2 ($A2) not row 1 ($A1). Using $A1 causes an off-by-one:
-        # each row gets coloured based on the PREVIOUS row's value, not its own.
-        #
-        # The Vulnerability Score column is DELIBERATELY EXCLUDED from every
-        # row-level range below. Every row is either ☑ or ☐ (always one or the
-        # other, always true), so if the Score column were included here, the
-        # row-level rule — added first, hence higher priority in Excel — would
-        # win the conflict on that cell on EVERY row, and the CVSS score-band
-        # colour applied further down would never actually be visible. This
-        # was a real bug: the score-band rules existed and were correct, but
-        # were silently overridden on 100% of rows. Splitting the range in two
-        # (skipping the Score column entirely) means there's no overlap for
-        # Excel to resolve — both colourings show, independently, as intended.
+        # Row colouring via conditional_format. Rules added first win in
+        # Excel. Ranges start at Excel row 2, so formulas reference $A2 —
+        # $A1 shifts every row's colour off by one. The Score column is
+        # excluded from row-level ranges: the always-true ☑/☐ rules would
+        # otherwise override the score-band colours on every row.
         _vs_idx = cl.index('Vulnerability Score') if 'Vulnerability Score' in cl else None
 
         def _row_cf(cf_dict):
@@ -512,10 +459,7 @@ def build_product_sheets(writer, triage_df, product_to_sheet,
                 'format':   exploit_fmt,
             })
 
-        # ── Sparse colouring via set_row for Python-computed states ──
-        # Only patch-gap rows need set_row; everything else is handled by the
-        # conditional_format rules above.  Skip the loop entirely when no patch
-        # gaps exist — that is the common case and saves ~80k iterations.
+        # set_row only for patch-gap rows; skip when none exist (common case).
         if patch_gap_pairs:
             _exp_arr     = (group[_exp_col].astype(str).str.strip().str.lower().tolist()
                             if _exp_col in group.columns else [''] * len(group))
@@ -541,11 +485,8 @@ def build_product_sheets(writer, triage_df, product_to_sheet,
         if 'Baseline Compliance' in cl: ws.set_column(cl.index('Baseline Compliance'), cl.index('Baseline Compliance'), 22)
         if _vs_idx is not None:
             ws.set_column(_vs_idx, _vs_idx, 8)
-            # CVSS score colour coding — matches the Risk Rating matrix exactly:
-            # Critical 9.0-10.0 = red, High 7.0-8.9 = gold, Medium 4.0-6.9 = yellow,
-            # Low 0.1-3.9 = green. Colour follows score ONLY — added AFTER
-            # row-level CFs so row colour (resolved/exploit) still takes
-            # precedence on those rows; score colour shows on the rest.
+            # CVSS score bands (crit/high/med/low). Added after row-level CFs
+            # so row colour still wins on resolved/exploit rows.
             _crit_fmt = wb_.add_format({'bg_color': '#FF0000', 'font_color': 'white',
                                         'num_format': '0.0', 'align': 'center'})
             _high_fmt = wb_.add_format({'bg_color': '#FFC000', 'font_color': 'black',
@@ -566,13 +507,9 @@ def build_product_sheets(writer, triage_df, product_to_sheet,
                 'type': 'cell', 'criteria': 'between', 'minimum': 0.1, 'maximum': 3.9,
                 'format': _low_fmt})
 
-        # ── Health/resolution subtotal block (hidden cols Q/R, rows 1-7) ───────
-        # Totals this sheet's ☑/☐ counts once, locally, so the Summary sheet's
-        # live formulas (Resolution Status table always; Patching Health Score
-        # when enabled) can reference ONE cell per sheet instead of embedding a
-        # COUNTIFS per sheet — which blew past Excel's 8,192-char formula limit
-        # on workbooks with many product sheets. Written unconditionally: the
-        # Resolution Status table is live regardless of include_health_score.
+        # Hidden subtotal block (cols Q/R) — one cell per sheet for the
+        # Summary's live formulas (avoids Excel's 8,192-char formula limit).
+        # Written unconditionally: Resolution Status table is always live.
         _write_hs_subtotals(ws, wb_, final_cols, _hs_subtotal_counts(group))
 
         legend_row = len(group) + 3

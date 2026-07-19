@@ -234,12 +234,8 @@ def run(request: DashboardRequest) -> DashboardResult:
         df_vuln = load_vulnerability_data(request.vuln_path)
         log.info("  %d rows loaded", len(df_vuln))
 
-        # ── Contract: CVE export boundary ────────────────────────────────
-        # Structural problems (missing canonical columns after alias
-        # normalisation, duplicate column labels, non-numeric scores) raise
-        # ContractError here with the source filename in the message.
-        # Vocabulary oddities (novel Threat Status values, scores outside
-        # 0-10) flow into `warnings` and surface on DashboardResult.
+        # Contract: CVE export — structural problems raise ContractError;
+        # vocabulary oddities go to warnings.
         run_check(check_cve_export, df_vuln,
                   source_name=Path(request.vuln_path).name,
                   warnings=warnings)
@@ -264,15 +260,8 @@ def run(request: DashboardRequest) -> DashboardResult:
         except Exception as _e:
             log.debug("CVE lookup auto-enrich skipped: %s", _e)
 
-        # ── CISA KEV enrichment ──────────────────────────────────────────────
-        # Independent of the version-data enrichment above (and allowed to
-        # fail independently): most detection exports have no genuine CISA
-        # KEV column at all, so without this every KEV-based Summary table
-        # and health-score penalty silently sees zero KEV CVEs even when the
-        # fleet has real, actively-exploited CVEs on it. See cve_lookup.py's
-        # enrich_cisa_kev() docstring for why this OR's the real catalog with
-        # any KEV data the source file already provided, rather than
-        # replacing it.
+        # CISA KEV enrichment — most exports have no real KEV column; ORs the
+        # catalog with any source-provided KEV data (see enrich_cisa_kev).
         try:
             from cve_lookup import enrich_cisa_kev
             _kev_flagged = enrich_cisa_kev(df_vuln)
@@ -286,9 +275,8 @@ def run(request: DashboardRequest) -> DashboardResult:
             df_rmm = load_rmm_data(request.rmm_path)
             log.info("  %d devices loaded", len(df_rmm))
 
-            # ── Contract: RMM inventory boundary ─────────────────────────
-            # Hard-fails on duplicate Device_Join keys (would fan out CVE
-            # rows in the merge); warns on unknown Device Type values.
+            # Contract: RMM inventory — fails on duplicate Device_Join keys;
+            # warns on unknown Device Types.
             run_check(check_rmm_inventory, df_rmm,
                       source_name=Path(request.rmm_path).name,
                       warnings=warnings)
@@ -298,13 +286,8 @@ def run(request: DashboardRequest) -> DashboardResult:
                                as_of_date=run_ts)
         log.info("Merged dataset: %d rows", len(merged_df))
 
-        # ── Contract: merged-frame boundary ──────────────────────────────
-        # merge_data guarantees Last Response / Device Type / Username exist
-        # in every code path (RMM, skip_rmm, no-RMM). expect_category_cols
-        # guards the v0.12 decategorise/re-downcast round trip: if 'Device
-        # Type' comes back as object dtype, a conditional write was likely
-        # added after the re-downcast step (warn-only — memory, not
-        # correctness).
+        # Contract: merged frame — required columns exist in every code path;
+        # category-dtype check is warn-only (memory, not correctness).
         run_check(check_merged, merged_df,
                   expect_category_cols=('Device Type',),
                   warnings=warnings)
@@ -318,11 +301,8 @@ def run(request: DashboardRequest) -> DashboardResult:
                 cutoff = pd.to_datetime('1900-01-01')
             high = merged_df[merged_df['Vulnerability Score'] >= request.threshold]
 
-            # Stale = last seen before the user-entered cutoff date. This is
-            # the ONLY staleness criterion — there is no separate fixed
-            # day-count rule layered on top of it. 'Not found in RMM' is a
-            # wholly separate, orthogonal category (handled elsewhere as
-            # not_in_rmm_df) and is never counted as stale here.
+            # Stale = last seen before the cutoff date — the only criterion.
+            # 'Not Found in RMM' is a separate category, never counted as stale.
             stale_excluded = high[
                 (high['_Sort_Time'] < cutoff) &
                 (high['Last Response'] != 'Not Found in RMM')
@@ -340,11 +320,8 @@ def run(request: DashboardRequest) -> DashboardResult:
                 request.cutoff_date, len(merged_df), len(all_stale_names),
             )
 
-        # Approaching-stale feature removed: the warning flag, its row
-        # colouring, and the legend entries are gone from the sheet builders.
-        # request.stale_warning_days is retained on DashboardRequest only so
-        # existing callers (main.py GUI) keep constructing requests without
-        # error; it is ignored here.
+        # Approaching-stale feature removed; request.stale_warning_days kept
+        # for caller compatibility, ignored here.
 
         if merged_df.empty:
             msg = (
@@ -359,33 +336,14 @@ def run(request: DashboardRequest) -> DashboardResult:
         filtered_df = merged_df[merged_df['Vulnerability Score'] >= request.threshold]
         triage_df   = filtered_df[filtered_df['Last Response'] != 'Not Found in RMM']
 
-        # Health-score scope is ALWAYS CVSS >= 7.0, full stop — independent of
-        # whatever CVSS threshold the report itself is displayed at. This is
-        # what keeps the score comparable across runs: a report generated at
-        # the default 9.0 threshold and one generated at 1.0 (to see
-        # everything) should produce the SAME health score, because both are
-        # graded against the same fixed CVSS >= 7.0 bar.
-        #
-        # Previously this used min(request.threshold, 7.0), which meant a low
-        # display threshold (e.g. 1.0) shrank the health-score scope down to
-        # 1.0 too — pulling in a flood of low-severity CVEs that have nothing
-        # to do with "critical patching health" and made the score swing
-        # depending on what threshold the report happened to be run at. The
-        # health scope must never go below 7.0, matching the intent already
-        # documented on compute_patching_health_score().
+        # Health-score scope is fixed at CVSS >= 7.0, independent of the
+        # report's display threshold — keeps the score comparable across runs.
         health_score_threshold = 7.0
         health_filtered      = merged_df[merged_df['Vulnerability Score'] >= health_score_threshold]
         health_triage_df     = health_filtered[health_filtered['Last Response'] != 'Not Found in RMM']
 
-        # ── Contract: two-scope system (v0.3 Triage Scope guard) ─────────
-        # Asserts triage ⊆ filtered ⊆ merged, every filtered row is at or
-        # above the CVSS threshold, zero 'Not Found in RMM' rows reach
-        # triage, and the health-score floor never drops below 7.0. All
-        # violations here are structural — a scope leak silently corrupts
-        # every downstream sheet, so this raises rather than warns.
-        # (Deliberately does NOT assert no-RESOLVED in triage_df: since
-        # v0.3, UNRESOLVED filtering lives in resolution.py /
-        # _active_trend_scope, not at this boundary.)
+        # Contract: triage ⊆ filtered ⊆ merged, no 'Not Found in RMM' in
+        # triage, health floor >= 7.0. Structural — raises rather than warns.
         run_check(check_scopes, merged_df, filtered_df, triage_df,
                   request.threshold,
                   health_filtered=health_filtered,
@@ -423,14 +381,8 @@ def run(request: DashboardRequest) -> DashboardResult:
                 request.patch_path, merged_df.copy(), min_score=request.threshold,
                 as_of_date=run_ts)
 
-            # ── Contract: patch-match output (v0.4 Status Collision guard) ─
-            # Hard-fails if 'Status' contains RESOLVED/UNRESOLVED (the CVE
-            # export's threat status leaking into the patch install-status
-            # column — the exact merge collision from v0.4, guarded from
-            # both directions of reintroduction), if any internal
-            # underscore working column leaked, or if a required output
-            # column is missing. Warns if any 'Patch confirmed' row lacks a
-            # 'Version compliant' check (classifier AND-chain regression).
+            # Contract: patch-match output — fails on threat-status leaking
+            # into 'Status', leaked _columns, or missing output columns.
             run_check(check_patch_match, p_full, warnings=warnings)
 
             patch_data = (p_ov, p_full, p_raw, tot_r, filt_r)
@@ -545,12 +497,9 @@ def run(request: DashboardRequest) -> DashboardResult:
         _unresolved_pairs_2d: set = set()
         _raw_inject_pairs:    set = set()
 
-        # Determine once whether the current export carries a status column.
-        # When it does, build_product_sheets source 2 reads it directly per-row —
-        # injecting all RESOLVED rows into patch_resolved_pairs would be redundant
-        # and at large scale (70k+ rows) creates a large redundant set and forces
-        # repeated per-row membership checks during product-sheet rendering that
-        # dominate write time.
+        # When the export has a status column, build_product_sheets reads it
+        # per-row (source 2) — injecting RESOLVED pairs would only build a
+        # huge redundant set and slow sheet rendering.
         _export_has_status_col = any(c in raw_df.columns
                                      for c in ('Threat Status', 'Status', 'threat status', 'status'))
 
@@ -567,10 +516,7 @@ def run(request: DashboardRequest) -> DashboardResult:
                     _raw_unr['Vulnerability Name'].apply(extract_cve_id),
                 ))
 
-            # RESOLVED injection: only when there is no status column on the export.
-            # If the export has a status column, product sheets already read it as source 2.
-            # Injecting here would inflate patch_resolved_pairs to tens of thousands of
-            # entries forces repeated per-row membership checks in build_product_sheets.
+            # RESOLVED injection: only when the export has no status column (see above).
             if not _export_has_status_col:
                 _raw_res = raw_df[_col_upper == 'RESOLVED']
                 if not _raw_res.empty:
@@ -592,8 +538,7 @@ def run(request: DashboardRequest) -> DashboardResult:
                     len(to_remove),
                 )
 
-        # Step 2: inject raw RESOLVED pairs — only runs when export has no status column
-        # (otherwise source 2 in build_product_sheets handles it per-row at zero overhead).
+        # Step 2: inject raw RESOLVED pairs (export has no status column).
         if _raw_inject_pairs:
             clean = {p for p in _raw_inject_pairs if (p[0], p[1]) not in _unresolved_pairs_2d}
             skipped = len(_raw_inject_pairs) - len(clean)
@@ -620,12 +565,8 @@ def run(request: DashboardRequest) -> DashboardResult:
                 log.warning("Could not process patch failure report: %s", exc)
                 warnings.append(f"Could not process patch failure report: {exc}")
 
-        # ── Patch Status Check failures (RMM agent-side monitoring check) ───────
-        # Distinct from the patch failure report above: this is about RMM's own
-        # 'Patch Status Check' failing to even report a result for a device —
-        # i.e. RMM can't confirm whether the device is patched at all. See
-        # data_pipeline.load_patch_check_report()'s docstring for the full
-        # distinction.
+        # Patch Status Check failures — RMM's own check failing to report,
+        # distinct from a patch failing to install (see load_patch_check_report).
         check_df           = None
         check_lookup: dict  = {}
         check_devices: set  = set()
@@ -640,14 +581,8 @@ def run(request: DashboardRequest) -> DashboardResult:
                 check_lookup  = build_patch_check_failure_lookup(check_df)
                 check_devices = set(check_lookup.keys())
 
-                # "Active" mirrors the scope Key Metrics uses everywhere else —
-                # i.e. within the date range entered (not stale, given
-                # merged_df already had the cutoff_date exclusion applied
-                # above) and not 'Not Found in RMM'. The Summary sheet only
-                # ever shows devices in this active scope; the dedicated
-                # 'Patch Check Failures' worksheet shows every device from
-                # the imported report regardless, with this same set used to
-                # mark each one Active Yes/No for consistency.
+                # "Active" = same scope as Key Metrics: within date range and
+                # found in RMM. Sheet shows every device; this drives Active Yes/No.
                 _active_names_by_norm: dict = {}
                 if 'Name' in merged_df.columns and 'Last Response' in merged_df.columns:
                     for raw_name in merged_df.loc[
@@ -690,7 +625,10 @@ def run(request: DashboardRequest) -> DashboardResult:
 
         log.info("Writing workbook: %s", request.output_path)
         with pd.ExcelWriter(request.output_path, engine='xlsxwriter',
-                            engine_kwargs={'options': {'strings_to_urls': False}}) as writer:  # do NOT use constant_memory=True — corrupts data in xlsxwriter 3.x
+                            engine_kwargs={'options': {'strings_to_urls': False}}) as writer:
+            # strings_to_urls=False skips per-cell URL regexes (all links use
+            # explicit write_url). constant_memory corrupts output — the hs
+            # subtotal block writes rows out of order.
             wb = writer.book
 
             _not_in_rmm_mask = filtered_df['Last Response'] == 'Not Found in RMM'
@@ -718,9 +656,8 @@ def run(request: DashboardRequest) -> DashboardResult:
                 patch_check_active_df=patch_check_active_df if not patch_check_active_df.empty else None,
                 patch_check_active_names=check_active_names,
             )
-            # Trend Summary worksheet removed — trend metrics still appear in
-            # the Client Summary Month-over-Month section and the detail
-            # sheets below (New This Month / Persisting / Resolved Since).
+            # Trend Summary worksheet removed — metrics live on the Summary
+            # sheet and the trend detail sheets.
 
             if trend_data:
                 build_trend_detail_sheets(writer, wb, trend_data,
@@ -733,10 +670,8 @@ def run(request: DashboardRequest) -> DashboardResult:
                                   trend_data=trend_data,
                                   include_health_score=request.include_health_score)
 
-            # 'Resolved Since Previous Report' is placed after all product sheets —
-            # each product sheet tracks its own ☑/☐ Resolved column, so this
-            # cross-product, trend-inferred rollup reads more naturally as a
-            # follow-on to that per-product tracking than as a lead-in to it.
+            # Placed after product sheets: cross-product rollup reads as a
+            # follow-on to the per-sheet ☑/☐ tracking.
             if trend_data:
                 build_trend_detail_sheets(writer, wb, trend_data,
                                           sheets_subset={'Resolved Since Previous Report'})
@@ -830,12 +765,7 @@ def run(request: DashboardRequest) -> DashboardResult:
                     )
 
             if check_df is not None and check_lookup:
-                # Same "Active" definition used on the Summary sheet — within
-                # the date range entered (stale devices already excluded from
-                # merged_df) and found in RMM — not just "somewhere in the
-                # RMM inventory file" regardless of staleness. Every device
-                # from the imported report still appears in the sheet either
-                # way; this only affects the Active Yes/No column.
+                # Same "Active" definition as the Summary sheet (see above).
                 inventory_devices_chk = active_universe_names if active_universe_names else (
                     set(df_rmm['Device_Join'].unique()) if df_rmm is not None else None
                 )
