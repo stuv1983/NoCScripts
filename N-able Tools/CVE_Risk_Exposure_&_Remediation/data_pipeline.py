@@ -165,12 +165,17 @@ def _rename_cve_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def normalize_device_name(name: str) -> str:
-    """Strip domain components and uppercase a single device name string."""
-    name = str(name).strip().upper()
+from functools import lru_cache as _lru_cache
+
+@_lru_cache(maxsize=65536)
+def _normalize_device_name_cached(name: str) -> str:
     if '\\' in name: name = name.split('\\')[-1]
     if '.'  in name: name = name.split('.')[0]
     return name
+
+def normalize_device_name(name: str) -> str:
+    """Strip domain components and uppercase a single device name string."""
+    return _normalize_device_name_cached(str(name).strip().upper())
 
 
 def _normalize_device_col(series: 'pd.Series') -> 'pd.Series':
@@ -210,10 +215,14 @@ def clean_sheet_name(name: str, used_names: Set[str]) -> str:
     return final
 
 
+@_lru_cache(maxsize=65536)
+def _extract_cve_id_cached(val: str) -> str:
+    m = CVE_PATTERN.search(val)
+    return m.group(1).upper() if m else val.strip().upper()
+
 def extract_cve_id(val: str) -> str:
     """Pull a bare CVE-YYYY-NNNNN from either a raw string or a HYPERLINK formula."""
-    m = CVE_PATTERN.search(str(val))
-    return m.group(1).upper() if m else str(val).strip().upper()
+    return _extract_cve_id_cached(str(val))
 
 
 def determine_device_type(os_string: str) -> str:

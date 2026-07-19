@@ -389,11 +389,19 @@ def build_product_sheets(writer, triage_df, product_to_sheet,
 
         # ── Score Lift ─────────────────────────────────────────────────────────────────
         if include_health_score:
-            _group_rows = group.to_dict('records')
+            # Build minimal per-row dicts from only the five columns
+            # compute_score_lift reads — group.to_dict('records') boxed every
+            # cell of every column and dominated Score Lift time at scale.
+            _sl_cols = ['Resolved', 'Vulnerability Name', 'Vulnerability Score',
+                        'Has Known Exploit', 'CISA KEV']
+            _sl_data = {c: (group[c].tolist() if c in group.columns
+                            else [''] * len(group)) for c in _sl_cols}
             _sl_list = [
-                compute_score_lift(r, _sl_total, _sl_crit_total, _sl_exp_total,
-                                   _kev_unres_by_cve, _persisting_cves)
-                for r in _group_rows
+                compute_score_lift(
+                    dict(zip(_sl_cols, vals)),
+                    _sl_total, _sl_crit_total, _sl_exp_total,
+                    _kev_unres_by_cve, _persisting_cves)
+                for vals in zip(*(_sl_data[c] for c in _sl_cols))
             ]
             group.insert(1, 'Score Lift', _sl_list)
             _sort_cols = ['Score Lift', 'Vulnerability Score', '_Sort_Time', 'Name']

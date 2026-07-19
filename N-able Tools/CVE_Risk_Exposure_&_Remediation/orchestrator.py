@@ -23,9 +23,12 @@ from typing import Optional, Set, Tuple
 import pandas as pd
 
 from config import FIXED_VERSION_RULES
+from contracts import (
+    run_check, check_cve_export, check_rmm_inventory,
+    check_merged, check_scopes, check_patch_match,
+)
 from data_pipeline import (
     load_vulnerability_data, load_rmm_data, merge_data,
-    check_customer_consistency,
     process_patch_match, load_previous_report, compute_trends,
     normalize_device_name, extract_cve_id, clean_sheet_name,
     load_patch_failure_report, build_patch_failure_lookup,
@@ -35,7 +38,7 @@ from data_pipeline import (
 from diagnostics import compute_patch_diagnostics, classify_root_cause
 import snapshot as snap_store
 from summary_sheet import build_client_summary_sheet
-from trend_sheets import build_trend_detail_sheets
+from trend_sheets import build_trend_detail_sheets  # trend summary worksheet removed
 from product_sheets import build_product_sheets
 from patch_sheets import (
     build_patch_sheets, build_diagnostics_sheets,
@@ -125,6 +128,7 @@ class DashboardRequest:
     sync_baselines:       bool           = False
     exclude_missing_rmm:  bool           = False
     report_month:         str            = ''
+    stale_warning_days:   int            = 14   # flag active devices within this many days of going stale
     include_health_score: bool           = False  # beta — show Patching Health Score on Summary sheet
 
 @dataclass
@@ -230,6 +234,16 @@ def run(request: DashboardRequest) -> DashboardResult:
         df_vuln = load_vulnerability_data(request.vuln_path)
         log.info("  %d rows loaded", len(df_vuln))
 
+        # ── Contract: CVE export boundary ────────────────────────────────
+        # Structural problems (missing canonical columns after alias
+        # normalisation, duplicate column labels, non-numeric scores) raise
+        # ContractError here with the source filename in the message.
+        # Vocabulary oddities (novel Threat Status values, scores outside
+        # 0-10) flow into `warnings` and surface on DashboardResult.
+        run_check(check_cve_export, df_vuln,
+                  source_name=Path(request.vuln_path).name,
+                  warnings=warnings)
+
         _cve_repo = _find_cve_repo()
         _pull_cve_repo(_cve_repo)
 
@@ -271,16 +285,29 @@ def run(request: DashboardRequest) -> DashboardResult:
             log.info("Loading RMM data: %s", request.rmm_path)
             df_rmm = load_rmm_data(request.rmm_path)
             log.info("  %d devices loaded", len(df_rmm))
-            # Safety net: never silently merge a device report belonging to a
-            # different customer into this dashboard. Raises ValueError with a
-            # clear per-file message; run() surfaces it as a failed result.
-            check_customer_consistency({'Detections export': df_vuln,
-                                        'Device report':     df_rmm})
+
+            # ── Contract: RMM inventory boundary ─────────────────────────
+            # Hard-fails on duplicate Device_Join keys (would fan out CVE
+            # rows in the merge); warns on unknown Device Type values.
+            run_check(check_rmm_inventory, df_rmm,
+                      source_name=Path(request.rmm_path).name,
+                      warnings=warnings)
 
         merged_df = merge_data(df_vuln, df_rmm, request.skip_rmm,
                                exclude_missing_rmm=request.exclude_missing_rmm,
                                as_of_date=run_ts)
         log.info("Merged dataset: %d rows", len(merged_df))
+
+        # ── Contract: merged-frame boundary ──────────────────────────────
+        # merge_data guarantees Last Response / Device Type / Username exist
+        # in every code path (RMM, skip_rmm, no-RMM). expect_category_cols
+        # guards the v0.12 decategorise/re-downcast round trip: if 'Device
+        # Type' comes back as object dtype, a conditional write was likely
+        # added after the re-downcast step (warn-only — memory, not
+        # correctness).
+        run_check(check_merged, merged_df,
+                  expect_category_cols=('Device Type',),
+                  warnings=warnings)
 
         raw_df         = merged_df.copy()
         stale_excluded = pd.DataFrame()
@@ -313,6 +340,12 @@ def run(request: DashboardRequest) -> DashboardResult:
                 request.cutoff_date, len(merged_df), len(all_stale_names),
             )
 
+        # Approaching-stale feature removed: the warning flag, its row
+        # colouring, and the legend entries are gone from the sheet builders.
+        # request.stale_warning_days is retained on DashboardRequest only so
+        # existing callers (main.py GUI) keep constructing requests without
+        # error; it is ignored here.
+
         if merged_df.empty:
             msg = (
                 f"No vulnerability records found after applying date filter "
@@ -344,6 +377,22 @@ def run(request: DashboardRequest) -> DashboardResult:
         health_filtered      = merged_df[merged_df['Vulnerability Score'] >= health_score_threshold]
         health_triage_df     = health_filtered[health_filtered['Last Response'] != 'Not Found in RMM']
 
+        # ── Contract: two-scope system (v0.3 Triage Scope guard) ─────────
+        # Asserts triage ⊆ filtered ⊆ merged, every filtered row is at or
+        # above the CVSS threshold, zero 'Not Found in RMM' rows reach
+        # triage, and the health-score floor never drops below 7.0. All
+        # violations here are structural — a scope leak silently corrupts
+        # every downstream sheet, so this raises rather than warns.
+        # (Deliberately does NOT assert no-RESOLVED in triage_df: since
+        # v0.3, UNRESOLVED filtering lives in resolution.py /
+        # _active_trend_scope, not at this boundary.)
+        run_check(check_scopes, merged_df, filtered_df, triage_df,
+                  request.threshold,
+                  health_filtered=health_filtered,
+                  health_triage_df=health_triage_df,
+                  health_score_threshold=health_score_threshold,
+                  warnings=warnings)
+
         # Build a dedicated DataFrame for not-in-RMM devices so we can pass rows
         # (not just a count) into the stale sheet builders for audit tracking.
         not_in_rmm_df   = filtered_df[filtered_df['Last Response'] == 'Not Found in RMM']
@@ -373,6 +422,17 @@ def run(request: DashboardRequest) -> DashboardResult:
             p_ov, p_full, p_raw, tot_r, filt_r = process_patch_match(
                 request.patch_path, merged_df.copy(), min_score=request.threshold,
                 as_of_date=run_ts)
+
+            # ── Contract: patch-match output (v0.4 Status Collision guard) ─
+            # Hard-fails if 'Status' contains RESOLVED/UNRESOLVED (the CVE
+            # export's threat status leaking into the patch install-status
+            # column — the exact merge collision from v0.4, guarded from
+            # both directions of reintroduction), if any internal
+            # underscore working column leaked, or if a required output
+            # column is missing. Warns if any 'Patch confirmed' row lacks a
+            # 'Version compliant' check (classifier AND-chain regression).
+            run_check(check_patch_match, p_full, warnings=warnings)
+
             patch_data = (p_ov, p_full, p_raw, tot_r, filt_r)
             log.info("  Patch match: %d total rows, %d above threshold", tot_r, filt_r)
 
@@ -383,10 +443,6 @@ def run(request: DashboardRequest) -> DashboardResult:
             log.info("Loading previous report for trend: %s", request.prev_report_path)
             prev_df, prev_resolved_pairs, prev_source_type = load_previous_report(request.prev_report_path)
             prev_report_name = Path(request.prev_report_path).name
-            # Safety net: a previous report from a different customer would
-            # corrupt every trend metric — abort with a clear message instead.
-            check_customer_consistency({'Detections export (current)': df_vuln,
-                                        'Previous report':             prev_df})
             inventory_set    = (set(df_rmm['Device_Join'].unique())
                                 if df_rmm is not None else None)
 
@@ -633,7 +689,8 @@ def run(request: DashboardRequest) -> DashboardResult:
                 warnings.append(f"Could not process patch status check report: {exc}")
 
         log.info("Writing workbook: %s", request.output_path)
-        with pd.ExcelWriter(request.output_path, engine='xlsxwriter') as writer:  # do NOT use constant_memory=True — corrupts data in xlsxwriter 3.x
+        with pd.ExcelWriter(request.output_path, engine='xlsxwriter',
+                            engine_kwargs={'options': {'strings_to_urls': False}}) as writer:  # do NOT use constant_memory=True — corrupts data in xlsxwriter 3.x
             wb = writer.book
 
             _not_in_rmm_mask = filtered_df['Last Response'] == 'Not Found in RMM'
@@ -661,11 +718,13 @@ def run(request: DashboardRequest) -> DashboardResult:
                 patch_check_active_df=patch_check_active_df if not patch_check_active_df.empty else None,
                 patch_check_active_names=check_active_names,
             )
-            # v0.33: the 'Trend Summary' sheet was removed — the Summary
-            # sheet's Month-over-Month Remediation Summary and Patching
-            # Progress sections cover the same metrics in one place.
+            # Trend Summary worksheet removed — trend metrics still appear in
+            # the Client Summary Month-over-Month section and the detail
+            # sheets below (New This Month / Persisting / Resolved Since).
+
             if trend_data:
-                build_trend_detail_sheets(writer, wb, trend_data)
+                build_trend_detail_sheets(writer, wb, trend_data,
+                                          sheets_subset={'New This Month', 'Persisting CVEs'})
 
             build_product_sheets(writer, triage_df, product_to_sheet,
                                   patch_resolved_pairs=patch_resolved_pairs,
@@ -673,6 +732,14 @@ def run(request: DashboardRequest) -> DashboardResult:
                                   health_triage_df=health_triage_df,
                                   trend_data=trend_data,
                                   include_health_score=request.include_health_score)
+
+            # 'Resolved Since Previous Report' is placed after all product sheets —
+            # each product sheet tracks its own ☑/☐ Resolved column, so this
+            # cross-product, trend-inferred rollup reads more naturally as a
+            # follow-on to that per-product tracking than as a lead-in to it.
+            if trend_data:
+                build_trend_detail_sheets(writer, wb, trend_data,
+                                          sheets_subset={'Resolved Since Previous Report'})
 
             if not stale_excluded.empty or not not_in_rmm_df.empty:
                 build_stale_excluded_sheet(writer, stale_excluded,
