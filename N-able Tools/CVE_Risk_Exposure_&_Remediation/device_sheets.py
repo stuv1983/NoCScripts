@@ -36,19 +36,30 @@ def build_stale_excluded_sheet(writer, stale_df, not_in_rmm_df=None) -> None:
     note_fmt = wb.add_format({'italic': True, 'font_color': '#595959', 'font_size': 9})
 
     headers = ['Device Name', 'Username', 'Last Response', 'Days Since Last Response',
-               'Device Type', 'Reason']
-    col_widths = [35, 25, 25, 25, 18, 30]
+               'Device Type', 'Outstanding CVEs', 'Reason']
+    col_widths = [35, 25, 25, 25, 18, 18, 30]
     for ci, w in enumerate(col_widths):
         ws.set_column(ci, ci, w)
 
-    # Build unified DataFrame
+    def _cve_counts(src_df) -> dict:
+        """Unique outstanding CVE IDs per device (same CVE across multiple
+        product versions counts once)."""
+        if src_df is None or src_df.empty or 'Vulnerability Name' not in src_df.columns:
+            return {}
+        return src_df.groupby('Name')['Vulnerability Name'].nunique().to_dict()
+
+    # Build unified DataFrame — count CVEs BEFORE dropping duplicate device rows
     frames = []
     if has_stale:
+        _s_counts = _cve_counts(stale_df)
         _s = stale_df[[c for c in cols_src if c in stale_df.columns]].drop_duplicates(subset=['Name']).copy()
+        _s['Outstanding CVEs'] = _s['Name'].map(_s_counts).fillna(0).astype(int)
         _s['Reason'] = '⏱  Date-Stale'
         frames.append(_s)
     if has_nirm:
+        _n_counts = _cve_counts(not_in_rmm_df)
         _n = not_in_rmm_df[[c for c in cols_src if c in not_in_rmm_df.columns]].drop_duplicates(subset=['Name']).copy()
+        _n['Outstanding CVEs'] = _n['Name'].map(_n_counts).fillna(0).astype(int)
         _n['Reason'] = '🚫  Not Found in RMM'
         frames.append(_n)
 
@@ -69,7 +80,12 @@ def build_stale_excluded_sheet(writer, stale_df, not_in_rmm_df=None) -> None:
             src_col = h  # headers align with combined columns (Device Name, Username, etc.)
             pos = col_positions.get(src_col)
             val = row_vals[pos] if pos is not None else ''
-            ws.write(ri, ci, str(val) if val is not None and not (isinstance(val, float) and (val != val)) else '', _fmt)
+            if val is None or (isinstance(val, float) and val != val):
+                ws.write(ri, ci, '', _fmt)
+            elif isinstance(val, (int, float)) and not isinstance(val, bool):
+                ws.write_number(ri, ci, val, _fmt)
+            else:
+                ws.write(ri, ci, str(val), _fmt)
 
     # Autofilter on header row
     ws.autofilter(0, 0, len(combined), len(headers) - 1)
@@ -78,7 +94,10 @@ def build_stale_excluded_sheet(writer, stale_df, not_in_rmm_df=None) -> None:
     ws.write(note_row, 0,
              'ℹ  Date-Stale: last seen before the cutoff — may still be live. '
              'Not-in-RMM (🚫 red): device absent from RMM inventory — '
-             'verify decommission status.', note_fmt)
+             'verify decommission status. '
+             'Outstanding CVEs = unique CVE IDs at/above the score threshold '
+             'still detected on the device (full rows on the CVEs on Stale Devices sheet).',
+             note_fmt)
     ws.set_row(note_row, 30)
 
 
