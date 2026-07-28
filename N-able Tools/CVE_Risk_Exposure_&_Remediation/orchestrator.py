@@ -412,6 +412,21 @@ def run(request: DashboardRequest) -> DashboardResult:
                 "Trend: %d new CVEs, %d resolved, %d persisting (common-product scope)",
                 m['new_cve_count'], m['resolved_cve_count'], m['persisting_cve_count'],
             )
+            # Pair-level remediation (full scope) — the headline figures. The
+            # common-product CVE-type counts above legitimately read "0 resolved"
+            # whenever fleet growth re-seeds old CVE types or clearances came
+            # from retired products, which buries real patching work.
+            log.info(
+                "Trend: %d of %d previous unresolved pairs cleared (%.1f%%), "
+                "%d new pairs; %d CVE type(s) fully cleared full-scope%s",
+                m['cleared_previous_unresolved_count'],
+                m['previous_unresolved_pair_count'],
+                m['cleared_previous_unresolved_pct'] * 100,
+                m['new_unresolved_pair_count'],
+                m.get('cve_types_fully_cleared_count', 0),
+                (' (retired products: %s)' % ', '.join(m['retired_products'])
+                 if m.get('retired_products') else ''),
+            )
             
             redetected_count = trend_data.get('redetected_count', 0)
             if redetected_count > 0:
@@ -860,6 +875,16 @@ def run(request: DashboardRequest) -> DashboardResult:
                 'new_cve_count':       m['new_cve_count'],
                 'resolved_cve_count':  m['resolved_cve_count'],
                 'persisting_cve_count':m['persisting_cve_count'],
+                # Pair-level, full-scope remediation figures for the popup
+                # headline — matches the Month-over-Month Remediation Summary
+                # on the Summary sheet (Previous - Cleared + New == Current).
+                'cleared_pair_count':  m['cleared_previous_unresolved_count'],
+                'cleared_pair_pct':    m['cleared_previous_unresolved_pct'],
+                'new_pair_count':      m['new_unresolved_pair_count'],
+                'previous_pair_count': m['previous_unresolved_pair_count'],
+                'current_pair_count':  m['current_unresolved_pair_count'],
+                'cve_types_fully_cleared_count': m.get('cve_types_fully_cleared_count', 0),
+                'retired_products':    m.get('retired_products', []),
             }
 
         return DashboardResult(

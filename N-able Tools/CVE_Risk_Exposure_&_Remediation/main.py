@@ -82,11 +82,34 @@ def _run_in_thread(request):
             msg = result.message
             if result.trend_summary:
                 ts = result.trend_summary
+                # Lead with pair-level remediation (full scope — matches the
+                # Month-over-Month Remediation Summary on the Summary sheet).
+                # The CVE-type counts are common-product scoped and can read
+                # "0 resolved" during a month of genuinely good patching (fleet
+                # growth re-seeds old CVE types; retired products are out of
+                # scope), so they're shown second, clearly labelled.
+                msg += "\n\nTrend vs previous report:"
+                if 'cleared_pair_count' in ts:
+                    msg += (
+                        f"\n  \u2714 {ts['cleared_pair_count']:,} of "
+                        f"{ts.get('previous_pair_count', 0):,} previous unresolved "
+                        f"pairs cleared ({ts.get('cleared_pair_pct', 0.0):.1%})"
+                        f"\n  \u25b2 {ts.get('new_pair_count', 0):,} new unresolved pairs"
+                    )
+                    _retired_types = ts.get('cve_types_fully_cleared_count', 0)
+                    _retired_prods = ts.get('retired_products') or []
+                    if _retired_types:
+                        msg += f"\n  \u2714 {_retired_types:,} CVE type(s) fully cleared"
+                        if _retired_prods:
+                            _shown = ', '.join(_retired_prods[:3])
+                            if len(_retired_prods) > 3:
+                                _shown += f" +{len(_retired_prods) - 3} more"
+                            msg += f" (incl. retired products: {_shown})"
                 msg += (
-                    "\n\nTrend vs previous report:"
                     f"\n  \u25b2 {ts['new_cve_count']:,} new CVE types   "
                     f"\u25bc {ts['resolved_cve_count']:,} resolved   "
                     f"\u23f3 {ts['persisting_cve_count']:,} persisting"
+                    "  (common-product scope)"
                 )
             if result.warnings:
                 msg += "\n\nWarnings:\n" + "\n".join(f"  - {w}" for w in result.warnings)

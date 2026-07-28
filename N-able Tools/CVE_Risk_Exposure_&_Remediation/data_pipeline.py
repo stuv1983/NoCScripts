@@ -1597,6 +1597,17 @@ def compute_trends(current_df, previous_df, threshold,
         if previous_unresolved_pair_count else 0.0
     )
 
+    # Full-scope CVE-type clearance — companion to resolved_cve_count, which is
+    # common-product-restricted and therefore reports 0 when every fully-cleared
+    # CVE type belonged to a product that disappeared between reports (e.g. an
+    # uninstalled MySQL 5.7 taking 300+ CVE types with it). This full-scope count
+    # includes those, so the GUI popup / log can give credit for retired products
+    # instead of headlining "0 resolved".
+    prev_all_cve_ids        = set(prev_t['_CVE_Key'].unique())
+    cve_types_fully_cleared = prev_all_cve_ids - cur_all_cve_ids
+    retired_products        = sorted(set(prev_t['Base Product'].unique())
+                                     - set(cur_t['Base Product'].unique()))
+
     metrics = {
         'cur_cves':             snap_cur_cves,
         'prev_cves':            snap_prev_cves,
@@ -1632,6 +1643,12 @@ def compute_trends(current_df, previous_df, threshold,
         'cleared_previous_unresolved_count': cleared_previous_unresolved_count,
         'cleared_previous_unresolved_pct':   cleared_previous_unresolved_pct,
         'new_unresolved_pair_count':         new_unresolved_pair_count_full,
+        # Full-scope CVE-type clearance (see comment above prev_all_cve_ids):
+        # counts CVE types unresolved last period and completely absent now,
+        # INCLUDING types that left with a retired/uninstalled product —
+        # deliberately different from resolved_cve_count (common-product scope).
+        'cve_types_fully_cleared_count':     len(cve_types_fully_cleared),
+        'retired_products':                  retired_products,
     }
 
     cur_prod      = cur_t.groupby('Base Product')['_Name_Key'].nunique()
