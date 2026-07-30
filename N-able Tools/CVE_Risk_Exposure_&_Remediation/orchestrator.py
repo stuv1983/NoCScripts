@@ -18,7 +18,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Set, Tuple
+from typing import List, Optional, Set, Tuple
 
 import pandas as pd
 
@@ -113,10 +113,18 @@ class DashboardRequest:
     rmm_path:             Optional[str]  = None
     skip_rmm:             bool           = False
     patch_path:           Optional[str]  = None
+    # Multiple per-client patch reports. When set, takes precedence over
+    # patch_path; files are concatenated by process_patch_match (the Client
+    # column disambiguates rows).
+    patch_paths:          Optional[List[str]] = None
     include_patch:        bool           = False
     failure_report_path:  Optional[str]  = None
     include_failure_report: bool         = False
     patch_check_report_path: Optional[str] = None
+    # Multiple per-client patch status check exports. When set, takes
+    # precedence over patch_check_report_path; files are concatenated by
+    # load_patch_check_report (Customer/Asset columns disambiguate rows).
+    patch_check_report_paths: Optional[List[str]] = None
     include_patch_check_report: bool     = False
     browser_audit_path:   Optional[str]  = None
     include_browser_audit: bool          = False
@@ -376,10 +384,13 @@ def run(request: DashboardRequest) -> DashboardResult:
             product_to_sheet[product] = clean_sheet_name(product, used_names)
 
         patch_data = None
-        if request.include_patch and request.patch_path:
-            log.info("Running patch match: %s", request.patch_path)
+        _patch_inputs = (list(request.patch_paths) if request.patch_paths
+                         else ([request.patch_path] if request.patch_path else []))
+        if request.include_patch and _patch_inputs:
+            log.info("Running patch match: %s", ', '.join(map(str, _patch_inputs)))
             p_ov, p_full, p_raw, tot_r, filt_r = process_patch_match(
-                request.patch_path, merged_df.copy(), min_score=request.threshold,
+                _patch_inputs if len(_patch_inputs) > 1 else _patch_inputs[0],
+                merged_df.copy(), min_score=request.threshold,
                 as_of_date=run_ts)
 
             # Contract: patch-match output — fails on threat-status leaking
@@ -418,11 +429,13 @@ def run(request: DashboardRequest) -> DashboardResult:
             # from retired products, which buries real patching work.
             log.info(
                 "Trend: %d of %d previous unresolved pairs cleared (%.1f%%), "
-                "%d new pairs; %d CVE type(s) fully cleared full-scope%s",
+                "%d new pairs, %d detected & patched within period; "
+                "%d CVE type(s) fully cleared full-scope%s",
                 m['cleared_previous_unresolved_count'],
                 m['previous_unresolved_pair_count'],
                 m['cleared_previous_unresolved_pct'] * 100,
                 m['new_unresolved_pair_count'],
+                m.get('patched_within_period_count', 0),
                 m.get('cve_types_fully_cleared_count', 0),
                 (' (retired products: %s)' % ', '.join(m['retired_products'])
                  if m.get('retired_products') else ''),
@@ -635,10 +648,16 @@ def run(request: DashboardRequest) -> DashboardResult:
         active_universe_names: set = set()   # ALL active devices (normalised), regardless of check status
         patch_check_active_df = pd.DataFrame()
 
-        if request.include_patch_check_report and request.patch_check_report_path:
+        _check_inputs = (list(request.patch_check_report_paths)
+                         if request.patch_check_report_paths
+                         else ([request.patch_check_report_path]
+                               if request.patch_check_report_path else []))
+        if request.include_patch_check_report and _check_inputs:
             try:
-                log.info("Loading patch status check report: %s", request.patch_check_report_path)
-                check_df      = load_patch_check_report(request.patch_check_report_path)
+                log.info("Loading patch status check report: %s",
+                         ', '.join(map(str, _check_inputs)))
+                check_df      = load_patch_check_report(
+                    _check_inputs if len(_check_inputs) > 1 else _check_inputs[0])
                 check_lookup  = build_patch_check_failure_lookup(check_df)
                 check_devices = set(check_lookup.keys())
 
@@ -885,6 +904,7 @@ def run(request: DashboardRequest) -> DashboardResult:
                 'current_pair_count':  m['current_unresolved_pair_count'],
                 'cve_types_fully_cleared_count': m.get('cve_types_fully_cleared_count', 0),
                 'retired_products':    m.get('retired_products', []),
+                'patched_within_period_count': m.get('patched_within_period_count', 0),
             }
 
         return DashboardResult(

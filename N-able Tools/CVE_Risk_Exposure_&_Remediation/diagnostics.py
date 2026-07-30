@@ -234,6 +234,21 @@ def compute_patch_diagnostics(patch_full_df: pd.DataFrame,
         log.warning("compute_patch_diagnostics: missing columns %s", required - set(df.columns))
         return {"patch_lag_df": _e, "version_drift_df": _e, "root_cause_df": _e, "health_score": _no_h}
 
+    # Rows for clients with no patch report supplied are outside diagnostics
+    # scope entirely: excluding them here keeps them out of root_cause_df AND
+    # out of the health-score denominator (len(df)). Leaving them in would
+    # either pollute coverage-gap counts (if classified) or silently dilute
+    # the score (if unclassified but still counted in total_pairs).
+    _no_report = df["Patch Match Result"].astype(str).str.strip() \
+                   .eq("No patch report supplied for client")
+    if _no_report.any():
+        log.info("Diagnostics: excluding %d row(s) — no patch report supplied "
+                 "for their client", int(_no_report.sum()))
+        df = df[~_no_report].copy()
+        if df.empty:
+            return {"patch_lag_df": _e, "version_drift_df": _e,
+                    "root_cause_df": _e, "health_score": _no_h}
+
     df["_cause"]          = df.apply(classify_root_cause, axis=1)
     df["_baseline_cause"] = df.apply(classify_baseline_root_cause, axis=1)
 

@@ -1884,6 +1884,13 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
             ('CVE types fully cleared',
                  m.get('cve_types_fully_cleared_count',
                        m.get('resolved_cve_count',0)),                True),
+            # Pairs RESOLVED in current but absent from the previous report
+            # entirely — detected AND patched between reports. Disjoint from
+            # 'pairs cleared' above (those were previously unresolved). Reads 0
+            # when the current input is an unresolved-only export, since the
+            # RESOLVED rows needed to detect it aren't in the file.
+            ('Detected & patched within period',
+                 m.get('patched_within_period_count',0),              True),
             ('CVE types newly introduced',       m.get('new_cve_count',0),        False),
             ('CVE types persisting (unpatched)', m.get('persisting_cve_count',0), False),
             ('Devices fully remediated',         m.get('remediated_devices',0),   True),
