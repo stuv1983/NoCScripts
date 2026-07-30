@@ -297,6 +297,59 @@ def _get_arch(text: str) -> str:
 # drift out of sync with config.py and excel_builder.py the moment either
 # is edited without the other.
 
+# ── Non-CVE patch-type filter ────────────────────────────────────────────────
+# The N-able patch export lists everything the patch tool installs, including
+# items that do NOT correspond to a CVE the vulnerability scanner tracks:
+# antivirus/Defender signature ("Security Intelligence") updates and device
+# driver updates. When such a patch shares a product key with a CVE row it can
+# be matched and mis-classified as "Patched but still detected (rescan
+# required)", inflating that bucket with work that never mapped to a CVE.
+#
+# We drop these rows from the patch report BEFORE matching, so affected CVE
+# rows fall through to their real status (a genuine patch match, a coverage
+# gap, etc.) instead of a spurious rescan-required note.
+#
+# Deliberately conservative — we do NOT drop Windows/OS cumulative updates,
+# .NET updates, or "Security Update (KBxxxxxxx)" OS rollups: those legitimately
+# fix CVEs the scanner reports (e.g. "2026-02 Cumulative Update for Windows
+# Server 2019"). Only clearly non-CVE maintenance categories are removed.
+#
+# Patterns are overridable via config.json → "non_cve_patch_patterns" (a list
+# of case-insensitive regex strings). An empty list disables the filter.
+_DEFAULT_NON_CVE_PATCH_PATTERNS = [
+    r'security intelligence update',   # Defender definition updates (KB2267602)
+    r'defender antivirus',
+    r'antimalware',
+    r'\bdefinition update',
+    r'\bsignature update',
+    r'\bdriver update\b',              # "Dell, Inc. Driver Update", "... Firmware Driver Update"
+    r'\bdriver\b.*\bupdate\b',
+    r'\bfirmware\b',
+    r'\bbios\b',
+    r'\buefi\b',
+]
+
+def _compile_non_cve_patch_re():
+    pats = _CONFIG.get('non_cve_patch_patterns', _DEFAULT_NON_CVE_PATCH_PATTERNS)
+    if not pats:
+        return None
+    try:
+        return re.compile('|'.join(f'(?:{p})' for p in pats), re.IGNORECASE)
+    except re.error as exc:
+        log.warning("Invalid non_cve_patch_patterns in config (%s) — using defaults", exc)
+        return re.compile('|'.join(f'(?:{p})' for p in _DEFAULT_NON_CVE_PATCH_PATTERNS),
+                          re.IGNORECASE)
+
+_NON_CVE_PATCH_RE = _compile_non_cve_patch_re()
+
+def _is_non_cve_patch(patch_name) -> bool:
+    """True if a patch name is a non-CVE maintenance item (AV signature or
+    driver/firmware update) that should not be matched against CVE rows."""
+    if _NON_CVE_PATCH_RE is None or patch_name is None:
+        return False
+    return bool(_NON_CVE_PATCH_RE.search(str(patch_name)))
+
+
 def _detect_product(text):
     t = _norm_text(str(text))
     for key, product in PRODUCT_MAP:
@@ -1005,6 +1058,22 @@ def process_patch_match(patch_path, cve_df, min_score=9.0, as_of_date=None):
     filtered_rows = len(cve)
 
     patch = patch.copy()
+
+    # Drop non-CVE maintenance patches (AV signature / driver / firmware)
+    # before matching — see _is_non_cve_patch. Keeps OS/.NET CVE rollups.
+    if _NON_CVE_PATCH_RE is not None and 'Patch' in patch.columns:
+        _non_cve_mask = patch['Patch'].apply(_is_non_cve_patch)
+        _dropped = int(_non_cve_mask.sum())
+        if _dropped:
+            _by_name = (patch.loc[_non_cve_mask, 'Patch'].astype(str)
+                        .str.slice(0, 60).value_counts())
+            log.info("Patch match: filtered %d non-CVE patch row(s) "
+                     "(AV signature / driver / firmware) across %d distinct patch name(s)",
+                     _dropped, len(_by_name))
+            for _nm, _cnt in _by_name.head(8).items():
+                log.debug("  dropped %5d × %s", _cnt, _nm)
+            patch = patch[~_non_cve_mask].copy()
+
     patch['_ck']  = patch['Client'].map(_norm_compact)
     patch['_sk']  = patch['Site'].map(_norm_compact)
     patch['_dk']  = patch['Device'].map(_norm_compact)
