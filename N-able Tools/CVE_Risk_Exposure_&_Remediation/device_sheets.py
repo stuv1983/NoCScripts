@@ -11,68 +11,9 @@ import logging
 
 import pandas as pd
 
-from data_pipeline import extract_cve_id, get_col_letter, _drop_internal
-from sheet_helpers import write_nvd_links as _write_nvd_links
+from data_pipeline import _drop_internal
 
 log = logging.getLogger(__name__)
-
-def build_all_detections_sheet(writer, merged_df, link_fmt, missing_row_fmt):
-    df = _drop_internal(merged_df)
-    df['NVD'] = ''
-
-    cols = df.columns.tolist()
-    if 'Device Type' in cols and 'Name' in cols:
-        cols.insert(cols.index('Name') + 1, cols.pop(cols.index('Device Type')))
-        df = df[cols]
-
-    df = df.sort_values(by=['Vulnerability Score', 'Name'], ascending=[False, True])
-    df.to_excel(writer, sheet_name='All Detections', index=False)
-
-    ws = writer.sheets['All Detections']
-    ws.autofilter(0, 0, len(df), len(df.columns) - 1)
-    cl = df.columns.tolist()
-
-    if 'Vulnerability Name' in cl:
-        vn_idx = cl.index('Vulnerability Name')
-        ws.set_column(vn_idx, vn_idx, 25, link_fmt)
-        # CVE text already written by to_excel(); set_column applies blue colour
-    if 'NVD' in cl:
-        nvd_idx = cl.index('NVD')
-        ws.set_column(nvd_idx, nvd_idx, 10, link_fmt)
-        _write_nvd_links(ws, df['Vulnerability Name'], nvd_idx, link_fmt)
-    if 'Name' in cl:
-        ws.set_column(cl.index('Name'), cl.index('Name'), 25)
-    if 'Last Response' in cl:
-        lr = get_col_letter(cl.index('Last Response'))
-        ws.conditional_format(1, 0, len(df), len(cl) - 1, {
-            'type': 'formula', 'criteria': f'=${lr}2="Not Found in RMM"',
-            'format': missing_row_fmt,
-        })
-    if 'N Days Exposed' in cl:
-        nde_idx  = cl.index('N Days Exposed')
-        nde_col  = get_col_letter(nde_idx)
-        ws.set_column(nde_idx, nde_idx, 15)
-        wb = writer.book
-        # >180 days unpatched — critical (dark red)
-        ws.conditional_format(1, nde_idx, len(df), nde_idx, {
-            'type': 'cell', 'criteria': '>=', 'value': 180,
-            'format': wb.add_format({'bg_color': '#C00000', 'font_color': 'white', 'bold': True}),
-        })
-        # 91–179 days — high (red)
-        ws.conditional_format(1, nde_idx, len(df), nde_idx, {
-            'type': 'cell', 'criteria': 'between', 'minimum': 91, 'maximum': 179,
-            'format': wb.add_format({'bg_color': '#FCE4D6'}),
-        })
-        # 31–90 days — amber
-        ws.conditional_format(1, nde_idx, len(df), nde_idx, {
-            'type': 'cell', 'criteria': 'between', 'minimum': 31, 'maximum': 90,
-            'format': wb.add_format({'bg_color': '#FFF2CC'}),
-        })
-        # 0–30 days — green (within acceptable window)
-        ws.conditional_format(1, nde_idx, len(df), nde_idx, {
-            'type': 'cell', 'criteria': 'between', 'minimum': 0, 'maximum': 30,
-            'format': wb.add_format({'bg_color': '#E2EFDA'}),
-        })
 
 def build_stale_excluded_sheet(writer, stale_df, not_in_rmm_df=None) -> None:
     """
@@ -95,19 +36,30 @@ def build_stale_excluded_sheet(writer, stale_df, not_in_rmm_df=None) -> None:
     note_fmt = wb.add_format({'italic': True, 'font_color': '#595959', 'font_size': 9})
 
     headers = ['Device Name', 'Username', 'Last Response', 'Days Since Last Response',
-               'Device Type', 'Reason']
-    col_widths = [35, 25, 25, 25, 18, 30]
+               'Device Type', 'Outstanding CVEs', 'Reason']
+    col_widths = [35, 25, 25, 25, 18, 18, 30]
     for ci, w in enumerate(col_widths):
         ws.set_column(ci, ci, w)
 
-    # Build unified DataFrame
+    def _cve_counts(src_df) -> dict:
+        """Unique outstanding CVE IDs per device (same CVE across multiple
+        product versions counts once)."""
+        if src_df is None or src_df.empty or 'Vulnerability Name' not in src_df.columns:
+            return {}
+        return src_df.groupby('Name')['Vulnerability Name'].nunique().to_dict()
+
+    # Build unified DataFrame — count CVEs BEFORE dropping duplicate device rows
     frames = []
     if has_stale:
+        _s_counts = _cve_counts(stale_df)
         _s = stale_df[[c for c in cols_src if c in stale_df.columns]].drop_duplicates(subset=['Name']).copy()
+        _s['Outstanding CVEs'] = _s['Name'].map(_s_counts).fillna(0).astype(int)
         _s['Reason'] = '⏱  Date-Stale'
         frames.append(_s)
     if has_nirm:
+        _n_counts = _cve_counts(not_in_rmm_df)
         _n = not_in_rmm_df[[c for c in cols_src if c in not_in_rmm_df.columns]].drop_duplicates(subset=['Name']).copy()
+        _n['Outstanding CVEs'] = _n['Name'].map(_n_counts).fillna(0).astype(int)
         _n['Reason'] = '🚫  Not Found in RMM'
         frames.append(_n)
 
@@ -128,7 +80,12 @@ def build_stale_excluded_sheet(writer, stale_df, not_in_rmm_df=None) -> None:
             src_col = h  # headers align with combined columns (Device Name, Username, etc.)
             pos = col_positions.get(src_col)
             val = row_vals[pos] if pos is not None else ''
-            ws.write(ri, ci, str(val) if val is not None and not (isinstance(val, float) and (val != val)) else '', _fmt)
+            if val is None or (isinstance(val, float) and val != val):
+                ws.write(ri, ci, '', _fmt)
+            elif isinstance(val, (int, float)) and not isinstance(val, bool):
+                ws.write_number(ri, ci, val, _fmt)
+            else:
+                ws.write(ri, ci, str(val), _fmt)
 
     # Autofilter on header row
     ws.autofilter(0, 0, len(combined), len(headers) - 1)
@@ -137,11 +94,14 @@ def build_stale_excluded_sheet(writer, stale_df, not_in_rmm_df=None) -> None:
     ws.write(note_row, 0,
              'ℹ  Date-Stale: last seen before the cutoff — may still be live. '
              'Not-in-RMM (🚫 red): device absent from RMM inventory — '
-             'verify decommission status.', note_fmt)
+             'verify decommission status. '
+             'Outstanding CVEs = unique CVE IDs at/above the score threshold '
+             'still detected on the device (full rows on the CVEs on Stale Devices sheet).',
+             note_fmt)
     ws.set_row(note_row, 30)
 
 
-def build_stale_cves_sheet(writer, df, link_fmt, not_in_rmm_cves_df=None) -> None:
+def build_stale_cves_sheet(writer, df, not_in_rmm_cves_df=None) -> None:
     """
     'CVEs on Stale Devices' — one flat filterable table.
     Date-stale rows = light grey, Not-in-RMM rows = red.
@@ -155,12 +115,12 @@ def build_stale_cves_sheet(writer, df, link_fmt, not_in_rmm_cves_df=None) -> Non
     cols_src = ['Name', 'Username', 'Device Type', 'Vulnerability Name', 'Vulnerability Score',
                 'Vulnerability Severity', 'Affected Products',
                 'Has Known Exploit', 'CISA KEV', 'Last Response', 'Days Since Last Response']
-    headers  = cols_src + ['NVD', 'Reason']
+    headers  = cols_src + ['Reason']
     col_widths = {
         'Name': 25, 'Username': 22, 'Device Type': 15, 'Vulnerability Name': 25,
         'Vulnerability Score': 18, 'Vulnerability Severity': 20,
         'Affected Products': 30, 'Has Known Exploit': 16, 'CISA KEV': 12,
-        'Last Response': 20, 'Days Since Last Response': 22, 'NVD': 10, 'Reason': 28,
+        'Last Response': 20, 'Days Since Last Response': 22, 'Reason': 28,
     }
 
     wb = writer.book
@@ -169,8 +129,6 @@ def build_stale_cves_sheet(writer, df, link_fmt, not_in_rmm_cves_df=None) -> Non
     hdr_fmt    = wb.add_format({'bold': True, 'bg_color': '#2E75B6', 'font_color': 'white', 'border': 1})
     row_stale  = wb.add_format({'bg_color': '#F5F5F5', 'border': 1})
     row_nirm   = wb.add_format({'bg_color': '#FFEBEE', 'font_color': '#9C0006', 'border': 1})
-    link_stale = wb.add_format({'bg_color': '#F5F5F5', 'border': 1, 'font_color': '#0563C1', 'underline': True})
-    link_nirm  = wb.add_format({'bg_color': '#FFEBEE', 'border': 1, 'font_color': '#9C0006', 'underline': True})
     note_fmt   = wb.add_format({'italic': True, 'font_color': '#595959', 'font_size': 9})
 
     for ci, col_nm in enumerate(headers):
@@ -180,11 +138,11 @@ def build_stale_cves_sheet(writer, df, link_fmt, not_in_rmm_cves_df=None) -> Non
     frames = []
     if has_stale:
         _s = df[[c for c in cols_src if c in df.columns]].copy()
-        _s['NVD'] = ''; _s['Reason'] = '⏱  Date-Stale'
+        _s['Reason'] = '⏱  Date-Stale'
         frames.append(_s)
     if has_nirm:
         _n = not_in_rmm_cves_df[[c for c in cols_src if c in not_in_rmm_cves_df.columns]].copy()
-        _n['NVD'] = ''; _n['Reason'] = '🚫  Not Found in RMM'
+        _n['Reason'] = '🚫  Not Found in RMM'
         frames.append(_n)
 
     combined = pd.concat(frames, ignore_index=True)
@@ -194,29 +152,26 @@ def build_stale_cves_sheet(writer, df, link_fmt, not_in_rmm_cves_df=None) -> Non
     )
     cl = list(combined.columns)
     vn_idx  = cl.index('Vulnerability Name') if 'Vulnerability Name' in cl else None
-    nvd_idx = headers.index('NVD')
 
     # Header
     for ci, h in enumerate(headers):
         ws.write(0, ci, h, hdr_fmt)
 
-    # Data rows
+    # Data rows — look up 'Reason' by its actual column position rather than
+    # row[-1], which silently reads the wrong value if a column is ever
+    # appended after Reason.
+    _reason_idx = cl.index('Reason') if 'Reason' in cl else None
     for ri, row in enumerate(combined.itertuples(index=False), start=1):
-        _reason = str(row[-1]) if hasattr(row, '_fields') else ''
+        row_vals = list(row)
+        _reason  = str(row_vals[_reason_idx]) if _reason_idx is not None else ''
         _is_nirm = 'Not Found' in _reason
         _rfmt  = row_nirm  if _is_nirm else row_stale
-        _lfmt  = link_nirm if _is_nirm else link_stale
-        row_vals = list(row)
         for ci, col_nm in enumerate(headers):
             _ci_src = cl.index(col_nm) if col_nm in cl else None
             val = row_vals[_ci_src] if _ci_src is not None else ''
             safe = val if not (isinstance(val, float) and pd.isna(val)) else ''
             if col_nm == 'Vulnerability Name' and vn_idx is not None:
                 ws.write(ri, ci, str(safe), _rfmt)
-            elif col_nm == 'NVD':
-                cve_val = row_vals[vn_idx] if vn_idx is not None else ''
-                cve_id  = extract_cve_id(str(cve_val))
-                ws.write(ri, nvd_idx, 'NVD ↗' if cve_id else '', _rfmt)
             else:
                 ws.write(ri, ci, safe, _rfmt)
 
@@ -295,7 +250,7 @@ def build_device_report_sheet(writer, df_rmm: 'pd.DataFrame') -> None:
             'format': red})   # 30-59 days: stale
         ws.conditional_format(1, _d_idx, len(out), _d_idx, {
             'type': 'cell', 'criteria': 'between', 'minimum': 14, 'maximum': 29,
-            'format': amb})   # 14-29 days: approaching stale
+            'format': amb})   # 14-29 days old
         ws.conditional_format(1, _d_idx, len(out), _d_idx, {
             'type': 'cell', 'criteria': 'between', 'minimum': 0, 'maximum': 13,
             'format': grn})   # <14 days: healthy

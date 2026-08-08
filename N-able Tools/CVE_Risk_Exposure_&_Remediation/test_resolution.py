@@ -118,20 +118,23 @@ def test_all_unresolved_when_neither_source_present():
     assert flags == [False, False]
 
 
-def test_approaching_stale_overrides_patch_evidence():
+def test_offline_device_patch_evidence_still_counts():
+    """v0.34: the approaching-stale force-☐ override was removed — staleness
+    is now ONLY the user-supplied cutoff-date exclusion. A device's patch
+    evidence resolves its rows regardless of how long since last response."""
     df = _df([{'Name': 'CVLT001', 'Vulnerability Name': 'CVE-2026-0001'}])
     two_d, three_d = split_patch_pairs({('CVLT001', 'CVE-2026-0001')})
-    flags = compute_resolved_flags(df, 'chrome', two_d, three_d,
-                                    approaching_stale_names={'CVLT001'})
-    assert flags == [False]
+    flags = compute_resolved_flags(df, 'chrome', two_d, three_d)
+    assert flags == [True]
 
 
-def test_approaching_stale_overrides_status_resolved():
+def test_offline_device_status_resolved_still_counts():
+    """v0.34 companion: scanner Status=RESOLVED is honoured without any
+    days-since-last-response override."""
     df = _df([{'Name': 'CVLT001', 'Vulnerability Name': 'CVE-2026-0001',
                'Threat Status': 'RESOLVED'}])
-    flags = compute_resolved_flags(df, 'chrome', set(), {},
-                                    approaching_stale_names={'CVLT001'})
-    assert flags == [False]
+    flags = compute_resolved_flags(df, 'chrome', set(), {})
+    assert flags == [True]
 
 
 def test_status_column_named_status_instead_of_threat_status():

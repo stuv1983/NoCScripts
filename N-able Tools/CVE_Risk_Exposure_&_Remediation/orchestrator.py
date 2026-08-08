@@ -5,7 +5,9 @@ Receives a DashboardRequest, runs the pipeline, writes the workbook,
 and returns a DashboardResult.
 
 No tkinter. No filedialog. Fully testable headless.
-Business logic lives in: data_pipeline, diagnostics, snapshot, excel_builder.
+Business logic lives in: data_pipeline, diagnostics, snapshot, and the
+sheet-builder modules (summary_sheet, product_sheets, patch_sheets,
+trend_sheets, device_sheets, formatting).
 
 Author : Stu Villanti <s.villanti@kenstra.com>
 """
@@ -16,15 +18,18 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Set, Tuple
+from typing import List, Optional, Set, Tuple
 
 import pandas as pd
 
 from config import FIXED_VERSION_RULES
+from contracts import (
+    run_check, check_cve_export, check_rmm_inventory,
+    check_merged, check_scopes, check_patch_match,
+)
 from data_pipeline import (
     load_vulnerability_data, load_rmm_data, merge_data,
     process_patch_match, load_previous_report, compute_trends,
-    check_customer_consistency,
     normalize_device_name, extract_cve_id, clean_sheet_name,
     load_patch_failure_report, build_patch_failure_lookup,
     load_patch_check_report, build_patch_check_failure_lookup,
@@ -33,16 +38,17 @@ from data_pipeline import (
 from diagnostics import compute_patch_diagnostics, classify_root_cause
 from resolution import reconcile_patch_evidence
 import snapshot as snap_store
-from excel_builder import (
-    get_workbook_styles,
-    build_client_summary_sheet,
-    build_trend_summary_sheet, build_trend_detail_sheets,
-    build_product_sheets, build_stale_excluded_sheet,
-    build_stale_cves_sheet,
+from summary_sheet import build_client_summary_sheet
+from trend_sheets import build_trend_detail_sheets  # trend summary worksheet removed
+from product_sheets import build_product_sheets
+from patch_sheets import (
     build_patch_sheets, build_diagnostics_sheets,
     build_patch_failure_sheet, build_patch_check_failure_sheet,
     build_products_not_tracked_sheet,
     # build_patch_resolved_sheet,   # commented out — large sheet, slow to write
+)
+from device_sheets import (
+    build_stale_excluded_sheet, build_stale_cves_sheet,
     build_device_report_sheet,
 )
 
@@ -108,6 +114,10 @@ class DashboardRequest:
     rmm_path:             Optional[str]  = None
     skip_rmm:             bool           = False
     patch_path:           Optional[str]  = None
+    # Multiple per-client patch reports. When set, takes precedence over
+    # patch_path; files are concatenated by process_patch_match (the Client
+    # column disambiguates rows).
+    patch_paths:          Optional[List[str]] = None
     include_patch:        bool           = False
     # Opt-in: let patch evidence resolve a CVE the detections export still
     # shows as UNRESOLVED. N-able's scanner can lag a patch install by a full
@@ -117,6 +127,10 @@ class DashboardRequest:
     failure_report_path:  Optional[str]  = None
     include_failure_report: bool         = False
     patch_check_report_path: Optional[str] = None
+    # Multiple per-client patch status check exports. When set, takes
+    # precedence over patch_check_report_path; files are concatenated by
+    # load_patch_check_report (Customer/Asset columns disambiguate rows).
+    patch_check_report_paths: Optional[List[str]] = None
     include_patch_check_report: bool     = False
     browser_audit_path:   Optional[str]  = None
     include_browser_audit: bool          = False
@@ -130,6 +144,7 @@ class DashboardRequest:
     report_month:         str            = ''
     stale_warning_days:   int            = 14   # flag active devices within this many days of going stale
     include_health_score: bool           = False  # beta — show Patching Health Score on Summary sheet
+    advanced_summary:     bool           = False  # preview — extra Summary sections (multi-month trend, exposure age, root causes)
 
 @dataclass
 class DashboardResult:
@@ -211,6 +226,11 @@ def run(request: DashboardRequest) -> DashboardResult:
     try:
         log.info("Dashboard run started — output: %s", request.output_path)
 
+        # Single timestamp for the whole run — every "days since" style
+        # column (Days Since Last Response, N Days Exposed) is anchored to
+        # this so the workbook is internally consistent and reproducible.
+        run_ts = datetime.now()
+
         import json as _json
         try:
             with open(Path(__file__).parent / 'config.json', encoding='utf-8') as _fh:
@@ -228,6 +248,12 @@ def run(request: DashboardRequest) -> DashboardResult:
         log.info("Loading vulnerability data: %s", request.vuln_path)
         df_vuln = load_vulnerability_data(request.vuln_path)
         log.info("  %d rows loaded", len(df_vuln))
+
+        # Contract: CVE export — structural problems raise ContractError;
+        # vocabulary oddities go to warnings.
+        run_check(check_cve_export, df_vuln,
+                  source_name=Path(request.vuln_path).name,
+                  warnings=warnings)
 
         _cve_repo = _find_cve_repo()
         _pull_cve_repo(_cve_repo)
@@ -249,15 +275,8 @@ def run(request: DashboardRequest) -> DashboardResult:
         except Exception as _e:
             log.debug("CVE lookup auto-enrich skipped: %s", _e)
 
-        # ── CISA KEV enrichment ──────────────────────────────────────────────
-        # Independent of the version-data enrichment above (and allowed to
-        # fail independently): most detection exports have no genuine CISA
-        # KEV column at all, so without this every KEV-based Summary table
-        # and health-score penalty silently sees zero KEV CVEs even when the
-        # fleet has real, actively-exploited CVEs on it. See cve_lookup.py's
-        # enrich_cisa_kev() docstring for why this OR's the real catalog with
-        # any KEV data the source file already provided, rather than
-        # replacing it.
+        # CISA KEV enrichment — most exports have no real KEV column; ORs the
+        # catalog with any source-provided KEV data (see enrich_cisa_kev).
         try:
             from cve_lookup import enrich_cisa_kev
             _kev_flagged = enrich_cisa_kev(df_vuln)
@@ -286,20 +305,25 @@ def run(request: DashboardRequest) -> DashboardResult:
             df_rmm = load_rmm_data(request.rmm_path)
             log.info("  %d devices loaded", len(df_rmm))
 
-            # Safety net: abort if the device report belongs to a
-            # different customer than the detections export.
-            check_customer_consistency({
-                'Detections export': df_vuln,
-                'Device report':     df_rmm,
-            })
+            # Contract: RMM inventory — fails on duplicate Device_Join keys;
+            # warns on unknown Device Types.
+            run_check(check_rmm_inventory, df_rmm,
+                      source_name=Path(request.rmm_path).name,
+                      warnings=warnings)
 
         merged_df = merge_data(df_vuln, df_rmm, request.skip_rmm,
-                               exclude_missing_rmm=request.exclude_missing_rmm)
+                               exclude_missing_rmm=request.exclude_missing_rmm,
+                               as_of_date=run_ts)
         log.info("Merged dataset: %d rows", len(merged_df))
+
+        # Contract: merged frame — required columns exist in every code path;
+        # category-dtype check is warn-only (memory, not correctness).
+        run_check(check_merged, merged_df,
+                  expect_category_cols=('Device Type',),
+                  warnings=warnings)
 
         raw_df         = merged_df.copy()
         stale_excluded = pd.DataFrame()
-        approaching_stale_names: set = set()
 
         if not request.show_all_dates and request.cutoff_date:
             cutoff = pd.to_datetime(request.cutoff_date, dayfirst=True, errors='coerce')
@@ -307,11 +331,8 @@ def run(request: DashboardRequest) -> DashboardResult:
                 cutoff = pd.to_datetime('1900-01-01')
             high = merged_df[merged_df['Vulnerability Score'] >= request.threshold]
 
-            # Stale = last seen before the user-entered cutoff date. This is
-            # the ONLY staleness criterion — there is no separate fixed
-            # day-count rule layered on top of it. 'Not found in RMM' is a
-            # wholly separate, orthogonal category (handled elsewhere as
-            # not_in_rmm_df) and is never counted as stale here.
+            # Stale = last seen before the cutoff date — the only criterion.
+            # 'Not Found in RMM' is a separate category, never counted as stale.
             stale_excluded = high[
                 (high['_Sort_Time'] < cutoff) &
                 (high['Last Response'] != 'Not Found in RMM')
@@ -329,22 +350,8 @@ def run(request: DashboardRequest) -> DashboardResult:
                 request.cutoff_date, len(merged_df), len(all_stale_names),
             )
 
-        # ── Approaching stale: DISABLED FOR TESTING ─────────────────────────────
-        warning_days = max(1, int(request.stale_warning_days))
-        approaching_stale_names: set = set()
-        # if 'Days Since Last Response' in merged_df.columns:
-        #     _days_col_ap  = pd.to_numeric(merged_df['Days Since Last Response'], errors='coerce')
-        #     _active_mask  = merged_df['Last Response'] != 'Not Found in RMM'
-        #     approaching_stale_names = set(
-        #         merged_df.loc[
-        #             _active_mask & (_days_col_ap >= warning_days),
-        #             'Name'
-        #         ].unique()
-        #     )
-        # log.info(
-        #     "%d device(s) flagged as approaching stale (offline >= %d days)",
-        #     len(approaching_stale_names), warning_days,
-        # )
+        # Approaching-stale feature removed; request.stale_warning_days kept
+        # for caller compatibility, ignored here.
 
         if merged_df.empty:
             msg = (
@@ -359,23 +366,20 @@ def run(request: DashboardRequest) -> DashboardResult:
         filtered_df = merged_df[merged_df['Vulnerability Score'] >= request.threshold]
         triage_df   = filtered_df[filtered_df['Last Response'] != 'Not Found in RMM']
 
-        # Health-score scope is ALWAYS CVSS >= 7.0, full stop — independent of
-        # whatever CVSS threshold the report itself is displayed at. This is
-        # what keeps the score comparable across runs: a report generated at
-        # the default 9.0 threshold and one generated at 1.0 (to see
-        # everything) should produce the SAME health score, because both are
-        # graded against the same fixed CVSS >= 7.0 bar.
-        #
-        # Previously this used min(request.threshold, 7.0), which meant a low
-        # display threshold (e.g. 1.0) shrank the health-score scope down to
-        # 1.0 too — pulling in a flood of low-severity CVEs that have nothing
-        # to do with "critical patching health" and made the score swing
-        # depending on what threshold the report happened to be run at. The
-        # health scope must never go below 7.0, matching the intent already
-        # documented on compute_patching_health_score().
+        # Health-score scope is fixed at CVSS >= 7.0, independent of the
+        # report's display threshold — keeps the score comparable across runs.
         health_score_threshold = 7.0
         health_filtered      = merged_df[merged_df['Vulnerability Score'] >= health_score_threshold]
         health_triage_df     = health_filtered[health_filtered['Last Response'] != 'Not Found in RMM']
+
+        # Contract: triage ⊆ filtered ⊆ merged, no 'Not Found in RMM' in
+        # triage, health floor >= 7.0. Structural — raises rather than warns.
+        run_check(check_scopes, merged_df, filtered_df, triage_df,
+                  request.threshold,
+                  health_filtered=health_filtered,
+                  health_triage_df=health_triage_df,
+                  health_score_threshold=health_score_threshold,
+                  warnings=warnings)
 
         # Build a dedicated DataFrame for not-in-RMM devices so we can pass rows
         # (not just a count) into the stale sheet builders for audit tracking.
@@ -401,10 +405,19 @@ def run(request: DashboardRequest) -> DashboardResult:
             product_to_sheet[product] = clean_sheet_name(product, used_names)
 
         patch_data = None
-        if request.include_patch and request.patch_path:
-            log.info("Running patch match: %s", request.patch_path)
+        _patch_inputs = (list(request.patch_paths) if request.patch_paths
+                         else ([request.patch_path] if request.patch_path else []))
+        if request.include_patch and _patch_inputs:
+            log.info("Running patch match: %s", ', '.join(map(str, _patch_inputs)))
             p_ov, p_full, p_raw, tot_r, filt_r = process_patch_match(
-                request.patch_path, merged_df.copy(), min_score=request.threshold)
+                _patch_inputs if len(_patch_inputs) > 1 else _patch_inputs[0],
+                merged_df.copy(), min_score=request.threshold,
+                as_of_date=run_ts)
+
+            # Contract: patch-match output — fails on threat-status leaking
+            # into 'Status', leaked _columns, or missing output columns.
+            run_check(check_patch_match, p_full, warnings=warnings)
+
             patch_data = (p_ov, p_full, p_raw, tot_r, filt_r)
             log.info("  Patch match: %d total rows, %d above threshold", tot_r, filt_r)
 
@@ -415,13 +428,6 @@ def run(request: DashboardRequest) -> DashboardResult:
             log.info("Loading previous report for trend: %s", request.prev_report_path)
             prev_df, prev_resolved_pairs, prev_source_type = load_previous_report(request.prev_report_path)
             prev_report_name = Path(request.prev_report_path).name
-
-            # Safety net: abort if the previous report belongs to a
-            # different customer than this run's detections export.
-            check_customer_consistency({
-                'Detections export (current)': df_vuln,
-                'Previous report':             prev_df,
-            })
             inventory_set    = (set(df_rmm['Device_Join'].unique())
                                 if df_rmm is not None else None)
 
@@ -437,6 +443,23 @@ def run(request: DashboardRequest) -> DashboardResult:
             log.info(
                 "Trend: %d new CVEs, %d resolved, %d persisting (common-product scope)",
                 m['new_cve_count'], m['resolved_cve_count'], m['persisting_cve_count'],
+            )
+            # Pair-level remediation (full scope) — the headline figures. The
+            # common-product CVE-type counts above legitimately read "0 resolved"
+            # whenever fleet growth re-seeds old CVE types or clearances came
+            # from retired products, which buries real patching work.
+            log.info(
+                "Trend: %d of %d previous unresolved pairs cleared (%.1f%%), "
+                "%d new pairs, %d detected & patched within period; "
+                "%d CVE type(s) fully cleared full-scope%s",
+                m['cleared_previous_unresolved_count'],
+                m['previous_unresolved_pair_count'],
+                m['cleared_previous_unresolved_pct'] * 100,
+                m['new_unresolved_pair_count'],
+                m.get('patched_within_period_count', 0),
+                m.get('cve_types_fully_cleared_count', 0),
+                (' (retired products: %s)' % ', '.join(m['retired_products'])
+                 if m.get('retired_products') else ''),
             )
             
             redetected_count = trend_data.get('redetected_count', 0)
@@ -462,6 +485,7 @@ def run(request: DashboardRequest) -> DashboardResult:
         diagnostics: dict = {'patch_lag_df': pd.DataFrame(),
                              'version_drift_df': pd.DataFrame(),
                              'root_cause_df': pd.DataFrame()}
+        root_cause_counts: dict = {}   # cause → device-CVE pair count (advanced Summary table)
 
         if patch_data:
             p_full = patch_data[1].copy()
@@ -486,7 +510,7 @@ def run(request: DashboardRequest) -> DashboardResult:
             for _, row in p_full[p_full['_root_cause'].notna()].iterrows():
                 patch_gap_pairs[(row['_nk'], row['_ck'])] = row['_root_cause']
 
-            cause_counts: dict[str, int] = {}
+            cause_counts = root_cause_counts
             for c in patch_gap_pairs.values():
                 cause_counts[c] = cause_counts.get(c, 0) + 1
             for cause, count in cause_counts.items():
@@ -527,12 +551,9 @@ def run(request: DashboardRequest) -> DashboardResult:
         _unresolved_pairs_2d: set = set()
         _raw_inject_pairs:    set = set()
 
-        # Determine once whether the current export carries a status column.
-        # When it does, build_product_sheets source 2 reads it directly per-row —
-        # injecting all RESOLVED rows into patch_resolved_pairs would be redundant
-        # and at large scale (70k+ rows) creates a large redundant set and forces
-        # repeated per-row membership checks during product-sheet rendering that
-        # dominate write time.
+        # When the export has a status column, build_product_sheets reads it
+        # per-row (source 2) — injecting RESOLVED pairs would only build a
+        # huge redundant set and slow sheet rendering.
         _export_has_status_col = any(c in raw_df.columns
                                      for c in ('Threat Status', 'Status', 'threat status', 'status'))
 
@@ -549,10 +570,7 @@ def run(request: DashboardRequest) -> DashboardResult:
                     _raw_unr['Vulnerability Name'].apply(extract_cve_id),
                 ))
 
-            # RESOLVED injection: only when there is no status column on the export.
-            # If the export has a status column, product sheets already read it as source 2.
-            # Injecting here would inflate patch_resolved_pairs to tens of thousands of
-            # entries forces repeated per-row membership checks in build_product_sheets.
+            # RESOLVED injection: only when the export has no status column (see above).
             if not _export_has_status_col:
                 _raw_res = raw_df[_col_upper == 'RESOLVED']
                 if not _raw_res.empty:
@@ -611,8 +629,7 @@ def run(request: DashboardRequest) -> DashboardResult:
                 f"N-able rescan pending"
             )
 
-        # Step 2: inject raw RESOLVED pairs — only runs when export has no status column
-        # (otherwise source 2 in build_product_sheets handles it per-row at zero overhead).
+        # Step 2: inject raw RESOLVED pairs (export has no status column).
         if _raw_inject_pairs:
             clean = {p for p in _raw_inject_pairs if (p[0], p[1]) not in _unresolved_pairs_2d}
             skipped = len(_raw_inject_pairs) - len(clean)
@@ -625,16 +642,49 @@ def run(request: DashboardRequest) -> DashboardResult:
             log.debug("Raw RESOLVED injection skipped — export has status column; "
                       "product sheets read it directly (avoids large-set performance issue)")
 
-        patch_confirmed_count = 0
-        if patch_resolved_pairs:
-            from data_pipeline import _detect_product as _dp_detect
-            triage_keys = set(zip(
-                triage_df['Name'].apply(normalize_device_name),
-                triage_df['Vulnerability Name'].apply(extract_cve_id),
-                triage_df['Affected Products'].astype(str).apply(_dp_detect),
-            ))
-            _confirmed_3tuples = patch_resolved_pairs & triage_keys
-            patch_confirmed_count = len({(d, v) for d, v, _ in _confirmed_3tuples})
+        # ── Advanced Summary (preview) — health score + snapshot history ──
+        # Computed here (not in the sheet builder) so the same numbers feed
+        # both the Summary trend strip and the snapshot record.
+        adv_history: list = []
+        adv_current: Optional[dict] = None
+        if request.advanced_summary:
+            try:
+                from resolution import (dedup_per_base_product as _adv_dedup_fn,
+                                        compute_resolved_series as _adv_res_fn)
+                from summary_sheet import compute_patching_health_score as _adv_hs_fn
+                _adv_scope = _adv_dedup_fn(health_triage_df)
+                _adv_res   = _adv_res_fn(_adv_scope, product_to_sheet,
+                                         patch_resolved_pairs).astype(bool)
+                _adv_hs    = _adv_hs_fn(_adv_scope, _adv_res, ~_adv_res,
+                                        trend_data=trend_data,
+                                        has_patch_report=patch_data is not None)
+                adv_current = {
+                    'report_month':        report_month_val,
+                    'health_score':        _adv_hs['score'],
+                    'health_grade':        _adv_hs['grade'],
+                    'unique_cves':         int(filtered_df['Vulnerability Name'].nunique()),
+                    'unique_devices':      int(filtered_df['Name'].nunique()),
+                    'kev_unresolved_cves': _adv_hs['penalties'].get('kev_unresolved', {}).get('count'),
+                    'unresolved_pairs':    int((~_adv_res).sum()),
+                    'resolved_pairs':      int(_adv_res.sum()),
+                }
+
+                def _rec_month(r: dict) -> str:
+                    try:
+                        return datetime.strptime(str(r.get('report_month', '')).strip(),
+                                                 '%B %Y').strftime('%Y-%m')
+                    except ValueError:
+                        return str(r.get('run_date', ''))[:7]
+                try:
+                    _cur_month = datetime.strptime(report_month_val, '%B %Y').strftime('%Y-%m')
+                except ValueError:
+                    _cur_month = datetime.now().strftime('%Y-%m')
+                adv_history = [r for r in snap_store.load_history(request.output_path, months=7)
+                               if _rec_month(r) != _cur_month][-6:]
+            except Exception as _adv_e:
+                log.warning("Advanced summary pre-compute failed: %s", _adv_e)
+                adv_current = None
+                adv_history = []
 
         failure_df     = None
         failure_lookup = {}
@@ -650,12 +700,8 @@ def run(request: DashboardRequest) -> DashboardResult:
                 log.warning("Could not process patch failure report: %s", exc)
                 warnings.append(f"Could not process patch failure report: {exc}")
 
-        # ── Patch Status Check failures (RMM agent-side monitoring check) ───────
-        # Distinct from the patch failure report above: this is about RMM's own
-        # 'Patch Status Check' failing to even report a result for a device —
-        # i.e. RMM can't confirm whether the device is patched at all. See
-        # data_pipeline.load_patch_check_report()'s docstring for the full
-        # distinction.
+        # Patch Status Check failures — RMM's own check failing to report,
+        # distinct from a patch failing to install (see load_patch_check_report).
         check_df           = None
         check_lookup: dict  = {}
         check_devices: set  = set()
@@ -663,21 +709,21 @@ def run(request: DashboardRequest) -> DashboardResult:
         active_universe_names: set = set()   # ALL active devices (normalised), regardless of check status
         patch_check_active_df = pd.DataFrame()
 
-        if request.include_patch_check_report and request.patch_check_report_path:
+        _check_inputs = (list(request.patch_check_report_paths)
+                         if request.patch_check_report_paths
+                         else ([request.patch_check_report_path]
+                               if request.patch_check_report_path else []))
+        if request.include_patch_check_report and _check_inputs:
             try:
-                log.info("Loading patch status check report: %s", request.patch_check_report_path)
-                check_df      = load_patch_check_report(request.patch_check_report_path)
+                log.info("Loading patch status check report: %s",
+                         ', '.join(map(str, _check_inputs)))
+                check_df      = load_patch_check_report(
+                    _check_inputs if len(_check_inputs) > 1 else _check_inputs[0])
                 check_lookup  = build_patch_check_failure_lookup(check_df)
                 check_devices = set(check_lookup.keys())
 
-                # "Active" mirrors the scope Key Metrics uses everywhere else —
-                # i.e. within the date range entered (not stale, given
-                # merged_df already had the cutoff_date exclusion applied
-                # above) and not 'Not Found in RMM'. The Summary sheet only
-                # ever shows devices in this active scope; the dedicated
-                # 'Patch Check Failures' worksheet shows every device from
-                # the imported report regardless, with this same set used to
-                # mark each one Active Yes/No for consistency.
+                # "Active" = same scope as Key Metrics: within date range and
+                # found in RMM. Sheet shows every device; this drives Active Yes/No.
                 _active_names_by_norm: dict = {}
                 if 'Name' in merged_df.columns and 'Last Response' in merged_df.columns:
                     for raw_name in merged_df.loc[
@@ -719,12 +765,12 @@ def run(request: DashboardRequest) -> DashboardResult:
                 warnings.append(f"Could not process patch status check report: {exc}")
 
         log.info("Writing workbook: %s", request.output_path)
-        with pd.ExcelWriter(request.output_path, engine='xlsxwriter') as writer:  # do NOT use constant_memory=True — corrupts data in xlsxwriter 3.x
+        with pd.ExcelWriter(request.output_path, engine='xlsxwriter',
+                            engine_kwargs={'options': {'strings_to_urls': False}}) as writer:
+            # strings_to_urls=False skips per-cell URL regexes (all links use
+            # explicit write_url). constant_memory corrupts output — the hs
+            # subtotal block writes rows out of order.
             wb = writer.book
-            styles     = get_workbook_styles(wb)
-            link_fmt   = styles['link']
-            header_fmt = styles['header']
-            miss_fmt   = styles['row_missing']
 
             _not_in_rmm_mask = filtered_df['Last Response'] == 'Not Found in RMM'
             _not_in_rmm_cve_rows = int(_not_in_rmm_mask.sum()) if 'Last Response' in filtered_df.columns else 0
@@ -741,8 +787,6 @@ def run(request: DashboardRequest) -> DashboardResult:
                 not_in_rmm_unique_cves=_not_in_rmm_unique_cves,
                 not_in_rmm_df=not_in_rmm_df if not not_in_rmm_df.empty else None,
                 report_month=report_month_val,
-                approaching_stale_names=approaching_stale_names,
-                stale_warning_days=request.stale_warning_days,
                 product_to_sheet=product_to_sheet,
                 include_health_score=request.include_health_score,
                 patch_resolved_pairs=patch_resolved_pairs,
@@ -752,31 +796,29 @@ def run(request: DashboardRequest) -> DashboardResult:
                 prev_report_name=prev_report_name,
                 patch_check_active_df=patch_check_active_df if not patch_check_active_df.empty else None,
                 patch_check_active_names=check_active_names,
+                advanced_summary=request.advanced_summary,
+                snapshot_history=adv_history,
+                snapshot_current=adv_current,
+                root_cause_counts=root_cause_counts,
             )
-            if trend_data:
-                build_trend_summary_sheet(wb, trend_data, request.threshold,
-                                          prev_report_name, header_fmt,
-                                          customer_name=customer_name)
+            # Trend Summary worksheet removed — metrics live on the Summary
+            # sheet and the trend detail sheets.
 
             if trend_data:
-                build_trend_detail_sheets(writer, wb, trend_data, link_fmt,
+                build_trend_detail_sheets(writer, wb, trend_data,
                                           sheets_subset={'New This Month', 'Persisting CVEs'})
 
-            build_product_sheets(writer, triage_df, product_to_sheet, link_fmt,
+            build_product_sheets(writer, triage_df, product_to_sheet,
                                   patch_resolved_pairs=patch_resolved_pairs,
                                   patch_gap_pairs=patch_gap_pairs,
-                                  approaching_stale_names=approaching_stale_names,
-                                  stale_warning_days=request.stale_warning_days,
                                   health_triage_df=health_triage_df,
                                   trend_data=trend_data,
                                   include_health_score=request.include_health_score)
 
-            # 'Resolved Since Previous Report' is placed after all product sheets —
-            # each product sheet tracks its own ☑/☐ Resolved column, so this
-            # cross-product, trend-inferred rollup reads more naturally as a
-            # follow-on to that per-product tracking than as a lead-in to it.
+            # Placed after product sheets: cross-product rollup reads as a
+            # follow-on to the per-sheet ☑/☐ tracking.
             if trend_data:
-                build_trend_detail_sheets(writer, wb, trend_data, link_fmt,
+                build_trend_detail_sheets(writer, wb, trend_data,
                                           sheets_subset={'Resolved Since Previous Report'})
 
             if not stale_excluded.empty or not not_in_rmm_df.empty:
@@ -806,7 +848,7 @@ def run(request: DashboardRequest) -> DashboardResult:
                 else:
                     not_in_rmm_cves = not_in_rmm_raw.copy()
 
-                build_stale_cves_sheet(writer, stale_unresolved_cves, link_fmt,
+                build_stale_cves_sheet(writer, stale_unresolved_cves,
                                        not_in_rmm_cves_df=not_in_rmm_cves if not not_in_rmm_cves.empty else None)
 
             _status_col_wb = ('Threat Status' if 'Threat Status' in merged_df.columns
@@ -868,12 +910,7 @@ def run(request: DashboardRequest) -> DashboardResult:
                     )
 
             if check_df is not None and check_lookup:
-                # Same "Active" definition used on the Summary sheet — within
-                # the date range entered (stale devices already excluded from
-                # merged_df) and found in RMM — not just "somewhere in the
-                # RMM inventory file" regardless of staleness. Every device
-                # from the imported report still appears in the sheet either
-                # way; this only affects the Active Yes/No column.
+                # Same "Active" definition as the Summary sheet (see above).
                 inventory_devices_chk = active_universe_names if active_universe_names else (
                     set(df_rmm['Device_Join'].unique()) if df_rmm is not None else None
                 )
@@ -903,6 +940,12 @@ def run(request: DashboardRequest) -> DashboardResult:
             unique_devices    = int(filtered_df['Name'].nunique()),
             trend_metrics     = trend_data['metrics'] if trend_data else None,
             root_cause_summary= rc_summary or None,
+            report_month      = request.report_month or None,
+            health_score      = adv_current.get('health_score') if adv_current else None,
+            health_grade      = adv_current.get('health_grade') if adv_current else None,
+            kev_unresolved_cves = adv_current.get('kev_unresolved_cves') if adv_current else None,
+            unresolved_pairs  = adv_current.get('unresolved_pairs') if adv_current else None,
+            resolved_pairs    = adv_current.get('resolved_pairs') if adv_current else None,
         )
 
         trend_summary = None
@@ -912,6 +955,17 @@ def run(request: DashboardRequest) -> DashboardResult:
                 'new_cve_count':       m['new_cve_count'],
                 'resolved_cve_count':  m['resolved_cve_count'],
                 'persisting_cve_count':m['persisting_cve_count'],
+                # Pair-level, full-scope remediation figures for the popup
+                # headline — matches the Month-over-Month Remediation Summary
+                # on the Summary sheet (Previous - Cleared + New == Current).
+                'cleared_pair_count':  m['cleared_previous_unresolved_count'],
+                'cleared_pair_pct':    m['cleared_previous_unresolved_pct'],
+                'new_pair_count':      m['new_unresolved_pair_count'],
+                'previous_pair_count': m['previous_unresolved_pair_count'],
+                'current_pair_count':  m['current_unresolved_pair_count'],
+                'cve_types_fully_cleared_count': m.get('cve_types_fully_cleared_count', 0),
+                'retired_products':    m.get('retired_products', []),
+                'patched_within_period_count': m.get('patched_within_period_count', 0),
             }
 
         return DashboardResult(

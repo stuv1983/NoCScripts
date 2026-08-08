@@ -270,7 +270,9 @@ class TestProcessPatchMatchColumnValidation:
     def test_missing_patch_columns_raises_value_error(self, tmp_path):
         patch_csv = _write_patch_csv(tmp_path, [{'Client': 'Acme', 'Site': 'HQ', 'Device': 'WS01'}])
         cve_df = pd.DataFrame([_cve_row()])
-        with pytest.raises(ValueError, match='Patch report missing required columns'):
+        # The message names the offending file between 'Patch report' and
+        # 'missing required columns', so don't anchor the two together.
+        with pytest.raises(ValueError, match='missing required columns'):
             process_patch_match(patch_csv, cve_df)
 
     def test_missing_cve_columns_raises_value_error(self, tmp_path):

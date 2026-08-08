@@ -72,10 +72,11 @@ def build_parser() -> argparse.ArgumentParser:
                         'AND installed on/after the CVE publication date. Requires --patch.')
     p.add_argument('--failure-report', default=None, metavar='FILE',
                    help='Patch failure report CSV for failed patch delivery analysis')
-    p.add_argument('--patch-check-report', default=None, metavar='FILE',
+    p.add_argument('--patch-check-report', default=None, metavar='FILE[;FILE...]',
                    help='RMM monitoring-check export (e.g. "Failing Checks") listing devices where '
                         'the Patch Status Check itself is failing to report — distinct from a specific '
-                        'patch failing to install. Adds a "Patch Check Failures" sheet, highlights '
+                        'patch failing to install. Accepts several semicolon-separated files, one per '
+                        'client. Adds a "Patch Check Failures" sheet, highlights '
                         'matching active devices in Top At-Risk Devices, and adds a Summary table.')
     p.add_argument('--previous',  default=None,   metavar='FILE',
                    help='Previous dashboard (.xlsx) for month-over-month trends')
@@ -89,13 +90,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help='Refresh rolling product baselines from vendor APIs before generating')
     p.add_argument('--exclude-missing-rmm', action='store_true',
                    help='Drop CVEs for devices not found in the RMM inventory (default: keep them)')
+    p.add_argument('--advanced-summary', action='store_true',
+                   help='Preview: adds Multi-Month Trend, N-Day Exposure Age, and '
+                        'Top Patch-Gap Root Causes sections to the Summary sheet, and '
+                        'records health-score history in snapshots/.')
     p.add_argument('--report-month', default='', metavar='MONTH',
                    help='Report label e.g. "April 2026". Defaults to current month. '
                         'Allows retroactive labelling when generating last month\'s report today.')
-    p.add_argument('--stale-warning-days', default=14, type=int, metavar='DAYS',
-                   help='Highlight active devices whose last response is within this many days of '
-                        'the stale cutoff (default: 14). Shown orange in product sheets and '
-                        'overview — devices are NOT excluded from the report.')
     p.add_argument('--verbose',   action='store_true',
                    help='Enable DEBUG-level logging')
     return p
@@ -124,9 +125,12 @@ def main() -> int:
     if args.failure_report and not Path(args.failure_report).exists():
         log.error("Patch failure report not found: %s", args.failure_report)
         return 1
-    if args.patch_check_report and not Path(args.patch_check_report).exists():
-        log.error("Patch status check report not found: %s", args.patch_check_report)
-        return 1
+    _check_report_paths = ([p.strip() for p in args.patch_check_report.split(';') if p.strip()]
+                           if args.patch_check_report else [])
+    for _crp in _check_report_paths:
+        if not Path(_crp).exists():
+            log.error("Patch status check report not found: %s", _crp)
+            return 1
     if args.previous and not Path(args.previous).exists():
         log.error("Previous report not found: %s", args.previous)
         return 1
@@ -142,8 +146,11 @@ def main() -> int:
         trust_patch_evidence   = args.trust_patch_evidence,
         failure_report_path    = args.failure_report,
         include_failure_report = bool(args.failure_report),
-        patch_check_report_path    = args.patch_check_report,
-        include_patch_check_report = bool(args.patch_check_report),
+        patch_check_report_path    = (_check_report_paths[0]
+                                      if len(_check_report_paths) == 1 else None),
+        patch_check_report_paths   = (_check_report_paths
+                                      if len(_check_report_paths) > 1 else None),
+        include_patch_check_report = bool(_check_report_paths),
         prev_report_path       = args.previous,
         include_trend          = bool(args.previous),
         threshold              = args.threshold,
@@ -152,7 +159,7 @@ def main() -> int:
         sync_baselines         = args.sync_baselines,
         exclude_missing_rmm    = args.exclude_missing_rmm,
         report_month           = args.report_month,
-        stale_warning_days     = args.stale_warning_days,
+        advanced_summary       = args.advanced_summary,
     )
 
     log.info("Starting headless dashboard generation")

@@ -15,7 +15,7 @@ import logging
 
 import pandas as pd
 
-from sheet_helpers import hs_subtotal_ref as _hs_subtotal_ref
+from sheet_helpers import hs_subtotal_ref as _hs_ref
 
 log = logging.getLogger(__name__)
 
@@ -177,8 +177,6 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
                                not_in_rmm_unique_cves=0,
                                not_in_rmm_df: 'Optional[pd.DataFrame]' = None,
                                report_month='',
-                               approaching_stale_names: Optional[Set[str]] = None,
-                               stale_warning_days: int = 14,
                                product_to_sheet: Optional[dict] = None,
                                include_health_score: bool = False,
                                patch_resolved_pairs: Optional[set] = None,
@@ -187,7 +185,11 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
                                has_patch_report: bool = False,
                                prev_report_name: str = '',
                                patch_check_active_df: 'Optional[pd.DataFrame]' = None,
-                               patch_check_active_names: Optional[Set[str]] = None):
+                               patch_check_active_names: Optional[Set[str]] = None,
+                               advanced_summary: bool = False,
+                               snapshot_history: Optional[list] = None,
+                               snapshot_current: Optional[dict] = None,
+                               root_cause_counts: Optional[dict] = None):
     """
     Client Summary sheet.
 
@@ -270,8 +272,6 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     else:
         triage_dedup = triage_df.drop_duplicates(subset=['Name', 'Vulnerability Name']).copy()
 
-    _approaching_set = approaching_stale_names or set()
-
     # ── Compute resolved/unresolved by replaying the exact same ☑/☐ logic
     # that build_product_sheets writes into column A of each product sheet.
     # This guarantees the cached values supplied to write_formula() match what
@@ -290,9 +290,7 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     # confirmed resolved by a --patch report but not yet reflected in
     # N-able's own scan would count as unresolved there while correctly
     # showing ☑ everywhere else in the workbook.
-    from resolution import (get_sheet_product_key as _get_sheet_pk_sum,
-                            split_patch_pairs as _split_patch_pairs_sum,
-                            compute_resolved_flags as _compute_flags_sum,
+    from resolution import (split_patch_pairs as _split_patch_pairs_sum,
                             compute_resolved_series as _compute_resolved_series_shared)
     _p2s_sum   = product_to_sheet or {}
     _patch_2d_sum, _patch_3d_sum = _split_patch_pairs_sum(patch_resolved_pairs)
@@ -302,8 +300,7 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         Delegates to resolution.compute_resolved_series(), the single
         index-safe implementation shared with product_sheets.py — see that
         function's docstring for the row-misalignment bug this replaced."""
-        return _compute_resolved_series_shared(df, _p2s_sum, patch_resolved_pairs,
-                                               approaching_stale_names=_approaching_set)
+        return _compute_resolved_series_shared(df, _p2s_sum, patch_resolved_pairs)
 
     _is_res = _compute_resolved_series(triage_dedup)
     _is_unr = ~_is_res
@@ -316,11 +313,6 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     crit_rows      = int(crit_mask.sum())
     crit_cves      = int(triage_dedup.loc[crit_mask, 'Vulnerability Name'].nunique()) if score_col and 'Vulnerability Name' in triage_dedup.columns else unique_cves
 
-    exploit_col     = 'Has Known Exploit' if 'Has Known Exploit' in triage_dedup.columns else None
-    exploit_mask    = triage_dedup[exploit_col].astype(str).str.strip().str.lower().isin(['yes','true','1','y']) if exploit_col else pd.Series([False]*len(triage_dedup), index=triage_dedup.index)
-    exploit_count   = int(exploit_mask.sum())
-    exploit_patched = int((exploit_mask & _is_res).sum())
-    exploit_unpatch = int((exploit_mask & _is_unr).sum())
 
     # CISA KEV — Known Exploited Vulnerabilities catalog. Distinct from the
     # generic 'Has Known Exploit' column above: KEV is CISA's authoritative
@@ -330,25 +322,11 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     kev_mask       = triage_dedup[kev_col].astype(str).str.strip().str.lower().isin(['yes','true','1','y']) if kev_col else pd.Series([False]*len(triage_dedup), index=triage_dedup.index)
     kev_rows       = int(kev_mask.sum())
     kev_cves       = int(triage_dedup.loc[kev_mask, 'Vulnerability Name'].nunique()) if kev_col and 'Vulnerability Name' in triage_dedup.columns else 0
-    kev_patched    = int((kev_mask & _is_res).sum())
-    kev_unpatch    = int((kev_mask & _is_unr).sum())
-
-    # Server/workstation exploit breakdowns — detection row counts, active scope only
-    if 'Device Type' in triage_dedup.columns:
-        _srv_mask = triage_dedup['Device Type'].astype(str).str.lower().str.contains('server',      na=False)
-        _wks_mask = triage_dedup['Device Type'].astype(str).str.lower().str.contains('workstation', na=False)
-        srv_exp_total   = int((exploit_mask & _srv_mask).sum())
-        srv_exp_patched = int((exploit_mask & _srv_mask & _is_res).sum())
-        srv_exp_unpatch = int((exploit_mask & _srv_mask & _is_unr).sum())
-        wks_exp_total   = int((exploit_mask & _wks_mask).sum())
-        wks_exp_patched = int((exploit_mask & _wks_mask & _is_res).sum())
-        wks_exp_unpatch = int((exploit_mask & _wks_mask & _is_unr).sum())
-    else:
-        srv_exp_total = srv_exp_patched = srv_exp_unpatch = 0
-        wks_exp_total = wks_exp_patched = wks_exp_unpatch = 0
 
     # Device-type counts for Device Breakdown sub-table (unique devices)
     if 'Device Type' in triage_dedup.columns and 'Name' in triage_dedup.columns:
+        _srv_mask = triage_dedup['Device Type'].astype(str).str.lower().str.contains('server',      na=False)
+        _wks_mask = triage_dedup['Device Type'].astype(str).str.lower().str.contains('workstation', na=False)
         srv_total   = int(triage_dedup.loc[_srv_mask,           'Name'].nunique())
         srv_unpatch = int(triage_dedup.loc[_srv_mask & _is_unr, 'Name'].nunique())
         wks_total   = int(triage_dedup.loc[_wks_mask,           'Name'].nunique())
@@ -363,41 +341,23 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         _stale_wks = int(stale_excluded_df[stale_excluded_df['Device Type'].astype(str).str.lower().str.contains('workstation', na=False)]['Name'].nunique())
 
     # Stale + NIRM counts for Key Metrics math rows — computed once, reused in waterfall
-    _stale_rows = int(len(stale_excluded_df)) if stale_excluded_df is not None and not stale_excluded_df.empty else 0
     _stale_devs = int(stale_excluded_df['Name'].nunique()) if stale_excluded_df is not None and not stale_excluded_df.empty and 'Name' in stale_excluded_df.columns else 0
-    _stale_crit = 0   # detection rows at CVSS 9+ on stale devices
-    _stale_crit_cves = 0  # unique CVE types at CVSS 9+ on stale devices
-    if stale_excluded_df is not None and not stale_excluded_df.empty and score_col and score_col in stale_excluded_df.columns:
-        _stale_sc = pd.to_numeric(stale_excluded_df[score_col], errors='coerce')
-        _stale_crit      = int((_stale_sc >= 9.0).sum())
-        _stale_crit_cves = int(stale_excluded_df.loc[_stale_sc >= 9.0, 'Vulnerability Name'].nunique()) if 'Vulnerability Name' in stale_excluded_df.columns else 0
     # NIRM (not_in_rmm_cve_count already passed in as detection rows; compute CVSS 9+ subset from filtered_df)
     _nirm_devs  = not_in_rmm_count
+    _nirm_mask  = (filtered_df['Last Response'] == 'Not Found in RMM') \
+                  if 'Last Response' in filtered_df.columns \
+                  else pd.Series(False, index=filtered_df.index)
     _nirm_crit  = 0
-    _nirm_crit_cves = 0
-    if 'Last Response' in filtered_df.columns and score_col and score_col in filtered_df.columns:
-        _nirm_mask     = filtered_df['Last Response'] == 'Not Found in RMM'
-        _nirm_sc       = pd.to_numeric(filtered_df.loc[_nirm_mask, score_col], errors='coerce')
-        _nirm_crit     = int((_nirm_sc >= 9.0).sum())
-        _nirm_crit_cves = int(filtered_df.loc[_nirm_mask & (pd.to_numeric(filtered_df[score_col], errors='coerce') >= 9.0), 'Vulnerability Name'].nunique()) if 'Vulnerability Name' in filtered_df.columns else 0
+    if score_col and score_col in filtered_df.columns:
+        _nirm_sc   = pd.to_numeric(filtered_df.loc[_nirm_mask, score_col], errors='coerce')
+        _nirm_crit = int((_nirm_sc >= 9.0).sum())
 
     # Stale + NIRM CISA KEV counts, mirroring the CVSS 9+ pattern above so
     # KEV gets the same All / Active / Excluded reconciliation.
-    _stale_kev = 0
-    _stale_kev_cves = 0
-    if stale_excluded_df is not None and not stale_excluded_df.empty and kev_col and kev_col in stale_excluded_df.columns:
-        _stale_kev_mask  = stale_excluded_df[kev_col].astype(str).str.strip().str.lower().isin(['yes','true','1','y'])
-        _stale_kev       = int(_stale_kev_mask.sum())
-        _stale_kev_cves  = int(stale_excluded_df.loc[_stale_kev_mask, 'Vulnerability Name'].nunique()) if 'Vulnerability Name' in stale_excluded_df.columns else 0
     _nirm_kev  = 0
-    _nirm_kev_cves = 0
-    if 'Last Response' in filtered_df.columns and kev_col and kev_col in filtered_df.columns:
-        _nirm_kev_mask   = filtered_df[kev_col].astype(str).str.strip().str.lower().isin(['yes','true','1','y'])
-        _nirm_kev        = int((_nirm_mask & _nirm_kev_mask).sum())
-        _nirm_kev_cves   = int(filtered_df.loc[_nirm_mask & _nirm_kev_mask, 'Vulnerability Name'].nunique()) if 'Vulnerability Name' in filtered_df.columns else 0
-    _excl_devs       = _stale_devs + _nirm_devs
-    _excl_crit       = _stale_crit + _nirm_crit
-    _excl_crit_cves  = _stale_crit_cves + _nirm_crit_cves   # note: may overlap; shown as informational
+    if kev_col and kev_col in filtered_df.columns:
+        _nirm_kev_mask = filtered_df[kev_col].astype(str).str.strip().str.lower().isin(['yes','true','1','y'])
+        _nirm_kev      = int((_nirm_mask & _nirm_kev_mask).sum())
 
     # ── Key Metrics — 4-column grid: Metric | All | Active | Excluded ───────────
     # "All" = entire dataset (no stale/NIRM filter), "Active" = triage_df scope,
@@ -431,7 +391,6 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     _all_rows      = len(_all_df)          # = total_rows + stale_dedup_rows — math correct
     _all_cves      = int(_all_df['Vulnerability Name'].nunique()) if 'Vulnerability Name' in _all_df.columns else 0
     _all_devs      = int(_all_df['Name'].nunique())               if 'Name'               in _all_df.columns else 0
-    _all_sc        = pd.to_numeric(_all_df.get(score_col, pd.Series(dtype=float)), errors='coerce') if score_col else pd.Series(dtype=float)
 
     # For CVSS 9+ counts use the FULL stale_excluded_df (deduplicated Name+CVE),
     # NOT _stale_dedup which filters to _p2s_keys (active products only).
@@ -470,12 +429,6 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     _all_kev      = kev_rows + _stale_full_kev
     _all_kev_cves = kev_cves + _stale_full_kev_cves
 
-    # stale crit rows from _stale_dedup directly (consistent with _all_rows)
-    if not _stale_dedup.empty and score_col and score_col in _stale_dedup.columns:
-        _stale_crit_dedup = int((pd.to_numeric(_stale_dedup[score_col], errors='coerce') >= 9.0).sum())
-    else:
-        _stale_crit_dedup = _stale_crit
-
     # Uses the deduped not-in-RMM row count (matches how _all_rows is now built)
     # when the actual dataframe was passed; falls back to the pre-computed
     # scalar for callers that haven't been updated to pass not_in_rmm_df yet.
@@ -483,9 +436,7 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     _excl_rows          = len(_stale_dedup) + _nirm_excl_rows
     _excl_devs_tot      = _stale_devs + _nirm_devs
     _excl_crit_tot      = _stale_full_crit + _nirm_crit        # full stale, not _p2s_keys-filtered
-    _excl_crit_cves_tot = _stale_full_crit_cves + _nirm_crit_cves
     _excl_kev_tot       = _stale_full_kev + _nirm_kev          # full stale, not _p2s_keys-filtered
-    _excl_kev_cves_tot  = _stale_full_kev_cves + _nirm_kev_cves
 
     # ── Patching Health Score (beta) ──────────────────────────────────────────
     # Only rendered when include_health_score=True (opt-in checkbox in the GUI).
@@ -541,12 +492,13 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         _phs_conf   = _phs.get('confidence', {})
 
         # ── Live-formula helpers ───────────────────────────────────────────────
-        # Every product sheet (full triage AND Patch Confirmed) carries six
-        # hidden subtotal cells at a fixed address (col R rows 1-6, written by
-        # product_sheets via sheet_helpers.write_hs_subtotals).  Each cell holds
-        # a short LOCAL COUNTIF over that sheet's own columns, so the three
-        # score components below update automatically when ☐/☑ are toggled in
-        # any product sheet — while the Summary-side formulas stay tiny.
+        # Product sheets have a fixed column layout (set in cols_order):
+        #   A(0)=Resolved  B(1)=Score Lift  C(2)=Vulnerability Name  D(3)=Name
+        #   E(4)=Device Type  F(5)=Vulnerability Severity  G(6)=Vulnerability Score
+        #   H(7)=Risk Severity Index  I(8)=Has Known Exploit  J(9)=CISA KEV
+        #
+        # We build cross-sheet COUNTIFS formulas so the three score components
+        # update automatically when ☐/☑ are toggled in any product sheet.
         # Penalties (persisting CVEs, unresolved KEVs) depend on external data
         # (trend comparison, KEV database) and cannot be recalculated in-sheet;
         # they remain static and are labelled "(fixed at generation)".
@@ -554,194 +506,217 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         _hs_live = bool(_p2s_hs_vals)
 
         # health_triage_df is deliberately broader than the report's own
-        # threshold (e.g. CVSS ≥ 7.0 even when the report itself is ≥ 9.0),
-        # so _score_scope can legitimately contain a Base Product with no
-        # entry in product_to_sheet at all — no dedicated sheet, no ☑/☐
-        # column, nothing a COUNTIF formula could reference. The Python-side
-        # score (_phs, above) already accounts for these "hidden" products
-        # correctly via compute_resolved_series(). But a LIVE formula only
-        # ever sums COUNTIFs over _p2s_hs_vals (existing sheets) — so if we
-        # built one anyway, it would silently drop those products' rows the
-        # moment Excel recalculates (e.g. the reader toggles any unrelated
-        # checkbox), producing a number that visibly disagrees with the
-        # correct one this workbook was generated with. Rather than ship a
-        # formula that can drift wrong on first interaction, fall back to
-        # the same static-value path already used when a formula is too
-        # long for Excel's limit.
-        if _hs_live and 'Base Product' in _score_scope.columns:
-            _hs_hidden_products = set(_score_scope['Base Product'].unique()) - set((product_to_sheet or {}).keys())
-            if _hs_hidden_products:
+        # threshold (CVSS ≥ 7.0 even when the report itself is ≥ 9.0), so
+        # _score_scope can contain rows that exist on NO product sheet:
+        #   (a) whole products with nothing at the report threshold — no
+        #       sheet, no entry in product_to_sheet at all; and
+        #   (b) 7.0–8.9 rows of products that DO have a sheet, because
+        #       product sheets are built from triage_df at the report's own
+        #       threshold, not the health scope.
+        # None of these rows has a ☑/☐ checkbox, so their resolved state can
+        # never change inside Excel — it is frozen at generation time. So
+        # rather than disabling live scoring (the old behaviour), their
+        # generation-time counts are folded into the fleet sums as plain
+        # numeric constants. The live score then equals the Python score
+        # exactly at generation, and stays live for every row the reader can
+        # actually toggle.
+        #
+        # The one case constants can NOT fix is the reverse direction: a
+        # report threshold BELOW the health scope (e.g. 1.0) puts sub-7.0
+        # rows — with toggleable checkboxes — onto the sheets, and the
+        # per-sheet subtotal cells would count them into the health score as
+        # they're toggled. Live scoring stays disabled there.
+        _hs_residual = {'hs_res': 0, 'hs_unres': 0, 'crit_res': 0,
+                        'crit_unres': 0, 'exp_res': 0, 'exp_unres': 0,
+                        'kev_unres': 0}
+        _hs_key_cols = ['Base Product', 'Name', 'Vulnerability Name']
+        # A report threshold BELOW the health scope (e.g. 1.0) puts sub-7.0
+        # rows with toggleable checkboxes on the sheets — but the fleet sums
+        # only reference the scoped subtotal cells (R5-R9 carry the
+        # 'Vulnerability Score >= 7' criterion inside their COUNTIFS), so
+        # those rows can never feed the score and live scoring stays on at
+        # ANY report threshold (v0.35).
+        if _hs_live and not all(c in _score_scope.columns for c in _hs_key_cols):
+            log.info(
+                "Patching Health Score live formulas disabled: health scope is missing "
+                "one of %s, so off-sheet rows can't be matched. Static score values "
+                "will be written instead.", _hs_key_cols,
+            )
+            _hs_live = False
+        elif _hs_live:
+            # Rows present on a product sheet = triage_dedup rows for products
+            # that have a sheet (product sheets dedup by Name + Vulnerability
+            # Name per product, which is exactly how triage_dedup is built).
+            _on_sheet = triage_dedup[triage_dedup['Base Product'].isin(set((product_to_sheet or {}).keys()))] \
+                if 'Base Product' in triage_dedup.columns else triage_dedup.iloc[0:0]
+            _sheet_idx = pd.MultiIndex.from_frame(_on_sheet[_hs_key_cols].astype(str)) \
+                if not _on_sheet.empty else pd.MultiIndex.from_arrays([[], [], []], names=_hs_key_cols)
+            _off_mask = ~pd.MultiIndex.from_frame(_score_scope[_hs_key_cols].astype(str)).isin(_sheet_idx)
+            _off_mask = pd.Series(_off_mask, index=_score_scope.index)
+            if _off_mask.any():
+                if 'Vulnerability Score' in _score_scope.columns:
+                    _hcm = pd.to_numeric(_score_scope['Vulnerability Score'], errors='coerce') >= 9.0
+                else:
+                    _hcm = pd.Series(False, index=_score_scope.index)
+                if 'Has Known Exploit' in _score_scope.columns:
+                    _hem = _score_scope['Has Known Exploit'].astype(str).str.strip().str.lower().isin(
+                        ['yes', 'true', '1', 'y'])
+                else:
+                    _hem = pd.Series(False, index=_score_scope.index)
+                if 'CISA KEV' in _score_scope.columns:
+                    _hkm = _score_scope['CISA KEV'].astype(str).str.strip().str.lower().isin(
+                        ['yes', 'true', '1', 'y'])
+                else:
+                    _hkm = pd.Series(False, index=_score_scope.index)
+                _hs_residual = {
+                    # Off-sheet rows are all within the health scope by
+                    # construction, so they carry the hs_* keys.
+                    'hs_res':     int((_off_mask & _hs_is_res).sum()),
+                    'hs_unres':   int((_off_mask & _hs_is_unr).sum()),
+                    'crit_res':   int((_off_mask & _hcm & _hs_is_res).sum()),
+                    'crit_unres': int((_off_mask & _hcm & _hs_is_unr).sum()),
+                    'exp_res':    int((_off_mask & _hem & _hs_is_res).sum()),
+                    'exp_unres':  int((_off_mask & _hem & _hs_is_unr).sum()),
+                    # Off-sheet unresolved KEV rows can never be ticked, so if
+                    # any exist the live KEV cell $E$11 correctly never reaches
+                    # 0 and the grade cap/penalty correctly never lift.
+                    'kev_unres':  int((_off_mask & _hkm & _hs_is_unr).sum()),
+                }
                 log.info(
-                    "Patching Health Score live formulas disabled: %d product(s) in the "
-                    "health scope have no dedicated sheet (%s) — a live COUNTIF formula "
-                    "can't reference rows that don't exist on any sheet. Static score "
-                    "values will be written instead.",
-                    len(_hs_hidden_products), ', '.join(sorted(_hs_hidden_products)),
+                    "Patching Health Score: %d health-scope row(s) exist on no product "
+                    "sheet (broader CVSS ≥ %.1f scope vs report threshold %.1f, plus any "
+                    "products with no sheet). They have no checkboxes and can never "
+                    "change in Excel, so their counts are folded into the live fleet "
+                    "sums as fixed constants. Live scoring remains enabled.",
+                    int(_off_mask.sum()), health_score_threshold, threshold,
                 )
-                _hs_live = False
 
         if _hs_live:
-            # ── Fleet totals from per-sheet subtotal cells ─────────────────────
-            # Each product sheet totals its own ☑/☐ counts once, in hidden
-            # helper cells at a fixed address (col R rows 1-6 — see
-            # sheet_helpers.write_hs_subtotals, written by product_sheets).
-            # The fleet-wide totals are therefore just ONE cell reference per
-            # sheet ('Sheet'!$R$1 + ...) instead of one or two COUNTIFS per
-            # sheet.  The old inline-COUNTIFS approach produced 20k+ character
-            # formulas on workbooks with many product sheets — far above
-            # Excel's 8,192-char limit — permanently forcing the static-score
-            # fallback.  A bonus fix: subtotals are computed from each sheet's
-            # OWN column layout, so Patch Confirmed sheets (no Score Lift
-            # column) no longer have the wrong columns tested by a one-size
-            # G:G / I:I reference.
+            # ── Live totals via per-sheet subtotal cells ─────────────────────────
+            # Each product sheet carries a hidden subtotal block (col R rows 1-7,
+            # written by product_sheets via sheet_helpers.write_hs_subtotals):
+            # short LOCAL COUNTIF/COUNTIFS over that sheet only, so toggling ☑/☐
+            # still flows through live.  The fleet totals here are therefore one
+            # short cell reference per sheet ('Sheet'!$R$1 + ...) instead of a
+            # full COUNTIFS per sheet — the old approach produced 20k+ character
+            # formulas on big fleets, far above Excel's 8,192-char stored-formula
+            # limit, which permanently forced the score back to static values.
+            #
+            # The six fleet sums are written ONCE into hidden helper cells
+            # E5:E10 (next to the E4 score helper).  Every visible formula
+            # references $E$5..$E$10, so visible formulas stay constant-size no
+            # matter how many product sheets exist.  A second win: each sheet's
+            # subtotals are built from its OWN column layout — Patch Confirmed
+            # sheets have no Score Lift column, so the old Summary-side G:G/I:I
+            # hard-coding silently tested the wrong columns there.
+            # Each sum is one short cell ref per sheet, plus (when the health
+            # scope contains products with no sheet — see _hs_residual above)
+            # a single numeric constant carrying those frozen rows.
             def _fleet_sum(_key):
-                return ' + '.join(_hs_subtotal_ref(s, _key) for s in _p2s_hs_vals)
+                _s = ' + '.join(_hs_ref(sn, _key) for sn in _p2s_hs_vals)
+                if _hs_residual.get(_key):
+                    _s = f"{_s} + {_hs_residual[_key]}"
+                return _s
 
-            # ── Summary-side fleet helper cells E5:E10 (rows 4-9, col 4) ──────
-            # The six per-sheet sums above are the ONLY formulas whose length
-            # grows with the number of product sheets, so they get their own
-            # hidden helper cells next to the E4 score cell.  Every visible
-            # formula (rates, points, score, grade) then references $E$5..$E$10
-            # and stays constant-size no matter how many sheets exist.
-            _fleet_cells = {                       # key → (row, absolute ref)
-                'res':        (4, '$E$5'),
-                'unres':      (5, '$E$6'),
-                'crit_res':   (6, '$E$7'),
-                'crit_unres': (7, '$E$8'),
-                'exp_res':    (8, '$E$9'),
-                'exp_unres':  (9, '$E$10'),
-                'kev_unres':  (10, '$E$11'),   # live count of unresolved KEV rows
-            }
-            _fleet_col = 4
-            _fleet_formulas = {k: f'={_fleet_sum(k)}' for k in _fleet_cells}
+            # 'hs_res'/'hs_unres' (R8/R9) — NOT the whole-sheet R1/R2, which
+            # include sub-scope rows when the report threshold is below the
+            # health scope. R1/R2 remain the Resolution Status table's source.
+            _f_sum_res        = _fleet_sum('hs_res')
+            _f_sum_unres      = _fleet_sum('hs_unres')
+            _f_sum_crit_res   = _fleet_sum('crit_res')
+            _f_sum_crit_unres = _fleet_sum('crit_unres')
+            _f_sum_exp_res    = _fleet_sum('exp_res')
+            _f_sum_exp_unres  = _fleet_sum('exp_unres')
+            # Live count of unresolved CISA KEV rows (per-sheet R7 cells plus
+            # the off-sheet constant) — drives the live grade cap and the KEV
+            # penalty lift below via hidden helper cell $E$11.
+            _f_sum_kev_unres  = _fleet_sum('kev_unres')
 
-            # Cached values so the workbook shows correct numbers pre-recalc.
-            # When _hs_live is true there are no hidden products (checked
-            # above), so the Python-side component counts equal the sheet sums.
-            _c_res_c  = _phs_comps.get('resolution',        {})
-            _c_crit_c = _phs_comps.get('critical_coverage', {})
-            _c_exp_c  = _phs_comps.get('exploit_coverage',  {})
-            _fleet_static = {
-                'res':        int(_c_res_c.get('resolved', 0)),
-                'unres':      int(_c_res_c.get('total', 0))  - int(_c_res_c.get('resolved', 0)),
-                'crit_res':   int(_c_crit_c.get('resolved', 0)),
-                'crit_unres': int(_c_crit_c.get('total', 0)) - int(_c_crit_c.get('resolved', 0)),
-                'exp_res':    int(_c_exp_c.get('resolved', 0)),
-                'exp_unres':  int(_c_exp_c.get('total', 0))  - int(_c_exp_c.get('resolved', 0)),
-            }
-            # Unresolved KEV ROW count (rows, not unique CVE types — mirrors
-            # what the per-sheet COUNTIFS cells compute).
-            if 'CISA KEV' in _score_scope.columns:
-                _kev_row_mask = _score_scope['CISA KEV'].astype(str).str.strip().str.lower() == 'yes'
-                _fleet_static['kev_unres'] = int((_kev_row_mask & _hs_is_unr).sum())
-            else:
-                _fleet_static['kev_unres'] = 0
+            # Helper cell layout (col E = index 4, rows 4-11 in Excel terms):
+            #   E4  live score          E5  Σ res        E6  Σ unres
+            #   E7  Σ crit res          E8  Σ crit unres
+            #   E9  Σ exp res           E10 Σ exp unres
+            #   E11 Σ unresolved CISA KEV rows (drives cap/penalty lift)
+            _helper_row = 3
+            _helper_col = 4
+            _helper_ref = '$E$4'
+            _kev_live_ref = '$E$11'
+            _hr = {'res': '$E$5', 'unres': '$E$6', 'crit_res': '$E$7',
+                   'crit_unres': '$E$8', 'exp_res': '$E$9', 'exp_unres': '$E$10'}
 
-            # ── Component 1: Resolution rate across ALL product sheets ──────────
-            # Totals = ☑ + ☐ (avoids counting header/legend rows that COUNTA would hit)
-            _f_hs_res   = _fleet_cells['res'][1]
-            _f_hs_unres = _fleet_cells['unres'][1]
-            _f_hs_total = f'({_f_hs_res}+{_f_hs_unres})'
+            _f_hs_res     = _hr['res']
+            _f_hs_total   = f"({_hr['res']}+{_hr['unres']})"
+            _f_crit_res   = _hr['crit_res']
+            _f_crit_total = f"({_hr['crit_res']}+{_hr['crit_unres']})"
+            _f_exp_res    = _hr['exp_res']
+            _f_exp_total  = f"({_hr['exp_res']}+{_hr['exp_unres']})"
 
-            # ── Component 2: Critical CVE coverage (CVSS ≥ 9) ─────────────────
-            _f_crit_res   = _fleet_cells['crit_res'][1]
-            _f_crit_total = f"({_f_crit_res}+{_fleet_cells['crit_unres'][1]})"
-
-            # ── Component 3: Known-exploit coverage ────────────────────────────
-            _f_exp_res   = _fleet_cells['exp_res'][1]
-            _f_exp_total = f"({_f_exp_res}+{_fleet_cells['exp_unres'][1]})"
-
-            # Static penalty values (cannot be fully recalculated from the
-            # sheet columns — persisting CVEs depend on trend data; the KEV
-            # penalty counts unique CVE TYPES, which no in-sheet formula can
-            # deduplicate).  BUT the boundary case is exact: unresolved KEV
-            # ROWS = 0 (live cell $E$11) if and only if unresolved KEV CVE
-            # types = 0.  So the KEV penalty and the KEV grade cap are made
-            # CONDITIONAL on $E$11 — when the reader resolves every KEV row
-            # by toggling ☑, the −1/CVE penalty and the C/B grade ceiling
-            # lift automatically instead of pinning the score forever at the
-            # generation-time cap (the "everything is ☑ but it still says
-            # 74/C" problem).  In-between states keep the generation-time
-            # penalty (documented as fixed).
+            # Static penalty values (cannot be recalculated from the sheet columns)
             _pen_persist_pts = _phs_pens.get('persisting_cves', {}).get('pts', 0.0)
             _pen_kev_pts     = _phs_pens.get('kev_unresolved',  {}).get('pts', 0.0)
-            _kev_live_ref    = _fleet_cells['kev_unres'][1]      # $E$11
-            # Only trust the live KEV cell if the sheets actually carry the
-            # CISA KEV column — otherwise it reads 0 and would wrongly lift
-            # the cap.  Fall back to the fixed penalty/cap in that case.
-            _kev_cell_valid  = 'CISA KEV' in _score_scope.columns
-            if _pen_kev_pts > 0 and _kev_cell_valid:
-                _total_pen = f'({_pen_persist_pts}+IF({_kev_live_ref}>0,{_pen_kev_pts},0))'
-            else:
-                _total_pen = _pen_persist_pts + _pen_kev_pts
 
             # -- Live score formula -------------------------------------------------
             # Mirrors compute_patching_health_score:
             #   pts_res  = IF(total>0, res/total, 0) * 60
             #   pts_crit = IF(crit_total>0, crit_res/crit_total, 1) * 20
             #   pts_exp  = IF(exp_total>0,  exp_res/exp_total,   1) * 20
-            #   score    = MAX(0, INT(ROUND(pts_res + pts_crit + pts_exp - penalties, 0)))
+            #   score    = MIN(cap, MAX(0, INT(ROUND(pts - penalties, 0))))
             #
-            # Score/grade both need the full expression; writing the score once
-            # into hidden helper cell E4 and referencing $E$4 everywhere keeps
-            # the visible formulas short and the score/grade guaranteed equal.
-            _f_pts_res  = f'IF(({_f_hs_total})>0,({_f_hs_res})/({_f_hs_total}),0)*60'
-            _f_pts_crit = f'IF(({_f_crit_total})>0,({_f_crit_res})/({_f_crit_total}),1)*20'
-            _f_pts_exp  = f'IF(({_f_exp_total})>0,({_f_exp_res})/({_f_exp_total}),1)*20'
-            _f_raw      = f'({_f_pts_res})+({_f_pts_crit})+({_f_pts_exp})-{_total_pen}'
-            _f_score    = f'MAX(0,INT(ROUND({_f_raw},0)))'
+            # The persisting-CVE penalty is genuinely static (depends on trend
+            # data that isn't in the workbook). The KEV penalty is conditionally
+            # live: the Python penalty counts unique unresolved KEV CVE *types*
+            # (−1 each, cap −5), which no in-sheet formula can deduplicate — but
+            # the boundary IS exact: unresolved KEV rows = 0 ⇔ unresolved KEV
+            # types = 0. So `IF($E$11>0, pts, 0)` keeps the generation-time
+            # penalty for intermediate states and lifts it precisely when the
+            # last KEV row is ticked ☑ (or keeps it forever if any unresolved
+            # KEV row is off-sheet, where it can never be ticked — correct).
+            _f_pts_res  = f"IF(({_f_hs_total})>0,({_f_hs_res})/({_f_hs_total}),0)*60"
+            _f_pts_crit = f"IF(({_f_crit_total})>0,({_f_crit_res})/({_f_crit_total}),1)*20"
+            _f_pts_exp  = f"IF(({_f_exp_total})>0,({_f_exp_res})/({_f_exp_total}),1)*20"
+            _f_pen      = f"({_pen_persist_pts}+IF({_kev_live_ref}>0,{_pen_kev_pts},0))"
+            _f_raw      = f"({_f_pts_res})+({_f_pts_crit})+({_f_pts_exp})-{_f_pen}"
 
-            # Hard KEV grade caps — mirror compute_patching_health_score.  The
-            # cap tier (74 vs 89) is a generation-time constant, but WHETHER a
-            # cap applies is live: it lifts when the reader resolves every KEV
-            # row ($E$11 reaches 0).  Without this the live score would stay
-            # pinned at the ceiling even after all KEVs are marked ☑.
-            _kev_cnt_live = int(_phs_pens.get('kev_unresolved', {}).get('count', 0))
+            # KEV grade caps — compute_patching_health_score caps the numeric
+            # score at 74 (KEV ≥ 3, or any KEV with no patch report) / 89 (any
+            # unresolved KEV).  The cap *tier* (74 vs 89) stays a generation-time
+            # constant, but *whether* it applies is live: it lifts the moment
+            # the live unresolved-KEV count $E$11 reaches 0 — i.e. every KEV
+            # row on every sheet is ticked ☑ and none exist off-sheet. Without
+            # the live condition, a fully-remediated workbook stayed pinned at
+            # the ceiling (74/89) no matter what the reader resolved.
+            _kev_cnt_live = _phs_pens.get('kev_unresolved', {}).get('count', 0)
             if _kev_cnt_live >= 3 or (_kev_cnt_live > 0 and not _phs_conf.get('has_patch_report')):
-                _kev_cap = 74      # KEV exposure without patch evidence → C ceiling
+                _score_cap = 74
             elif _kev_cnt_live > 0:
-                _kev_cap = 89      # any unresolved KEV → B ceiling
+                _score_cap = 89
             else:
-                _kev_cap = None
-            if _kev_cap is not None:
-                if _kev_cell_valid:
-                    _f_score = f'MIN(IF({_kev_live_ref}>0,{_kev_cap},100),{_f_score})'
-                else:
-                    _f_score = f'MIN({_kev_cap},{_f_score})'
+                _score_cap = None
+            _f_score = f"MAX(0,INT(ROUND({_f_raw},0)))"
+            if _score_cap is not None:
+                _f_score = f"MIN(IF({_kev_live_ref}>0,{_score_cap},100),{_f_score})"
 
-            # Helper cell E4 (row=3, col=4): holds the live numeric score.
-            # Grade IFS and final score row both reference $E$4 -- short formulas.
-            _helper_row = 3
-            _helper_col = 4
-            _helper_ref = '$E$4'
             # Nested IF rather than IFS(): IFS is an Excel 2019+ "future
-            # function" that xlsxwriter writes verbatim — Excel stores it
-            # internally as _xlfn.IFS, so a bare IFS renders as #NAME?.
-            # Nested IF is equivalent and works in every Excel/LibreOffice.
+            # function" that xlsxwriter writes verbatim — Excel stores such
+            # functions internally as _xlfn.IFS, so a bare IFS renders as
+            # #NAME?.  Nested IF is equivalent and works in every Excel and
+            # LibreOffice version.
             _f_grade = (
                 f'IF({_helper_ref}>=90,"A",IF({_helper_ref}>=75,"B",'
                 f'IF({_helper_ref}>=60,"C",IF({_helper_ref}>=40,"D","F"))))'
             )
             _f_score_ref = f'={_helper_ref}'
 
-            # Excel's stored formula limit is 8,192 characters.  With per-sheet
-            # subtotals the only formulas that grow with the number of product
-            # sheets are the six fleet-total sums below (~1 cell reference per
-            # sheet, ≈ sheet-name length + 12 chars each) — the visible score /
-            # grade / rate / points formulas are constant-size.  A workbook
-            # would need several hundred product sheets to hit the limit now,
-            # but keep the guard: falling back to static values is always
-            # better than shipping a workbook Excel "repairs" on open.
-            _candidate_live_formulas = list(_fleet_formulas.values()) + [
-                _f_score,
-                _f_grade,
-                _f_score_ref,
-                f'IF(({_f_hs_total})>0,({_f_hs_res})/({_f_hs_total}),1)',
-                _f_pts_res,
-                f'IF(({_f_crit_total})>0,({_f_crit_res})/({_f_crit_total}),1)',
-                _f_pts_crit,
-                f'IF(({_f_exp_total})>0,({_f_exp_res})/({_f_exp_total}),1)',
-                _f_pts_exp,
+            # Excel's stored formula limit is 8,192 characters.  With the
+            # subtotal-cell design the only formulas that still grow with the
+            # sheet count are the six helper-cell sums (one short cell ref per
+            # sheet, ~25 chars each) — it would take ~250 max-length sheet
+            # names to trip this, but keep the guard as a safety net: an
+            # over-limit formula makes Excel "repair" (strip) formulas on open.
+            _candidate_live_formulas = [
+                _f_sum_res, _f_sum_unres, _f_sum_crit_res,
+                _f_sum_crit_unres, _f_sum_exp_res, _f_sum_exp_unres,
+                _f_sum_kev_unres, _f_score, _f_grade, _f_score_ref,
             ]
             _max_formula_len = max(len(str(f or '')) + 1 for f in _candidate_live_formulas)
             if _max_formula_len > 8192:
@@ -754,17 +729,21 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
                 _hs_live = False
 
         # ── Format objects ──────────────────────────────────────────────────────
-        # Live mode: boxes start neutral dark blue; conditional-formatting rules
-        # below recolour them from the live $E$4 score.  Static mode: no CF is
-        # added, so the boxes take the generation-time grade colour directly.
-        _live_score_bg = '#1F4E79' if _hs_live else _phs_colour
+        # Score box and grade box background (v0.29):
+        #   live   → neutral dark blue; the formula-based conditional-format
+        #            rules below recolour both boxes from the live $E$4 score.
+        #   static → the generation-time grade colour (_phs_colour) — no
+        #            conditional formatting exists in static mode, so the box
+        #            must carry the correct colour itself.
+        _live_score_bg = '#1F4E79'   # neutral dark blue for the live score container
+        _box_bg        = _live_score_bg if _hs_live else _phs_colour
         _score_box_fmt = workbook.add_format({
             'bold': True, 'font_size': 36, 'align': 'center', 'valign': 'vcenter',
-            'font_color': 'white', 'bg_color': _live_score_bg, 'border': 2,
+            'font_color': 'white', 'bg_color': _box_bg, 'border': 2,
         })
         _grade_box_fmt = workbook.add_format({
             'bold': True, 'font_size': 28, 'align': 'center', 'valign': 'vcenter',
-            'font_color': 'white', 'bg_color': _live_score_bg, 'border': 2,
+            'font_color': 'white', 'bg_color': _box_bg, 'border': 2,
         })
         _score_lbl_fmt = workbook.add_format({
             'bold': True, 'font_size': 10, 'align': 'center', 'valign': 'vcenter',
@@ -819,25 +798,49 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         ws.set_row(row + 1, 14)
 
         # Score box (cols A-B) -- live formula or static fallback.
-        # For live formulas: merge_range cannot store a cached formula result,
-        # so a merged formula cell carries a cached 0 — any reader that does
-        # not recalculate on open (e.g. LibreOffice headless, some viewers)
-        # would display 0.  The documented xlsxwriter pattern is to merge with
-        # a blank, then overwrite the top-left cell via write_formula, which
-        # DOES accept a cached result.  (Verified: produces a single cell
-        # entry in the sheet XML — no corruption.)
+        # merge_range cannot store a cached formula result, so readers that
+        # don't recalculate on open (data_only tooling, some viewers) would
+        # display 0 in the box. Merge a blank, then overwrite the top-left
+        # cell via write_formula with the correct cached result — the
+        # documented xlsxwriter pattern for formulas in merged ranges; this
+        # write order produces a single cell entry in the sheet XML (v0.29).
         _score_box_row = row   # remember for conditional formatting below
         if _hs_live:
-            # Write the full score formula into hidden helper cell E4 first,
-            # and the six fleet-total sums into E5:E10 below it.  All visible
-            # cells reference $E$4..$E$10 to stay far under the 8192-char limit.
-            _hidden_e_fmt = workbook.add_format({'num_format': '0', 'font_color': 'white',
-                                                 'bg_color': 'white'})
+            # Hidden helper cells: E4 = live score; E5:E10 = the six fleet
+            # sums over the per-sheet subtotal cells.  All visible cells
+            # reference these, so every visible formula stays tiny.
+            _helper_fmt = workbook.add_format({'num_format': '0', 'font_color': 'white',
+                                               'bg_color': 'white'})
+            # Cached generation-time values so data_only readers see numbers
+            # (Excel recalculates the formulas on open regardless).
+            _cache_res   = int(_hs_is_res.sum())
+            _cache_unres = int(_hs_is_unr.sum())
+            if 'Vulnerability Score' in _score_scope.columns:
+                _cm = pd.to_numeric(_score_scope['Vulnerability Score'], errors='coerce') >= 9.0
+            else:
+                _cm = pd.Series(False, index=_score_scope.index)
+            if 'Has Known Exploit' in _score_scope.columns:
+                _em = _score_scope['Has Known Exploit'].astype(str).str.strip().str.lower().isin(
+                    ['yes', 'true', '1', 'y'])
+            else:
+                _em = pd.Series(False, index=_score_scope.index)
+            if 'CISA KEV' in _score_scope.columns:
+                _km = _score_scope['CISA KEV'].astype(str).str.strip().str.lower().isin(
+                    ['yes', 'true', '1', 'y'])
+            else:
+                _km = pd.Series(False, index=_score_scope.index)
+            for _hrow, _hf, _hcache in [
+                (4,  _f_sum_res,        _cache_res),
+                (5,  _f_sum_unres,      _cache_unres),
+                (6,  _f_sum_crit_res,   int((_cm & _hs_is_res).sum())),
+                (7,  _f_sum_crit_unres, int((_cm & _hs_is_unr).sum())),
+                (8,  _f_sum_exp_res,    int((_em & _hs_is_res).sum())),
+                (9,  _f_sum_exp_unres,  int((_em & _hs_is_unr).sum())),
+                (10, _f_sum_kev_unres,  int((_km & _hs_is_unr).sum())),
+            ]:
+                ws.write_formula(_hrow, _helper_col, f'={_hf}', _helper_fmt, _hcache)
             ws.write_formula(_helper_row, _helper_col, f'={_f_score}',
-                             _hidden_e_fmt, _phs_score)
-            for _fk, (_fr, _fref) in _fleet_cells.items():
-                ws.write_formula(_fr, _fleet_col, _fleet_formulas[_fk],
-                                 _hidden_e_fmt, _fleet_static[_fk])
+                             _helper_fmt, _phs_score)
             ws.merge_range(row, 0, row + 1, 1, '', _score_box_fmt)
             ws.write_formula(row, 0, _f_score_ref, _score_box_fmt, _phs_score)
         else:
@@ -856,29 +859,26 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         # ── Conditional formatting: colour score/grade boxes by live score value ─
         # Applied to the top-left cell of each merged region (xlsxwriter targets the
         # top-left cell; Excel applies the format to the entire merged range).
-        # Rules are FORMULA-based on $E$4 (the live numeric score) rather than
-        # 'cell between' rules: the grade box contains TEXT ("A".."F"), which a
-        # numeric cell-value rule never matches — with the old rules the grade
-        # box kept its static colour forever while the score box recoloured.
         if _hs_live:
+            # Formula-based rules on the live $E$4 score — the previous
+            # numeric 'cell between' rules could never match the grade cell's
+            # TEXT value ("A".."F"), so the grade box stayed neutral dark blue
+            # forever.  A formula rule evaluates $E$4 regardless of what the
+            # formatted cell itself contains, so score box and grade box
+            # recolour together.
             for _cf_min, _cf_max, _cf_bg in [
-                (90, None, '#375623'),   # A — dark green
-                (75,   90, '#70AD47'),   # B — green
-                (60,   75, '#ED7D31'),   # C — orange
-                (40,   60, '#C00000'),   # D — red
-                ( 0,   40, '#7B0000'),   # F — dark red
+                (90, 100, '#375623'),   # A — dark green
+                (75,  89, '#70AD47'),   # B — green
+                (60,  74, '#ED7D31'),   # C — orange
+                (40,  59, '#C00000'),   # D — red
+                ( 0,  39, '#7B0000'),   # F — dark red
             ]:
                 _cf_fmt = workbook.add_format({
                     'bold': True, 'font_color': 'white', 'bg_color': _cf_bg, 'border': 2,
                 })
-                _cf_crit = (
-                    f'={_helper_ref}>={_cf_min}'
-                    if _cf_max is None else
-                    f'=AND({_helper_ref}>={_cf_min},{_helper_ref}<{_cf_max})'
-                )
                 ws.conditional_format(_score_box_row, 0, _score_box_row + 1, 2, {
                     'type': 'formula',
-                    'criteria': _cf_crit,
+                    'criteria': f'=AND($E$4>={_cf_min},$E$4<={_cf_max})',
                     'format': _cf_fmt,
                 })
 
@@ -924,30 +924,28 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
             row += 1
 
         # ── Penalty rows ────────────────────────────────────────────────────────
-        # Persisting-CVE penalty is always static (depends on trend data).
-        # The KEV penalty is LIVE when possible: it zeroes out automatically
-        # once every KEV row is resolved ($E$11 = 0), matching the score
-        # formula's conditional penalty and cap.
-        _kev_pen_is_live = (
-            _hs_live and _pen_kev_pts and _pen_kev_pts > 0 and _kev_cell_valid
-        ) if _hs_live else False
-        for _plbl, _pkey, _punit in [
+        # Persisting-CVE penalty is static (depends on trend data outside the
+        # workbook). The KEV penalty display is live when the score is live:
+        # =IF($E$11>0, −pts, 0) — it visibly clears alongside the score/cap
+        # the moment the last KEV row is ticked ☑ (see the live-score formula
+        # comment above for why the boundary is exact).
+        for _plbl, _pkey, _punit, _plive in [
             ('Persisting CVE types (\u22120.5 each, max \u22125)  \u2013 fixed at generation',
-             'persisting_cves', 'CVE types'),
-            ('Unresolved CISA KEV CVEs (\u22121 each, max \u22125)'
-             + ('  \u2013 lifts when all KEV rows are \u2611' if _kev_pen_is_live
-                else '  \u2013 fixed at generation'),
-             'kev_unresolved',  'KEV CVEs'),
+             'persisting_cves', 'CVE types', False),
+            ('Unresolved CISA KEV CVEs (\u22121 each, max \u22125)  \u2013 lifts when all KEV rows are \u2611'
+             if _hs_live else
+             'Unresolved CISA KEV CVEs (\u22121 each, max \u22125)  \u2013 fixed at generation',
+             'kev_unresolved',  'KEV CVEs', True),
         ]:
             _pen  = _phs_pens.get(_pkey, {})
             _ppts = _pen.get('pts', 0)
             _pcnt = _pen.get('count', 0)
             ws.write(row, 0, _plbl,               _comp_lbl_italic_fmt)
             ws.write(row, 1, f'{_pcnt} {_punit}', _comp_lbl_italic_fmt)
-            if _pkey == 'kev_unresolved' and _kev_pen_is_live:
+            if _hs_live and _plive and _ppts > 0:
                 ws.write_formula(row, 2,
-                                 f'=IF({_kev_live_ref}>0,{-_ppts},0)',
-                                 _pen_neg_fmt, -_ppts)
+                    f'=IF({_kev_live_ref}>0,{-_ppts},0)',
+                    _pen_neg_fmt, -_ppts)
             else:
                 ws.write(row, 2, -_ppts if _ppts > 0 else None,
                          _pen_neg_fmt if _ppts > 0 else _pen_zero_fmt)
@@ -978,10 +976,8 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
             _kev_cap_note = '  ·  Unresolved KEV CVEs: grade cap active.'
         _live_note_hs = (
             '\u26a1 Blue cells update automatically when \u2610/\u2611 are toggled in product sheets.  '
-            + ('The KEV penalty and grade cap lift automatically once every KEV row is \u2611.  '
-               if (_kev_pen_is_live or (_hs_live and _kev_cap is not None and _kev_cell_valid))
-               else '')
-            + 'The persisting-CVE penalty is fixed at report generation (depends on trend data).  '
+            'The KEV grade cap and KEV penalty lift when every KEV row is \u2611; '
+            'the persisting-CVE penalty is fixed at report generation (depends on trend data).  '
         ) if _hs_live else ''
         ws.merge_range(row, 0, row, 3,
             f'{_live_note_hs}'
@@ -1003,10 +999,46 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         # Health score disabled — Key Metrics starts at row 3
         row = 3
 
+    # ── Multi-Month Trend (advanced preview) ────────────────────────────────────
+    # Built from snapshots/ history next to the output file — accumulates
+    # across runs without needing previous workbooks. Advanced-only while
+    # the layout settles.
+    if advanced_summary and (snapshot_history or snapshot_current):
+        _adv_hdr = workbook.add_format({'bold': True, 'bg_color': '#D9D9D9', 'border': 1})
+        _adv_bold = workbook.add_format({'bold': True})
+        ws.merge_range(row, 0, row, 6, '  Multi-Month Trend  \u26a0 advanced preview', sect_fmt)
+        row += 1
+        for _c, _h in enumerate(['Month', 'Health Score', 'Grade', 'Unique CVEs',
+                                 'Unique Devices', 'Unresolved KEV CVEs', 'Unresolved pairs']):
+            ws.write(row, _c, _h, _adv_hdr)
+        row += 1
+
+        def _snap_val(rec, key):
+            v = rec.get(key)
+            return v if v is not None else '\u2014'
+
+        _SNAP_KEYS = ['health_score', 'health_grade', 'unique_cves',
+                      'unique_devices', 'kev_unresolved_cves', 'unresolved_pairs']
+        for _rec in (snapshot_history or []):
+            ws.write(row, 0, str(_rec.get('report_month') or _rec.get('run_date', '')[:7]), lbl_fmt)
+            for _c, _k in enumerate(_SNAP_KEYS, start=1):
+                ws.write(row, _c, _snap_val(_rec, _k), val_fmt)
+            row += 1
+        if snapshot_current:
+            ws.write(row, 0, f"{snapshot_current.get('report_month', '')} (this run)", _adv_bold)
+            for _c, _k in enumerate(_SNAP_KEYS, start=1):
+                ws.write(row, _c, _snap_val(snapshot_current, _k), _adv_bold)
+            row += 1
+        ws.merge_range(row, 0, row, 6,
+                       '\u2139  Built from the snapshots/ folder next to the output file. '
+                       'Months generated before this feature (or with it off) show \u2014 '
+                       'for score fields.',
+                       note_fmt)
+        row += 2
+
     # ── Month-over-Month Remediation Summary ────────────────────────────────────
     # Only rendered when a previous report was supplied. The point of this
-    # section is to make remediation WORK visible without opening Trend
-    # Summary — the Resolution Status table below only shows the current
+    # section is to make remediation WORK visible in one place — the Resolution Status table below only shows the current
     # snapshot, which can make a month of real patching look like "only
     # dropped by a few hundred rows" if new detections landed at the same
     # time.
@@ -1073,9 +1105,29 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         ws.write(row, 0, 'New unresolved pairs introduced', lbl_fmt)
         ws.write(row, 1, '\u2014', val_fmt)
         ws.write(row, 2, _new_count, val_fmt)
-        ws.write(row, 3, '\u25b2  offset' if _new_count else '\u2014', _mom_up_fmt if _new_count else _mom_same_fmt)
+        ws.write(row, 3, f'\u25b2  {_new_count:,}' if _new_count else '\u2014',
+                 _mom_up_fmt if _new_count else _mom_same_fmt)
         ws.write(row, 4, 'Pairs that became unresolved for the first time this period.', def_fmt)
-        row += 2
+        row += 1
+
+        # Advanced: CVE-type level movement (pairs above are device+CVE level).
+        if advanced_summary:
+            for _lbl, _key, _defn in [
+                ('New CVE types introduced', 'new_cve_count',
+                 'Distinct CVE IDs seen this period but not last (common-product scope).'),
+                ('CVE types resolved', 'resolved_cve_count',
+                 'Distinct CVE IDs present last period and gone or resolved now.'),
+                ('Persisting CVE types', 'persisting_cve_count',
+                 'Distinct CVE IDs unresolved in both periods.'),
+            ]:
+                _v = int(_mom.get(_key, 0))
+                ws.write(row, 0, _lbl, lbl_fmt)
+                ws.write(row, 1, '\u2014', val_fmt)
+                ws.write(row, 2, _v, val_fmt)
+                ws.write(row, 3, '\u2014', _mom_same_fmt)
+                ws.write(row, 4, _defn, def_fmt)
+                row += 1
+        row += 1
 
     ws.merge_range(row, 0, row, 4, '  Key Metrics', sect_fmt)
     row += 1
@@ -1268,14 +1320,9 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     # device that still shows "unresolved" here can be checked against how
     # recently it actually checked in — a device that's gone quiet may simply
     # not have reported a fresh scan showing the CVE patched, rather than
-    # genuinely still being vulnerable. Devices within stale_warning_days of
-    # going stale get the same ⚠ / orange treatment as Top At-Risk Devices.
+    # genuinely still being vulnerable.
     _kev_has_lr   = 'Last Response' in triage_dedup.columns
     _kev_has_days = 'Days Since Last Response' in triage_dedup.columns
-    _kev_approach = approaching_stale_names or set()
-    _kev_td_approach   = workbook.add_format({'border': 1, 'bg_color': '#FFF3E0', 'font_color': '#7B3F00'})
-    _kev_td_approach_r = workbook.add_format({'border': 1, 'bg_color': '#FFF3E0', 'font_color': '#7B3F00',
-                                               'align': 'right', 'num_format': '#,##0'})
 
     ws.merge_range(row, 0, row, 5,
                    '  Devices with Unpatched Known Exploited Vulnerabilities  (CISA KEV)',
@@ -1301,9 +1348,8 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
                              if _kev_has_days else ('Name', lambda s: ''))
                     .sort_values('cves', ascending=False))
         for dev, dr in _dev_grp.iterrows():
-            _near_stale = dev in _kev_approach
-            _bf, _nf = (_kev_td_approach, _kev_td_approach_r) if _near_stale else (_kev_td, _kev_td_r)
-            _name_label = f'⚠ {dev}' if _near_stale else str(dev)
+            _bf, _nf = _kev_td, _kev_td_r
+            _name_label = str(dev)
             _days_val = (
                 int(dr['days_since']) if _kev_has_days
                 and not (isinstance(dr['days_since'], float) and pd.isna(dr['days_since']))
@@ -1319,15 +1365,10 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     else:
         ws.merge_range(row, 0, row, 5, 'No devices with unpatched KEV CVEs.', note_fmt)
         row += 1
-    _kev_approach_note = (
-        f'  \U0001f7e7 Orange = offline \u2265 {stale_warning_days}d (\u26a0 prefix on name) \u2014 '
-        'check Last Response before assuming the CVE is still genuinely unpatched.  '
-        if _kev_approach else ''
-    )
     ws.merge_range(row, 0, row, 5,
                    '\u2139  Full list \u2014 not capped, unlike Top At-Risk Devices further below. '
                    'Includes every active device with at least one unresolved CISA KEV CVE, '
-                   f'fixed at report generation.  {_kev_approach_note}'
+                   'fixed at report generation.  '
                    'A device that has not checked in recently may still show as unresolved simply '
                    'because no newer scan has confirmed the patch \u2014 use Last Response / Days Since '
                    'Last Response to tell that apart from a genuinely still-vulnerable device.',
@@ -1342,37 +1383,34 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     # COUNTIF per sheet.  The sums are written ONCE into two hidden helper
     # cells next to the table (col G) and every visible formula references
     # those — so visible formulas stay constant-size no matter how many
-    # product sheets exist (Excel's stored-formula limit is 8,192 chars).
+    # product sheets exist (Excel's stored-formula limit is 8,192 chars; the
+    # old COUNTIF-chain approach had NO length guard here and could silently
+    # ship a corrupt workbook on big fleets).
     _p2s = product_to_sheet or {}
     if _p2s:
-        _f_res_sum   = ' + '.join(_hs_subtotal_ref(s, 'res')   for s in _p2s.values())
-        _f_unres_sum = ' + '.join(_hs_subtotal_ref(s, 'unres') for s in _p2s.values())
-        _live = True
-        if max(len(_f_res_sum), len(_f_unres_sum)) + 1 > 8192:
+        _f_sum_rs_res   = ' + '.join(_hs_ref(sn, 'res')   for sn in _p2s.values())
+        _f_sum_rs_unres = ' + '.join(_hs_ref(sn, 'unres') for sn in _p2s.values())
+        _live = max(len(_f_sum_rs_res), len(_f_sum_rs_unres)) + 1 <= 8192
+        if not _live:
             log.warning(
-                "Resolution Status live formulas disabled: per-sheet reference sum is "
-                "%d characters, above Excel's 8,192 character limit (workbook has %d "
-                "product sheets). Static values will be written instead.",
-                max(len(_f_res_sum), len(_f_unres_sum)) + 1, len(_p2s),
+                "Resolution Status live formulas disabled: helper sum is %d characters, "
+                "above Excel's 8,192 character limit. Static values will be written.",
+                max(len(_f_sum_rs_res), len(_f_sum_rs_unres)) + 1,
             )
-            _live = False
-        # _f_res / _f_unres / _f_total are assigned below once the table's row
-        # position is known — they become $G$ references to the helper cells.
-        _f_res = _f_unres = _f_total = None
-        # Device type unresolved: count rows where Resolved=☐ AND DevType matches
-        _f_srv_unr = None   # device unique-count across sheets needs SUMPRODUCT — kept static
-        _f_wks_unr = None
-        _f_srv_all = None
-        _f_wks_all = None
     else:
         _live = False
+    if _live:
+        # Helper cells are written just before the table rows below (the row
+        # position isn't known yet); the visible formulas use these refs.
+        _rs_helper_col = 6                     # col G — table itself uses A-D
+        _f_res   = None                        # set once helper row is known
+        _f_unres = None
+        _f_total = None
+    else:
         _f_res   = None   # guard: prevents UnboundLocalError when no product sheets exist
         _f_unres = None
         _f_total = None
 
-    _live_fmt  = workbook.add_format({'num_format': '#,##0', 'align': 'center',
-                                      'bg_color': '#EBF3FB', 'border': 1,
-                                      'font_color': '#1F3864'})  # blue tint = live formula cell
     _live_pct  = workbook.add_format({'num_format': '0%',   'align': 'center',
                                       'bg_color': '#EBF3FB', 'border': 1,
                                       'font_color': '#1F3864'})
@@ -1396,8 +1434,10 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     #      CVE — a fixed CVE just stops appearing — so #2 is often the ONLY
     #      way resolution ever shows up without a patch report. It's inferred,
     #      not proven: disappearance can also mean a device was decommissioned,
-    #      renamed, or dropped out of RMM. See the 'Resolved Since Previous Report' sheet
-    #      for the underlying device/CVE rows behind this number.
+    #      renamed, or dropped out of RMM. (The 'Resolved Since Previous
+    #      Report' detail sheet was removed in v0.33 — inferred resolution
+    #      double-reported work already tracked by the Patch Confirmed
+    #      sheets; this count remains as a metric only.)
     # Total is therefore Resolved + Unresolved, where Unresolved = still-active
     # rows this period and Resolved = confirmed + inferred — i.e. "of everything
     # tracked as of the last report, how much is now closed out."
@@ -1481,13 +1521,16 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
 
     res_row = row
     if _live:
-        # Hidden helper cells in col G alongside the table: G holds the two
-        # per-sheet reference sums; visible cells reference $G$ so they stay
-        # tiny.  Total = ☑ + ☐ only — COUNTA would overcount legend/header rows.
-        _hlp_fmt = workbook.add_format({'font_color': 'white'})
-        ws.write_formula(res_row,     6, f'={_f_res_sum}',   _hlp_fmt, _rr_confirmed)
-        ws.write_formula(res_row + 1, 6, f'={_f_unres_sum}', _hlp_fmt, _ur)
-        _f_res   = f'$G${res_row + 1}'
+        # Hidden helper cells (col G, alongside the Resolved/Unresolved rows):
+        # G holds the two long-ish per-sheet sums once; visible cells reference
+        # them.  White-on-white so they don't visually clutter the Summary.
+        _rs_helper_fmt = workbook.add_format({'num_format': '#,##0',
+                                              'font_color': 'white', 'bg_color': 'white'})
+        ws.write_formula(res_row,     _rs_helper_col, f'={_f_sum_rs_res}',
+                         _rs_helper_fmt, _rr_confirmed)
+        ws.write_formula(res_row + 1, _rs_helper_col, f'={_f_sum_rs_unres}',
+                         _rs_helper_fmt, _ur)
+        _f_res   = f'$G${res_row + 1}'          # Excel 1-indexed rows
         _f_unres = f'$G${res_row + 2}'
         _f_total = f'({_f_res}+{_f_unres})'
     ws.write(row, 0, 'Resolved',   lbl_fmt)
@@ -1526,7 +1569,7 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     _trend_note = (
         ' \u2018Resolved\u2019 = confirmed this period (patch evidence / Status=RESOLVED) '
         '+ INFERRED (unresolved last report, absent this period \u2014 verify against a patch '
-        'report if uncertain; see \u2018Resolved Since Previous Report\u2019 for the underlying rows).'
+        'report if uncertain).'
         if trend_data else
         ' No previous report was supplied, so \u2018Resolved\u2019 reflects confirmed evidence only '
         '(patch data / Status=RESOLVED). Pass --previous to also infer resolutions from CVEs that '
@@ -1538,6 +1581,97 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
                    f'{_trend_note}',
                    note_fmt)
     ws.set_row(row, 60); row += 2
+
+    # ── N-Day Exposure Age (advanced preview) ────────────────────────────────────
+    # How long unresolved detections have been sitting. Age source, in order:
+    # 'N Days Exposed' (patch-match runs), else 'First detected' /
+    # 'Date Published' parsed against the current date.
+    if advanced_summary:
+        from formatting import get_band_formats
+        _age_days = None
+        _age_src  = None
+        if 'N Days Exposed' in triage_dedup.columns:
+            _age_days = pd.to_numeric(triage_dedup['N Days Exposed'], errors='coerce')
+            _age_src  = 'N Days Exposed'
+        else:
+            for _dc in ('First detected', 'Date Published'):
+                if _dc in triage_dedup.columns:
+                    _dts = pd.to_datetime(triage_dedup[_dc], errors='coerce', dayfirst=True)
+                    if _dts.notna().any():
+                        _age_days = (pd.Timestamp.now() - _dts).dt.days
+                        _age_src  = _dc
+                        break
+
+        ws.merge_range(row, 0, row, 3, '  N-Day Exposure Age  \u26a0 advanced preview', sect_fmt)
+        row += 1
+        if _age_days is None:
+            ws.merge_range(row, 0, row, 3,
+                           '\u2139  No age source in this export — needs a '
+                           "'First detected' column or a patch-match run "
+                           "(which adds 'N Days Exposed').", note_fmt)
+            row += 2
+        else:
+            _bands = get_band_formats(workbook)
+            _age_unres = ~_compute_resolved_series(triage_dedup)
+            _age_kev   = (triage_dedup['CISA KEV'].astype(str).str.strip().str.lower()
+                          .isin(['yes', 'y', 'true', '1'])
+                          if 'CISA KEV' in triage_dedup.columns
+                          else pd.Series(False, index=triage_dedup.index))
+            ws.write(row, 0, 'Age band',               _bands['header'])
+            ws.write(row, 1, 'Unresolved detections',  _bands['header'])
+            ws.write(row, 2, 'Unique CVEs',            _bands['header'])
+            ws.write(row, 3, 'Unresolved KEV CVEs',    _bands['header'])
+            row += 1
+            for _lbl, _fmt, _lo, _hi in [
+                ('90+ days',   _bands['critical'], 90,   None),
+                ('60\u201389 days', _bands['high'],     60,   90),
+                ('30\u201359 days', _bands['amber'],    30,   60),
+                ('Under 30 days',    _bands['ok'],        None, 30),
+            ]:
+                _m = _age_unres & _age_days.notna()
+                if _lo is not None: _m &= _age_days >= _lo
+                if _hi is not None: _m &= _age_days < _hi
+                _sub = triage_dedup[_m]
+                ws.write(row, 0, _lbl, _fmt)
+                ws.write(row, 1, int(_m.sum()), val_fmt)
+                ws.write(row, 2, int(_sub['Vulnerability Name'].nunique()) if not _sub.empty else 0, val_fmt)
+                ws.write(row, 3, int(_sub.loc[_age_kev[_m.index][_m], 'Vulnerability Name'].nunique())
+                                 if not _sub.empty else 0, val_fmt)
+                row += 1
+            _unknown = int((_age_unres & _age_days.isna()).sum())
+            if _unknown:
+                ws.write(row, 0, 'Unknown age', _bands['label'])
+                ws.write(row, 1, _unknown, val_fmt)
+                row += 1
+            ws.merge_range(row, 0, row, 3,
+                           f'\u2139  Age source: {_age_src}. Unresolved rows only, '
+                           'active scope, deduplicated per product. Fixed at generation.',
+                           note_fmt)
+            row += 2
+
+    # ── Top Patch-Gap Root Causes (advanced preview) ─────────────────────────────
+    # Why patches aren't landing — same classification the diagnostics
+    # sheets use, summarised for the client.
+    if advanced_summary and root_cause_counts:
+        _RC_LABELS = {
+            'coverage_gap':       'Coverage gap — device not in patch report',
+            'unmanaged_app':      'Unmanaged app — product not tracked in patch report',
+            'detection_mismatch': 'Detection mismatch — CVE detected but no matching patch found',
+            'patch_installing':   'Patch installing — awaiting next RMM sync',
+        }
+        ws.merge_range(row, 0, row, 1, '  Top Patch-Gap Root Causes  \u26a0 advanced preview', sect_fmt)
+        row += 1
+        ws.write(row, 0, 'Root cause',       hdr_fmt)
+        ws.write(row, 1, 'Device-CVE pairs', hdr_fmt)
+        row += 1
+        for _cause, _cnt in sorted(root_cause_counts.items(), key=lambda x: -x[1]):
+            ws.write(row, 0, _RC_LABELS.get(_cause, str(_cause)), lbl_fmt)
+            ws.write(row, 1, int(_cnt), val_fmt)
+            row += 1
+        ws.merge_range(row, 0, row, 3,
+                       '\u2139  From patch-evidence matching — see the diagnostics '
+                       'sheets for per-device detail.', note_fmt)
+        row += 2
 
     # ── Device Breakdown (active scope) — unique device counts ───────────────────
     ws.merge_range(row, 0, row, 3,
@@ -1679,11 +1813,7 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
                     _seen.add(_r.Name); _top.append(_r)
                 if len(_top) >= 10: break
 
-            _approaching = approaching_stale_names or set()
             _check_active = patch_check_active_names or set()
-            _td_approach   = workbook.add_format({'border': 1, 'bg_color': '#FFF3E0', 'font_color': '#7B3F00'})
-            _td_approach_r = workbook.add_format({'border': 1, 'bg_color': '#FFF3E0', 'font_color': '#7B3F00',
-                                                   'align': 'right', 'num_format': '#,##0'})
             _td_chkfail    = workbook.add_format({'border': 1, 'bg_color': '#E4DFEC', 'font_color': '#4C3B6E'})
             _td_chkfail_r  = workbook.add_format({'border': 1, 'bg_color': '#E4DFEC', 'font_color': '#4C3B6E',
                                                    'align': 'right', 'num_format': '#,##0'})
@@ -1693,19 +1823,16 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
             for _r in _top:
                 _srv        = 'server' in str(_r.device_type).lower()
                 _exp        = str(_r.has_exploit).strip().lower() == 'yes'
-                _near_stale = _r.Name in _approaching
                 _chk_fail   = bool(_check_active) and _norm_dev_name(_r.Name) in _check_active
                 if _exp:
                     _bf, _nf = _td_exp, _td_exp_r
                 elif _chk_fail:
                     _bf, _nf = _td_chkfail, _td_chkfail_r
-                elif _near_stale:
-                    _bf, _nf = _td_approach, _td_approach_r
                 elif _srv:
                     _bf, _nf = _td_srv, _td_srv_r
                 else:
                     _bf, _nf = _td, _td_r
-                _prefix     = '\U0001f527 ' if _chk_fail else ('⚠ ' if _near_stale else '')
+                _prefix     = '\U0001f527 ' if _chk_fail else ''
                 _name_label = f'{_prefix}{_r.Name}'
                 _days_val   = int(_r.days_since) if hasattr(_r, 'days_since') and not (isinstance(_r.days_since, float) and pd.isna(_r.days_since)) else ''
                 ws.write(row, 0, _name_label,               _bf)
@@ -1717,10 +1844,6 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
                 ws.write(row, 6, _days_val,                  _nf)
                 row += 1
 
-            _approach_note = (
-                f'  🟧 Orange = offline \u2265 {stale_warning_days}d (⚠ prefix on name).  '
-                if _approaching else ''
-            )
             _chkfail_note = (
                 '  \U0001f7ea Purple = active device failing its RMM Patch Status Check '
                 '(\U0001f527 prefix on name) — see Patch Check Failures sheet.  '
@@ -1728,7 +1851,6 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
             )
             ws.merge_range(row, 0, row, 6,
                 f'ℹ  🟡 Amber = Server.  🟥 Red = known exploit.  '
-                f'{_approach_note}'
                 f'{_chkfail_note}'
                 f'Up to 10 devices. Unresolved CVE counts only.',
                 note_fmt)
@@ -1742,24 +1864,33 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
     ws.set_column('C:C', 18); ws.set_column('D:D', 14); ws.set_column('E:E', 22)
     ws.set_column('F:F', 24); ws.set_column('G:G', 20)
 
-    # CVSS Score Split -- TODO: re-enable when layout is agreed
-    # (block commented out; score_split_data/start/end stubs kept for
-#  any downstream code that references these variables)
-    score_split_start = row
-    score_split_data  = []
-    score_split_end   = row - 1
-
     # Month-over-Month
-    mom_start_row=None; mom_data=[]
     if trend_data:
         m=trend_data['metrics']
         row+=1
         ws.merge_range(row,0,row,3,'  Month-over-Month Patching Progress',sect_fmt); row+=1
-        mom_start_row=row
         ws.write(row,0,'Metric',hdr_fmt); ws.write(row,1,'Count',hdr_fmt)
         ws.write(row,2,'Direction',hdr_fmt); ws.write(row,3,'',hdr_fmt); row+=1
+        # 'Device+CVE pairs cleared' and 'CVE types fully cleared' are the
+        # full-scope figures (same population as the Remediation Summary above,
+        # including products retired entirely between reports). The old
+        # headline here was resolved_cve_count — common-product scope — which
+        # legitimately reads 0 whenever every fully-cleared CVE type left with
+        # a retired product, or fleet growth re-seeded old types onto new
+        # devices, burying a month of real patching under "no change".
         for label,value,good in [
-            ('CVE types resolved / patched',    m.get('resolved_cve_count',0),   True),
+            ('Device+CVE pairs cleared (patched)',
+                 m.get('cleared_previous_unresolved_count',0),        True),
+            ('CVE types fully cleared',
+                 m.get('cve_types_fully_cleared_count',
+                       m.get('resolved_cve_count',0)),                True),
+            # Pairs RESOLVED in current but absent from the previous report
+            # entirely — detected AND patched between reports. Disjoint from
+            # 'pairs cleared' above (those were previously unresolved). Reads 0
+            # when the current input is an unresolved-only export, since the
+            # RESOLVED rows needed to detect it aren't in the file.
+            ('Detected & patched within period',
+                 m.get('patched_within_period_count',0),              True),
             ('CVE types newly introduced',       m.get('new_cve_count',0),        False),
             ('CVE types persisting (unpatched)', m.get('persisting_cve_count',0), False),
             ('Devices fully remediated',         m.get('remediated_devices',0),   True),
@@ -1770,7 +1901,14 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
             else:
                 vf=red_fmt if value>0 else val_fmt; ds=f'\u25b2  {value:,}  (increase)'    if value>0 else '\u2014  no change'; df2=trend_dn if value>0 else trend_eq
             ws.write(row,0,label,lbl_fmt); ws.write(row,1,value,vf); ws.merge_range(row,2,row,3,ds,df2)
-            mom_data.append((label,value)); row+=1
+            row+=1
+        _retired = m.get('retired_products') or []
+        if _retired:
+            _shown = ', '.join(_retired[:4]) + (f'  +{len(_retired)-4} more' if len(_retired) > 4 else '')
+            ws.merge_range(row,0,row,3,
+                f'\u2714  Product(s) retired since previous report (all their CVEs cleared): {_shown}',
+                note_fmt)
+            row+=1
 
     row+=1
     ws.write(row,0,'\u2139  All Key Metrics exclude stale devices and devices not found in RMM. '

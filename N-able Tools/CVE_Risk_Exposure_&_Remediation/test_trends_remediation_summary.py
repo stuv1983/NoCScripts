@@ -161,3 +161,46 @@ def test_zero_previous_pairs_gives_zero_percent_not_a_crash():
     m = trend['metrics']
     assert m['previous_unresolved_pair_count'] == 0
     assert m['cleared_previous_unresolved_pct'] == 0.0
+
+# ── Detected & patched within period ─────────────────────────────────────────
+# Pairs RESOLVED in the current report that never appeared in the previous
+# report at all. Disjoint from cleared_previous_unresolved_count.
+
+def test_patched_within_period_counts_resolved_pair_absent_from_previous():
+    """(DEV9, CVE-0009) never existed in prev; arrives in current already
+    RESOLVED — detected and patched between reports. Count = 1, and it must
+    not leak into the unresolved-pair arithmetic."""
+    cur = _df(CUR_ROWS + [
+        {'Name': 'DEV9', 'Vulnerability Name': 'CVE-2026-0009',
+         'Affected Products': 'Google Chrome', 'Base Product': 'Google Chrome',
+         'Vulnerability Score': 9.0, 'Threat Status': 'RESOLVED'},
+    ])
+    trend = compute_trends(cur, _df(PREV_ROWS), threshold=9.0, prev_source_type='dashboard')
+    m = trend['metrics']
+    assert m['patched_within_period_count'] == 1
+    # unchanged unresolved arithmetic
+    assert m['current_unresolved_pair_count'] == 3
+    assert (m['previous_unresolved_pair_count'] - m['cleared_previous_unresolved_count']
+            + m['new_unresolved_pair_count'] == m['current_unresolved_pair_count'])
+
+
+def test_patched_within_period_excludes_pairs_seen_in_previous_report():
+    """(DEV1, CVE-0002) was unresolved in prev; showing it RESOLVED in current
+    must NOT count here — it's already credited as 'cleared'. No double credit."""
+    cur = _df(CUR_ROWS + [
+        {'Name': 'DEV1', 'Vulnerability Name': 'CVE-2026-0002',
+         'Affected Products': 'Google Chrome', 'Base Product': 'Google Chrome',
+         'Vulnerability Score': 9.0, 'Threat Status': 'RESOLVED'},
+    ])
+    trend = compute_trends(cur, _df(PREV_ROWS), threshold=9.0, prev_source_type='dashboard')
+    m = trend['metrics']
+    assert m['patched_within_period_count'] == 0
+    # still counted as cleared exactly once
+    assert m['cleared_previous_unresolved_count'] == 2
+
+
+def test_patched_within_period_zero_for_unresolved_only_current_export():
+    """Current input with no RESOLVED rows (unresolved-only export) — nothing
+    to detect the case from, so the metric degrades to 0, not a crash."""
+    trend = _compute()
+    assert trend['metrics']['patched_within_period_count'] == 0
