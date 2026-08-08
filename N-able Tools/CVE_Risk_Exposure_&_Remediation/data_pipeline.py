@@ -1028,13 +1028,25 @@ def process_patch_match(patch_path, cve_df, min_score=9.0):
     # ── Patch Evidence Status (vectorised) ───────────────────────────────────
     _vcr_s   = best['Version Check Result'].astype(str).str.strip()
     _inst_dt = pd.to_datetime(best['Patch Install Date'], errors='coerce')
-    _cve_dates_max = best[['First detected', 'Date Published']].apply(
-        lambda col: pd.to_datetime(
-            col.astype(str).str.replace(' UTC', '', regex=False),
-            errors='coerce', utc=True
-        ).dt.tz_localize(None) if col.name in best.columns else pd.NaT,
-        axis=0,
-    ).max(axis=1)
+    # Anchor date for patch evidence: the latest of the CVE's own detection /
+    # publication dates. Select only the columns actually present — N-able
+    # export shapes vary and some ship neither ('Last scanned' instead of
+    # 'First detected', and no 'Date Published' until cve_lookup enriches it).
+    # Indexing both unconditionally raised KeyError and killed the entire
+    # patch run before a single pair was produced; the in-lambda
+    # `col.name in best.columns` check never ran because the frame selection
+    # above it had already failed.
+    _date_cols = [c for c in ('First detected', 'Date Published') if c in best.columns]
+    if _date_cols:
+        _cve_dates_max = best[_date_cols].apply(
+            lambda col: pd.to_datetime(
+                col.astype(str).str.replace(' UTC', '', regex=False),
+                errors='coerce', utc=True
+            ).dt.tz_localize(None),
+            axis=0,
+        ).max(axis=1)
+    else:
+        _cve_dates_max = pd.Series(pd.NaT, index=best.index)
 
     best['Patch Evidence Status'] = _vec_pes(_status_s, _vcr_s, _inst_dt, _cve_dates_max)
 

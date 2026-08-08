@@ -31,6 +31,7 @@ from data_pipeline import (
     load_browser_audit, merge_browser_audit_into_drift,
 )
 from diagnostics import compute_patch_diagnostics, classify_root_cause
+from resolution import reconcile_patch_evidence
 import snapshot as snap_store
 from excel_builder import (
     get_workbook_styles,
@@ -108,6 +109,11 @@ class DashboardRequest:
     skip_rmm:             bool           = False
     patch_path:           Optional[str]  = None
     include_patch:        bool           = False
+    # Opt-in: let patch evidence resolve a CVE the detections export still
+    # shows as UNRESOLVED. N-able's scanner can lag a patch install by a full
+    # rescan cycle, so a stale UNRESOLVED is not proof the CVE is still open.
+    # Off by default — the scanner stays authoritative unless asked otherwise.
+    trust_patch_evidence: bool           = False
     failure_report_path:  Optional[str]  = None
     include_failure_report: bool         = False
     patch_check_report_path: Optional[str] = None
@@ -258,6 +264,21 @@ def run(request: DashboardRequest) -> DashboardResult:
             log.info("CISA KEV enrichment: %d row(s) flagged against the KEV catalog", _kev_flagged)
         except Exception as _e:
             log.warning("CISA KEV enrichment skipped: %s", _e)
+
+        # ── CVE publication date enrichment ──────────────────────────────────
+        # Supplies 'Date Published' from the local cvelistV5 clone. Nothing
+        # else in the pipeline creates this column, and N-able exports don't
+        # ship it — without this, process_patch_match's Patch Evidence Status
+        # has no anchor date to compare the patch install date against and
+        # every row falls through to 'Unresolved'. Allowed to fail
+        # independently: a missing anchor just means no patch evidence, which
+        # is the pre-existing behaviour.
+        try:
+            from cve_lookup import enrich_date_published
+            _pub_filled = enrich_date_published(df_vuln, cve_repo_path=_cve_repo)
+            log.info("CVE publication dates: %d row(s) filled from local corpus", _pub_filled)
+        except Exception as _e:
+            log.warning("CVE publication date enrichment skipped: %s", _e)
 
         df_rmm = None
         if not request.skip_rmm and request.rmm_path:
@@ -433,8 +454,11 @@ def run(request: DashboardRequest) -> DashboardResult:
                     customer_name = vals.iloc[0]
                     break
 
-        patch_resolved_pairs: Set[Tuple[str, str, str]] = set() 
+        patch_resolved_pairs: Set[Tuple[str, str, str]] = set()
         patch_gap_pairs:      dict[Tuple[str, str], str] = {}
+        # Device-CVE pairs resolved from patch evidence over a still-UNRESOLVED
+        # scanner status (only ever non-zero with trust_patch_evidence enabled).
+        patch_evidence_override_count: int = 0
         diagnostics: dict = {'patch_lag_df': pd.DataFrame(),
                              'version_drift_df': pd.DataFrame(),
                              'root_cause_df': pd.DataFrame()}
@@ -538,17 +562,54 @@ def run(request: DashboardRequest) -> DashboardResult:
                         _raw_res['Affected Products'].astype(str).apply(_dp_detect_raw),
                     ))
 
-        # Step 1: strip false positives from patch tool memory.
-        # If the scanner says UNRESOLVED for (device, cve), remove every matching pair.
-        if _unresolved_pairs_2d and patch_resolved_pairs:
-            to_remove = {p for p in patch_resolved_pairs if (p[0], p[1]) in _unresolved_pairs_2d}
-            if to_remove:
-                patch_resolved_pairs -= to_remove
-                log.info(
-                    "Scanner override: removed %d pair(s) from patch_resolved_pairs "
-                    "because raw_df still shows UNRESOLVED — will render as red ☐",
-                    len(to_remove),
-                )
+        # Step 1: reconcile patch evidence against what the scanner still says.
+        #
+        # Patch evidence only ever CHANGES an outcome for a (device, cve) the
+        # scanner reports UNRESOLVED — if the export already says RESOLVED,
+        # resolution.py source 2 resolves the row on its own. So stripping
+        # every UNRESOLVED-overlapping pair (the original unconditional
+        # behaviour, CHANGELOG v0.24 "UNRESOLVED always wins") removed exactly
+        # the pairs the patch report exists to contribute, making its net
+        # effect on resolution status zero.
+        #
+        # Which side wins is now the caller's choice:
+        #   trust_patch_evidence=False (default) — scanner wins, as before.
+        #   trust_patch_evidence=True            — patch evidence wins, because
+        #       N-able can lag a patch install by a full rescan cycle and a
+        #       stale UNRESOLVED is not proof the CVE is still open.
+        #
+        # The opt-in is not a blanket "trust anything the patch tool said":
+        # patch_resolved_pairs only contains rows _vec_pes already qualified as
+        # installed AND version-compliant AND installed on/after the CVE's own
+        # publication/detection date. A pair that survives here has affirmative
+        # evidence, not merely an absence of contradiction — which is what
+        # keeps v0.24's false-positive concern (stale cache entries, mismatched
+        # patch records, product-name formatting drift) addressed.
+        _before_reconcile = len(patch_resolved_pairs)
+        patch_resolved_pairs, patch_evidence_override_count = reconcile_patch_evidence(
+            patch_resolved_pairs, _unresolved_pairs_2d,
+            trust_patch_evidence=request.trust_patch_evidence,
+        )
+        _dropped = _before_reconcile - len(patch_resolved_pairs)
+        if _dropped:
+            log.info(
+                "Scanner override: removed %d pair(s) from patch_resolved_pairs "
+                "because raw_df still shows UNRESOLVED — will render as red ☐ "
+                "(enable trust_patch_evidence to let patch evidence win instead)",
+                _dropped,
+            )
+        if patch_evidence_override_count:
+            log.info(
+                "Patch evidence override: %d device-CVE pair(s) resolved from the patch "
+                "report despite the detections export still showing UNRESOLVED "
+                "(scanner lag) — will render as ☑",
+                patch_evidence_override_count,
+            )
+            warnings.append(
+                f"{patch_evidence_override_count} CVE(s) marked resolved from patch "
+                f"evidence while the detections export still shows UNRESOLVED — "
+                f"N-able rescan pending"
+            )
 
         # Step 2: inject raw RESOLVED pairs — only runs when export has no status column
         # (otherwise source 2 in build_product_sheets handles it per-row at zero overhead).

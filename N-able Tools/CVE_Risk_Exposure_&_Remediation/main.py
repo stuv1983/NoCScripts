@@ -196,6 +196,7 @@ def process_reports():
         skip_rmm               = skip_rmm,
         patch_path             = patch_path or None,
         include_patch          = include_patch,
+        trust_patch_evidence   = include_patch and trust_patch_evidence_var.get(),
         failure_report_path    = failure_var.get() or None,
         include_failure_report = include_failure_var.get(),
         browser_audit_path     = browser_audit_var.get() or None,
@@ -457,6 +458,16 @@ def open_advanced_dialog():
     #
     # ctk.CTkCheckBox(dlg, text="Include Patch Report matching",
     #                 variable=include_patch_var, command=_toggle_p).pack(anchor="w", padx=16)
+    #
+    # _tpe = ctk.CTkCheckBox(dlg, text="Trust patch evidence over a stale UNRESOLVED status",
+    #                        variable=trust_patch_evidence_var)
+    # _tpe.pack(anchor="w", padx=32)
+    # Tooltip(_tpe, "N-able's scanner can lag a patch install by a full rescan cycle, so a "
+    #               "CVE can still show UNRESOLVED in the detections export after it has "
+    #               "actually been patched. Enable to let the patch report resolve those "
+    #               "rows. Only applies where the patch report proves the update installed "
+    #               "AND version-compliant AND installed on/after the CVE was published — "
+    #               "an absence of contradiction is never enough on its own.")
     #
     # ctk.CTkLabel(dlg, text="Patch Failure Report  (CSV)",
     #              font=ctk.CTkFont(weight="bold")).pack(anchor="w", **PAD)
@@ -740,6 +751,9 @@ failure_var = tk.StringVar()
 browser_audit_var = tk.StringVar()
 patch_check_var = tk.StringVar()
 include_patch_var = tk.BooleanVar()
+# Opt-in: let patch evidence resolve CVEs the detections export still shows as
+# UNRESOLVED (N-able scanner lag). Only meaningful alongside include_patch_var.
+trust_patch_evidence_var = tk.BooleanVar()
 include_failure_var = tk.BooleanVar()
 include_browser_audit_var = tk.BooleanVar()
 include_patch_check_var = tk.BooleanVar()

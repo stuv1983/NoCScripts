@@ -606,6 +606,8 @@ The stale Excluded Devices sheet `Reason` column distinguishes the two causes: `
 
 Rule: **UNRESOLVED always wins.** If the scanner shows UNRESOLVED for a (device, cve), no patch evidence — regardless of source — can override it to blue.
 
+> **Superseded by v0.31.** This rule was unconditional, and Step 1 therefore removed exactly the pairs the patch report exists to contribute — patch evidence only ever changes an outcome where the scanner says UNRESOLVED, so its net effect on resolution status was zero. Step 1 is now `resolution.reconcile_patch_evidence()` and the rule holds only under the default `trust_patch_evidence=False`.
+
 ---
 
 ### v0.25 — Device Inventory Sheet
@@ -717,6 +719,28 @@ Verified: 88/88 tests pass; a 70-sheet workbook shows identical score/grade valu
 - **KEV penalty display row is live too** — shows `=IF($E$11>0, −pts, 0)` so the −1 visibly clears alongside the score, with the label updated to "lifts when all KEV rows are ☑". The footnote now states the cap/penalty lift behaviour instead of claiming all penalties are fixed.
 
 Verified: 88/88 tests pass. A KEV-bearing, no-patch-report workbook recalculates to score 58 / grade D with cap and −2 penalty active while KEV rows remain ☐, and to score 100 / grade A with the penalty at 0 once every row is marked ☑.
+
+---
+
+### v0.31 — Patch Evidence vs. Stale Scanner Status (opt-in `trust_patch_evidence`)
+
+**Files:** `orchestrator.py`, `resolution.py`, `data_pipeline.py`, `cve_lookup.py`, `run_dashboard.py`, `main.py`
+
+**Problem:** N-able's scanner can lag a patch install by a full rescan cycle, so a CVE keeps reading UNRESOLVED in the detections export after the update has actually landed. The `patch_resolved_pairs` machinery was built to correct for exactly this, but three independent defects sat on that path and the patch report's net contribution to resolution status was **zero**:
+
+1. **The v0.24 override was self-defeating.** Patch evidence can only ever *change* an outcome for a `(device, cve)` the scanner calls UNRESOLVED — where the export already says RESOLVED, `compute_resolved_flags()` source 2 resolves the row anyway. So v0.24's unconditional strip removed precisely the pairs the feature exists to contribute. Verified end-to-end on a device patched 1-Mar for a CVE published 15-Jan: 1 pair built, 1 pair stripped, 0 surviving.
+2. **`process_patch_match()` crashed on real exports.** It selected `best[['First detected', 'Date Published']]` unconditionally while the guarded loop 60 lines above tolerated either being absent. The N-able detections export ships `Last scanned` and neither of those, so enabling `--patch` raised `KeyError` and killed the run before a single pair was built. The in-lambda `col.name in best.columns` check never ran — the frame selection above it had already failed.
+3. **`Date Published` was never populated.** Nothing in the pipeline created the column; it was only ever consumed. `_vec_pes` bails to `'Unresolved'` whenever its anchor date is NaT, so even past the crash no evidence could be produced.
+
+**Fix:**
+- **`resolution.reconcile_patch_evidence()`** — new single source of truth for what happens when the two sources disagree, extracted from the inline orchestrator block so it is unit-testable. Contested pairs are matched on the `(device, cve)` 2-tuple so product-string drift can't cause a miss in either direction. Returns surviving pairs plus a distinct-`(device, cve)` override count.
+- **`DashboardRequest.trust_patch_evidence`** (default `False`) — off by default, so v0.24's behaviour is unchanged unless asked for. Exposed as `--trust-patch-evidence` (CLI, requires `--patch`) and a GUI checkbox. When on, contested pairs survive and the run emits a warning naming the count, so an overridden row is never silently resolved.
+- **Guarded date selection** in `process_patch_match()` — either date column alone now suffices; with neither, the anchor is NaT and evidence **fails closed** to `'Unresolved'`.
+- **`cve_lookup.enrich_date_published()`** — fills `Date Published` from `cveMetadata.datePublished` in the local cvelistV5 clone, one corpus read per distinct CVE rather than per row, never overwriting a genuine date the export supplied. Deliberately does **not** fall back to a scan timestamp like `Last scanned`: that tracks the report date, so `install_date >= anchor` would be false for every genuinely-patched device and would suppress the exact rows this feature surfaces.
+
+Rule, restated: **UNRESOLVED wins by default; patch evidence wins only when explicitly trusted.** The opt-in is not "trust anything the patch tool said" — `patch_resolved_pairs` only ever holds rows `_vec_pes` qualified as installed AND version-compliant AND installed on/after the CVE's own publication date, so a surviving pair carries affirmative evidence rather than a mere absence of contradiction. That is what keeps v0.24's original false-positive concern (stale cache entries, mismatched patch records, product-name drift) answered.
+
+Verified: 13 new tests in `test_patch_evidence_override.py`, 98/98 existing tests still pass. Against the real 1.19M-row sample export, `enrich_date_published()` fills publication dates from the vendored corpus; rows whose CVE isn't in the local clone yet stay NaT and fail closed.
 
 ---
 

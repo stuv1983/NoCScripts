@@ -1365,6 +1365,70 @@ def enrich_cisa_kev(df: 'pd.DataFrame', config_path: Optional[str] = None,
     return int(_flag.sum())
 
 
+def enrich_date_published(df: 'pd.DataFrame', cve_repo_path=None,
+                           cve_col: str = 'Vulnerability Name') -> int:
+    """
+    Populate df['Date Published'] from cveMetadata.datePublished in the local
+    cvelistV5 clone, without overwriting a genuine date the source export
+    already supplied.
+
+    Nothing else in the pipeline ever creates this column — it was only ever
+    consumed (process_patch_match's Patch Evidence Status anchor, N Days
+    Exposed, the trend sort fallback). N-able detection exports don't ship it,
+    so on those exports every consumer silently saw NaT: _vec_pes bails to
+    'Unresolved' whenever the anchor date is missing, which meant patch
+    evidence could never be produced at all regardless of how clean the patch
+    report was.
+
+    The anchor must be the date the CVE became *known*, not the date the
+    device was last looked at — do not be tempted to fall back to a scan
+    timestamp like 'Last scanned'. That column tracks the report date, so
+    `install_date >= anchor` would be false for every genuinely-patched
+    device and would suppress the exact rows this feature exists to surface.
+    A missing anchor is the honest answer; it fails closed.
+
+    Returns the number of rows whose date was filled in from the corpus.
+    """
+    import pandas as pd
+    from data_pipeline import extract_cve_id
+
+    if not cve_repo_path or df is None or df.empty or cve_col not in df.columns:
+        return 0
+
+    _ids = df[cve_col].astype(str).apply(extract_cve_id).str.upper()
+
+    if 'Date Published' in df.columns:
+        _existing = pd.to_datetime(
+            df['Date Published'].astype(str).str.replace(' UTC', '', regex=False),
+            errors='coerce', utc=True).dt.tz_localize(None)
+    else:
+        _existing = pd.Series(pd.NaT, index=df.index)
+
+    # One corpus read per distinct CVE, not per row — a fleet export repeats
+    # the same CVE across hundreds of devices.
+    _need = sorted({c for c, have in zip(_ids, _existing.isna()) if have and c.startswith('CVE-')})
+    _dates: dict[str, object] = {}
+    for _cve in _need:
+        _data = _load_cve_org_local(_cve, cve_repo_path)
+        if not _data:
+            continue
+        _pub = (_data.get('cveMetadata') or {}).get('datePublished')
+        if _pub:
+            _ts = pd.to_datetime(str(_pub).replace('Z', '+00:00'), errors='coerce', utc=True)
+            if not pd.isna(_ts):
+                _dates[_cve] = _ts.tz_localize(None)
+
+    if not _dates:
+        log.debug("cve_lookup: no datePublished resolved from local corpus (%d CVE(s) checked)",
+                  len(_need))
+        return 0
+
+    _filled = _existing.fillna(_ids.map(_dates))
+    _n = int(_filled.notna().sum() - _existing.notna().sum())
+    df['Date Published'] = _filled
+    return _n
+
+
 # ==============================================================================
 # INTEGRATION WITH ORCHESTRATOR
 # ==============================================================================

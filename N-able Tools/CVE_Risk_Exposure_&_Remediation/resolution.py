@@ -117,6 +117,59 @@ def compute_resolved_flags(
     return res_bool
 
 
+def reconcile_patch_evidence(
+    patch_resolved_pairs: Optional[Set[tuple]],
+    unresolved_pairs_2d: Optional[Set[Tuple[str, str]]],
+    trust_patch_evidence: bool = False,
+) -> Tuple[Set[tuple], int]:
+    """
+    Decide what happens to patch evidence that the detections export
+    contradicts, returning (surviving_pairs, override_count).
+
+    A "contested" pair is one the patch report proved patched while the raw
+    export still reports the same (device, cve) as UNRESOLVED. The comparison
+    is deliberately 2-tuple: a product-string formatting difference must never
+    cause a contested pair to be missed in either direction.
+
+    Contested pairs are the ONLY pairs that matter. Patch evidence can only
+    ever change an outcome for a row the scanner calls UNRESOLVED — where the
+    export already says RESOLVED, compute_resolved_flags() source 2 resolves
+    the row on its own. So the original unconditional strip (CHANGELOG v0.24,
+    "UNRESOLVED always wins") removed precisely the pairs the patch report
+    exists to contribute, leaving its net effect on resolution status at zero.
+
+    trust_patch_evidence=False (default)
+        Scanner wins; contested pairs are dropped. Unchanged v0.24 behaviour.
+    trust_patch_evidence=True
+        Patch evidence wins; contested pairs survive. N-able can lag a patch
+        install by a full rescan cycle, so a stale UNRESOLVED is not proof the
+        CVE is still open.
+
+    Enabling the override is not "trust anything the patch tool said".
+    patch_resolved_pairs only ever contains rows _vec_pes already qualified as
+    installed AND version-compliant AND installed on/after the CVE's own
+    publication/detection date, so a surviving pair carries affirmative
+    evidence rather than a mere absence of contradiction — which is what keeps
+    v0.24's false-positive concern (stale cache entries, mismatched patch
+    records, product-name drift) answered.
+
+    override_count counts distinct (device, cve) pairs, not 3-tuples, so a CVE
+    spanning several product keys on one device is reported once.
+    """
+    pairs = set(patch_resolved_pairs or set())
+    unresolved = unresolved_pairs_2d or set()
+    if not pairs or not unresolved:
+        return pairs, 0
+
+    contested = {p for p in pairs if (p[0], p[1]) in unresolved}
+    if not contested:
+        return pairs, 0
+
+    if trust_patch_evidence:
+        return pairs, len({(p[0], p[1]) for p in contested})
+    return pairs - contested, 0
+
+
 def dedup_per_base_product(df: pd.DataFrame) -> pd.DataFrame:
     """
     Deduplicate df by (Name, Vulnerability Name) within each 'Base Product'
