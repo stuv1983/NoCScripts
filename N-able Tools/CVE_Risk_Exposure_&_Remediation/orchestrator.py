@@ -549,6 +549,7 @@ def run(request: DashboardRequest) -> DashboardResult:
 
         from data_pipeline import _detect_product as _dp_detect_raw
         _unresolved_pairs_2d: set = set()
+        _resolved_pairs_2d:   set = set()
         _raw_inject_pairs:    set = set()
 
         # When the export has a status column, build_product_sheets reads it
@@ -570,15 +571,25 @@ def run(request: DashboardRequest) -> DashboardResult:
                     _raw_unr['Vulnerability Name'].apply(extract_cve_id),
                 ))
 
+            _raw_res = raw_df[_col_upper == 'RESOLVED']
+
             # RESOLVED injection: only when the export has no status column (see above).
             if not _export_has_status_col:
-                _raw_res = raw_df[_col_upper == 'RESOLVED']
                 if not _raw_res.empty:
                     _raw_inject_pairs |= set(zip(
                         _raw_res['Name'].apply(normalize_device_name),
                         _raw_res['Vulnerability Name'].apply(extract_cve_id),
                         _raw_res['Affected Products'].astype(str).apply(_dp_detect_raw),
                     ))
+            elif not _raw_res.empty:
+                # Status column present, so source 2 already resolves these rows
+                # per-row. Collect them as 2-tuples so reconcile_patch_evidence
+                # can discard the (large, inert) patch pairs that duplicate them
+                # — see its docstring for the scale this matters at.
+                _resolved_pairs_2d |= set(zip(
+                    _raw_res['Name'].apply(normalize_device_name),
+                    _raw_res['Vulnerability Name'].apply(extract_cve_id),
+                ))
 
         # Step 1: reconcile patch evidence against what the scanner still says.
         #
@@ -604,11 +615,19 @@ def run(request: DashboardRequest) -> DashboardResult:
         # keeps v0.24's false-positive concern (stale cache entries, mismatched
         # patch records, product-name formatting drift) addressed.
         _before_reconcile = len(patch_resolved_pairs)
-        patch_resolved_pairs, patch_evidence_override_count = reconcile_patch_evidence(
+        (patch_resolved_pairs, patch_evidence_override_count,
+         _redundant_dropped) = reconcile_patch_evidence(
             patch_resolved_pairs, _unresolved_pairs_2d,
             trust_patch_evidence=request.trust_patch_evidence,
+            redundant_pairs_2d=_resolved_pairs_2d,
         )
-        _dropped = _before_reconcile - len(patch_resolved_pairs)
+        if _redundant_dropped:
+            log.info(
+                "Patch evidence: dropped %d redundant pair(s) the export already "
+                "reports RESOLVED (source 2 resolves those per-row) — %d pair(s) remain",
+                _redundant_dropped, len(patch_resolved_pairs),
+            )
+        _dropped = _before_reconcile - len(patch_resolved_pairs) - _redundant_dropped
         if _dropped:
             log.info(
                 "Scanner override: removed %d pair(s) from patch_resolved_pairs "

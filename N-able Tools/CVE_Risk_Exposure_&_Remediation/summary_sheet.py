@@ -1612,7 +1612,7 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
             row += 2
         else:
             _bands = get_band_formats(workbook)
-            _age_unres = ~_compute_resolved_series(triage_dedup)
+            _age_unres = _is_unr
             _age_kev   = (triage_dedup['CISA KEV'].astype(str).str.strip().str.lower()
                           .isin(['yes', 'y', 'true', '1'])
                           if 'CISA KEV' in triage_dedup.columns
@@ -1782,7 +1782,7 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         # rule build_product_sheets applies — guarantees this table can
         # never again show a different "unresolved" verdict for a CVE than
         # the product sheet the reader would go check it against.
-        _unr_df = triage_dedup[~_compute_resolved_series(triage_dedup)].copy()
+        _unr_df = triage_dedup[_is_unr].copy()
         if not _unr_df.empty:
             _agg = _unr_df.groupby('Name', as_index=False).agg(
                 cve_count   =('Vulnerability Name', 'nunique'),

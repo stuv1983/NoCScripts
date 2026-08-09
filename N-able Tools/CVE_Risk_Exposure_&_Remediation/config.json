@@ -1,5 +1,5 @@
 {
-  "_comment": "N-able CVE Dashboard — product configuration. Add rows to 'product_map' to match software N-able detects against patch report. Keys are lowercased substrings matched against the patch report product name; values are the internal canonical name. Entries are matched top-to-bottom — put more-specific strings before less-specific ones. 'fixed_version_rules' maps canonical_name ? {CVE-ID: minimum_fixed_version}.",
+  "_comment": "N-able CVE Dashboard \u2014 product configuration. Add rows to 'product_map' to match software N-able detects against patch report. Keys are lowercased substrings matched against the patch report product name; values are the internal canonical name. Entries are matched top-to-bottom \u2014 put more-specific strings before less-specific ones. 'fixed_version_rules' maps canonical_name ? {CVE-ID: minimum_fixed_version}.",
   "api": {
     "nvd_api_key": "9C2E062C-C745-F111-836A-129478FCB64D",
     "cvelistv5_path": "C:\\NoCScripts\\N-able Tools\\CVE_Risk_Exposure_&_Remediation\\cvelistV5"
@@ -7014,26 +7014,26 @@
     "firefox": [
       "Deploy Firefox update via RMM software deployment",
       "Enable Firefox auto-update policy via Group Policy (DisableAppUpdate = 0)",
-      "AppData installs (%APPDATA%\\Mozilla) bypass managed update — redeploy as SYSTEM install"
+      "AppData installs (%APPDATA%\\Mozilla) bypass managed update \u2014 redeploy as SYSTEM install"
     ],
     "chrome": [
       "Deploy Chrome update via RMM software deployment",
       "Verify Google Update service is running: services.msc ? gupdate/gupdatem",
       "Enforce update policy via Group Policy: Computer Config ? Google ? Update ? Auto-update",
-      "AppData installs (%LOCALAPPDATA%\\Google\\Chrome) bypass managed update — redeploy as SYSTEM"
+      "AppData installs (%LOCALAPPDATA%\\Google\\Chrome) bypass managed update \u2014 redeploy as SYSTEM"
     ],
     "edge": [
       "Run: winget upgrade Microsoft.Edge or deploy via RMM",
       "Check Microsoft Edge Update service status in services.msc",
-      "For AppData installs (%LOCALAPPDATA%\\Microsoft\\Edge) — redeploy as managed package"
+      "For AppData installs (%LOCALAPPDATA%\\Microsoft\\Edge) \u2014 redeploy as managed package"
     ],
     "vlc": [
       "Deploy VLC update via RMM software deployment",
-      "VLC has no background updater — manual or RMM deployment required on each affected device"
+      "VLC has no background updater \u2014 manual or RMM deployment required on each affected device"
     ],
     "ssms": [
       "Download latest SSMS from Microsoft and deploy via RMM",
-      "SSMS does not auto-update — schedule quarterly manual update cycle"
+      "SSMS does not auto-update \u2014 schedule quarterly manual update cycle"
     ]
   },
   "rmm_inventory_columns": {

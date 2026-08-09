@@ -109,10 +109,25 @@ def reconcile_patch_evidence(
     patch_resolved_pairs: Optional[Set[tuple]],
     unresolved_pairs_2d: Optional[Set[Tuple[str, str]]],
     trust_patch_evidence: bool = False,
-) -> Tuple[Set[tuple], int]:
+    redundant_pairs_2d: Optional[Set[Tuple[str, str]]] = None,
+) -> Tuple[Set[tuple], int, int]:
     """
     Decide what happens to patch evidence that the detections export
-    contradicts, returning (surviving_pairs, override_count).
+    contradicts, returning (surviving_pairs, override_count, redundant_dropped).
+
+    redundant_pairs_2d — (device, cve) pairs the export ALREADY reports
+    RESOLVED. Patch evidence for these changes nothing: compute_resolved_flags()
+    source 2 reads the status column per-row and resolves them anyway. They are
+    dropped first, because carrying them costs real time at fleet scale — a
+    ~1M-row export can produce ~450k patch-confirmed pairs of which only ~12%
+    are contested, and the set is re-split and re-scanned on every
+    compute_resolved_series() call during workbook writing. This is the same
+    reasoning the orchestrator already applies when it declines to inject raw
+    RESOLVED rows on an export that has a status column.
+
+    Only pass redundant_pairs_2d when the frames being rendered actually carry
+    a status column; without one, source 2 contributes nothing and dropping
+    these pairs would silently lose resolutions.
 
     A "contested" pair is one the patch report proved patched while the raw
     export still reports the same (device, cve) as UNRESOLVED. The comparison
@@ -146,16 +161,27 @@ def reconcile_patch_evidence(
     """
     pairs = set(patch_resolved_pairs or set())
     unresolved = unresolved_pairs_2d or set()
+
+    # Drop pairs the export already resolves on its own — see above.
+    redundant_dropped = 0
+    if pairs and redundant_pairs_2d:
+        _redundant = {p for p in pairs
+                      if (p[0], p[1]) in redundant_pairs_2d
+                      and (p[0], p[1]) not in unresolved}
+        if _redundant:
+            pairs -= _redundant
+            redundant_dropped = len(_redundant)
+
     if not pairs or not unresolved:
-        return pairs, 0
+        return pairs, 0, redundant_dropped
 
     contested = {p for p in pairs if (p[0], p[1]) in unresolved}
     if not contested:
-        return pairs, 0
+        return pairs, 0, redundant_dropped
 
     if trust_patch_evidence:
-        return pairs, len({(p[0], p[1]) for p in contested})
-    return pairs - contested, 0
+        return pairs, len({(p[0], p[1]) for p in contested}), redundant_dropped
+    return pairs - contested, 0, redundant_dropped
 
 
 def dedup_per_base_product(df: pd.DataFrame) -> pd.DataFrame:

@@ -99,7 +99,7 @@ class TestReconcilePatchEvidence:
 
     def test_scanner_wins_by_default(self):
         """Default behaviour is unchanged from v0.24 — contested pairs dropped."""
-        pairs, overrides = reconcile_patch_evidence(self.PAIRS, self.UNRESOLVED)
+        pairs, overrides, _ = reconcile_patch_evidence(self.PAIRS, self.UNRESOLVED)
 
         assert pairs == set(), "contested pair must be dropped when not trusting patch evidence"
         assert overrides == 0
@@ -109,7 +109,7 @@ class TestReconcilePatchEvidence:
         The bug: this pair is the ONLY kind that matters (patch says patched,
         scanner still says UNRESOLVED) and it was unconditionally deleted.
         """
-        pairs, overrides = reconcile_patch_evidence(
+        pairs, overrides, _ = reconcile_patch_evidence(
             self.PAIRS, self.UNRESOLVED, trust_patch_evidence=True)
 
         assert pairs == self.PAIRS, "patch evidence must survive a stale UNRESOLVED"
@@ -118,7 +118,7 @@ class TestReconcilePatchEvidence:
     def test_uncontested_pairs_survive_either_way(self):
         """A pair the scanner doesn't contradict is untouched, and isn't an override."""
         for trust in (False, True):
-            pairs, overrides = reconcile_patch_evidence(
+            pairs, overrides, _ = reconcile_patch_evidence(
                 self.PAIRS, {('WS02', 'CVE-2026-9999')}, trust_patch_evidence=trust)
 
             assert pairs == self.PAIRS
@@ -129,7 +129,7 @@ class TestReconcilePatchEvidence:
         Product-string drift must never let a contested pair slip through as
         resolved — the scanner's UNRESOLVED has no product key to compare.
         """
-        pairs, _ = reconcile_patch_evidence(
+        pairs, _, _ = reconcile_patch_evidence(
             {('WS01', 'CVE-2026-1234', 'chrome'),
              ('WS01', 'CVE-2026-1234', 'chrome-for-business')},
             self.UNRESOLVED,
@@ -139,7 +139,7 @@ class TestReconcilePatchEvidence:
 
     def test_override_count_is_distinct_device_cve(self):
         """One CVE spanning several product keys on a device counts once."""
-        _, overrides = reconcile_patch_evidence(
+        _, overrides, _ = reconcile_patch_evidence(
             {('WS01', 'CVE-2026-1234', 'chrome'),
              ('WS01', 'CVE-2026-1234', 'edge')},
             self.UNRESOLVED, trust_patch_evidence=True,
@@ -148,15 +148,73 @@ class TestReconcilePatchEvidence:
         assert overrides == 1
 
     def test_empty_inputs_are_safe(self):
-        assert reconcile_patch_evidence(None, None) == (set(), 0)
-        assert reconcile_patch_evidence(set(), self.UNRESOLVED) == (set(), 0)
-        assert reconcile_patch_evidence(self.PAIRS, set()) == (self.PAIRS, 0)
+        assert reconcile_patch_evidence(None, None) == (set(), 0, 0)
+        assert reconcile_patch_evidence(set(), self.UNRESOLVED) == (set(), 0, 0)
+        assert reconcile_patch_evidence(self.PAIRS, set()) == (self.PAIRS, 0, 0)
 
     def test_does_not_mutate_caller_set(self):
         original = set(self.PAIRS)
         reconcile_patch_evidence(original, self.UNRESOLVED)
 
         assert original == self.PAIRS, "input set must not be mutated in place"
+
+
+class TestRedundantPairDropping:
+    """
+    A ~1M-row export produced ~452k patch-confirmed pairs of which only ~57k
+    were contested; the other ~396k duplicated rows the export already reported
+    RESOLVED, which source 2 resolves per-row anyway. Carrying them changed no
+    output and made workbook writing crawl, since the set is re-split and
+    re-scanned on every compute_resolved_series() call.
+    """
+
+    def test_pair_already_resolved_by_export_is_dropped(self):
+        pairs, overrides, dropped = reconcile_patch_evidence(
+            {('WS01', 'CVE-2026-1234', 'chrome')},
+            unresolved_pairs_2d=set(),
+            redundant_pairs_2d={('WS01', 'CVE-2026-1234')},
+        )
+
+        assert pairs == set(), "a pair the export already resolves is inert — drop it"
+        assert (overrides, dropped) == (0, 1)
+
+    def test_contested_pair_is_never_dropped_as_redundant(self):
+        """
+        If the export reports the same (device, cve) both RESOLVED and
+        UNRESOLVED across rows, UNRESOLVED must win the redundancy test —
+        otherwise the pair is silently discarded and trust_patch_evidence
+        can never override it.
+        """
+        pairs, overrides, dropped = reconcile_patch_evidence(
+            {('WS01', 'CVE-2026-1234', 'chrome')},
+            unresolved_pairs_2d={('WS01', 'CVE-2026-1234')},
+            redundant_pairs_2d={('WS01', 'CVE-2026-1234')},
+            trust_patch_evidence=True,
+        )
+
+        assert pairs == {('WS01', 'CVE-2026-1234', 'chrome')}
+        assert (overrides, dropped) == (1, 0)
+
+    def test_unrelated_pairs_are_untouched(self):
+        pairs, _, dropped = reconcile_patch_evidence(
+            {('WS01', 'CVE-2026-1234', 'chrome')},
+            unresolved_pairs_2d=set(),
+            redundant_pairs_2d={('WS99', 'CVE-2026-0000')},
+        )
+
+        assert pairs == {('WS01', 'CVE-2026-1234', 'chrome')}
+        assert dropped == 0
+
+    def test_omitting_redundant_set_changes_nothing(self):
+        """
+        Callers on an export with no status column must not pass the set —
+        source 2 contributes nothing there, so dropping would lose resolutions.
+        """
+        pairs, _, dropped = reconcile_patch_evidence(
+            {('WS01', 'CVE-2026-1234', 'chrome')}, unresolved_pairs_2d=set())
+
+        assert pairs == {('WS01', 'CVE-2026-1234', 'chrome')}
+        assert dropped == 0
 
 
 # ===========================================================================
@@ -269,9 +327,9 @@ class TestStaleScannerEndToEnd:
             cve['Vulnerability Name'].apply(extract_cve_id),
         ))
 
-        kept, overrides = reconcile_patch_evidence(
+        kept, overrides, _ = reconcile_patch_evidence(
             pairs, unresolved_2d, trust_patch_evidence=True)
         assert kept == pairs and overrides == 1
 
-        dropped, no_overrides = reconcile_patch_evidence(pairs, unresolved_2d)
+        dropped, no_overrides, _ = reconcile_patch_evidence(pairs, unresolved_2d)
         assert dropped == set() and no_overrides == 0
