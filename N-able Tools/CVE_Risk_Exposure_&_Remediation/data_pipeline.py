@@ -1523,6 +1523,38 @@ def load_previous_report(file_path):
     return df, set(), 'raw_export'
 
 
+# Columns every trend computation indexes by. A frame with no rows at all is a
+# legitimate input — a first-ever report, or a period that cleared completely —
+# and pandas hands those back carrying no columns whatsoever, so a bare
+# df['Name'] raises KeyError before any of the empty-safe arithmetic below ever
+# gets a chance to run.
+_TREND_REQUIRED_COLS: dict[str, str] = {
+    'Name':                'object',
+    'Vulnerability Name':  'object',
+    'Affected Products':   'object',
+    'Base Product':        'object',
+    'Vulnerability Score': 'float64',
+}
+
+
+def _ensure_trend_columns(df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """
+    Return a copy of df with the trend key columns guaranteed to exist.
+
+    Deliberately only fills them in on an EMPTY frame. A frame that HAS rows
+    but is missing 'Name' is a genuine input error — load_previous_report()
+    validates for exactly that and raises a message naming the file — and must
+    keep raising here rather than being silently padded with blank columns,
+    which would turn a wrong input file into a plausible-looking zero trend.
+    """
+    out = pd.DataFrame() if df is None else df.copy()
+    if out.empty:
+        for col, dtype in _TREND_REQUIRED_COLS.items():
+            if col not in out.columns:
+                out[col] = pd.Series(dtype=dtype)
+    return out
+
+
 def _active_trend_scope(df: pd.DataFrame, threshold: float,
                         inventory_devices=None,
                         stale_devices=None,
@@ -1538,8 +1570,11 @@ def _active_trend_scope(df: pd.DataFrame, threshold: float,
       • Inventory filter (decommissioned devices dropped)
       • Stale filter (stale devices dropped completely from trend comparison)
       • Deduplication on (_Name_Key, _CVE_Key, _Product_Key)
+
+    An empty input frame yields an empty, correctly-keyed output frame rather
+    than raising — see _ensure_trend_columns().
     """
-    out = df.copy()
+    out = _ensure_trend_columns(df)
     out['_Name_Key']    = _normalize_device_col(out['Name'])
     out['_CVE_Key']     = out['Vulnerability Name'].astype(str).apply(extract_cve_id)
     out['_Product_Key'] = (
@@ -1622,7 +1657,7 @@ def compute_trends(current_df, previous_df, threshold,
     """
     _prev_is_raw = (prev_source_type == 'raw_export')
 
-    cur  = current_df.copy()
+    cur  = _ensure_trend_columns(current_df)
     cur['_Name_Key'] = cur['Name'].apply(normalize_device_name)
     cur['_CVE_Key']  = cur['Vulnerability Name'].apply(extract_cve_id)
 
@@ -1783,10 +1818,15 @@ def compute_trends(current_df, previous_df, threshold,
         if not _cur_res.empty:
             _cur_res_2d  = set(zip(_cur_res['_Name_Key'], _cur_res['_CVE_Key']))
             # ALL previous pairs, any status, no threshold — "not in the
-            # previous report" means not present there in any form.
+            # previous report" means not present there in any form. Read
+            # through _ensure_trend_columns: this branch is reached whenever
+            # the CURRENT export has a status column, which says nothing about
+            # the previous frame — a first-ever report pairs a full current
+            # export with an empty (column-less) previous one.
+            _prev_all = _ensure_trend_columns(previous_df)
             _prev_all_2d = set(zip(
-                _normalize_device_col(previous_df['Name']),
-                previous_df['Vulnerability Name'].astype(str).apply(extract_cve_id),
+                _normalize_device_col(_prev_all['Name']),
+                _prev_all['Vulnerability Name'].astype(str).apply(extract_cve_id),
             ))
             patched_within_period_count = len(_cur_res_2d - _prev_all_2d)
 
