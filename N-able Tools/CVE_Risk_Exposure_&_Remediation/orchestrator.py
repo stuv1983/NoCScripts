@@ -18,7 +18,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Set, Tuple
+from typing import List, Optional, Set, Tuple
 
 import pandas as pd
 
@@ -36,6 +36,7 @@ from data_pipeline import (
     load_browser_audit, merge_browser_audit_into_drift,
 )
 from diagnostics import compute_patch_diagnostics, classify_root_cause
+from resolution import reconcile_patch_evidence
 import snapshot as snap_store
 from summary_sheet import build_client_summary_sheet
 from trend_sheets import build_trend_detail_sheets  # trend summary worksheet removed
@@ -113,10 +114,23 @@ class DashboardRequest:
     rmm_path:             Optional[str]  = None
     skip_rmm:             bool           = False
     patch_path:           Optional[str]  = None
+    # Multiple per-client patch reports. When set, takes precedence over
+    # patch_path; files are concatenated by process_patch_match (the Client
+    # column disambiguates rows).
+    patch_paths:          Optional[List[str]] = None
     include_patch:        bool           = False
+    # Opt-in: let patch evidence resolve a CVE the detections export still
+    # shows as UNRESOLVED. N-able's scanner can lag a patch install by a full
+    # rescan cycle, so a stale UNRESOLVED is not proof the CVE is still open.
+    # Off by default — the scanner stays authoritative unless asked otherwise.
+    trust_patch_evidence: bool           = False
     failure_report_path:  Optional[str]  = None
     include_failure_report: bool         = False
     patch_check_report_path: Optional[str] = None
+    # Multiple per-client patch status check exports. When set, takes
+    # precedence over patch_check_report_path; files are concatenated by
+    # load_patch_check_report (Customer/Asset columns disambiguate rows).
+    patch_check_report_paths: Optional[List[str]] = None
     include_patch_check_report: bool     = False
     browser_audit_path:   Optional[str]  = None
     include_browser_audit: bool          = False
@@ -270,6 +284,21 @@ def run(request: DashboardRequest) -> DashboardResult:
         except Exception as _e:
             log.warning("CISA KEV enrichment skipped: %s", _e)
 
+        # ── CVE publication date enrichment ──────────────────────────────────
+        # Supplies 'Date Published' from the local cvelistV5 clone. Nothing
+        # else in the pipeline creates this column, and N-able exports don't
+        # ship it — without this, process_patch_match's Patch Evidence Status
+        # has no anchor date to compare the patch install date against and
+        # every row falls through to 'Unresolved'. Allowed to fail
+        # independently: a missing anchor just means no patch evidence, which
+        # is the pre-existing behaviour.
+        try:
+            from cve_lookup import enrich_date_published
+            _pub_filled = enrich_date_published(df_vuln, cve_repo_path=_cve_repo)
+            log.info("CVE publication dates: %d row(s) filled from local corpus", _pub_filled)
+        except Exception as _e:
+            log.warning("CVE publication date enrichment skipped: %s", _e)
+
         df_rmm = None
         if not request.skip_rmm and request.rmm_path:
             log.info("Loading RMM data: %s", request.rmm_path)
@@ -376,10 +405,13 @@ def run(request: DashboardRequest) -> DashboardResult:
             product_to_sheet[product] = clean_sheet_name(product, used_names)
 
         patch_data = None
-        if request.include_patch and request.patch_path:
-            log.info("Running patch match: %s", request.patch_path)
+        _patch_inputs = (list(request.patch_paths) if request.patch_paths
+                         else ([request.patch_path] if request.patch_path else []))
+        if request.include_patch and _patch_inputs:
+            log.info("Running patch match: %s", ', '.join(map(str, _patch_inputs)))
             p_ov, p_full, p_raw, tot_r, filt_r = process_patch_match(
-                request.patch_path, merged_df.copy(), min_score=request.threshold,
+                _patch_inputs if len(_patch_inputs) > 1 else _patch_inputs[0],
+                merged_df.copy(), min_score=request.threshold,
                 as_of_date=run_ts)
 
             # Contract: patch-match output — fails on threat-status leaking
@@ -412,6 +444,23 @@ def run(request: DashboardRequest) -> DashboardResult:
                 "Trend: %d new CVEs, %d resolved, %d persisting (common-product scope)",
                 m['new_cve_count'], m['resolved_cve_count'], m['persisting_cve_count'],
             )
+            # Pair-level remediation (full scope) — the headline figures. The
+            # common-product CVE-type counts above legitimately read "0 resolved"
+            # whenever fleet growth re-seeds old CVE types or clearances came
+            # from retired products, which buries real patching work.
+            log.info(
+                "Trend: %d of %d previous unresolved pairs cleared (%.1f%%), "
+                "%d new pairs, %d detected & patched within period; "
+                "%d CVE type(s) fully cleared full-scope%s",
+                m['cleared_previous_unresolved_count'],
+                m['previous_unresolved_pair_count'],
+                m['cleared_previous_unresolved_pct'] * 100,
+                m['new_unresolved_pair_count'],
+                m.get('patched_within_period_count', 0),
+                m.get('cve_types_fully_cleared_count', 0),
+                (' (retired products: %s)' % ', '.join(m['retired_products'])
+                 if m.get('retired_products') else ''),
+            )
             
             redetected_count = trend_data.get('redetected_count', 0)
             if redetected_count > 0:
@@ -428,8 +477,11 @@ def run(request: DashboardRequest) -> DashboardResult:
                     customer_name = vals.iloc[0]
                     break
 
-        patch_resolved_pairs: Set[Tuple[str, str, str]] = set() 
+        patch_resolved_pairs: Set[Tuple[str, str, str]] = set()
         patch_gap_pairs:      dict[Tuple[str, str], str] = {}
+        # Device-CVE pairs resolved from patch evidence over a still-UNRESOLVED
+        # scanner status (only ever non-zero with trust_patch_evidence enabled).
+        patch_evidence_override_count: int = 0
         diagnostics: dict = {'patch_lag_df': pd.DataFrame(),
                              'version_drift_df': pd.DataFrame(),
                              'root_cause_df': pd.DataFrame()}
@@ -497,6 +549,7 @@ def run(request: DashboardRequest) -> DashboardResult:
 
         from data_pipeline import _detect_product as _dp_detect_raw
         _unresolved_pairs_2d: set = set()
+        _resolved_pairs_2d:   set = set()
         _raw_inject_pairs:    set = set()
 
         # When the export has a status column, build_product_sheets reads it
@@ -518,27 +571,82 @@ def run(request: DashboardRequest) -> DashboardResult:
                     _raw_unr['Vulnerability Name'].apply(extract_cve_id),
                 ))
 
+            _raw_res = raw_df[_col_upper == 'RESOLVED']
+
             # RESOLVED injection: only when the export has no status column (see above).
             if not _export_has_status_col:
-                _raw_res = raw_df[_col_upper == 'RESOLVED']
                 if not _raw_res.empty:
                     _raw_inject_pairs |= set(zip(
                         _raw_res['Name'].apply(normalize_device_name),
                         _raw_res['Vulnerability Name'].apply(extract_cve_id),
                         _raw_res['Affected Products'].astype(str).apply(_dp_detect_raw),
                     ))
+            elif not _raw_res.empty:
+                # Status column present, so source 2 already resolves these rows
+                # per-row. Collect them as 2-tuples so reconcile_patch_evidence
+                # can discard the (large, inert) patch pairs that duplicate them
+                # — see its docstring for the scale this matters at.
+                _resolved_pairs_2d |= set(zip(
+                    _raw_res['Name'].apply(normalize_device_name),
+                    _raw_res['Vulnerability Name'].apply(extract_cve_id),
+                ))
 
-        # Step 1: strip false positives from patch tool memory.
-        # If the scanner says UNRESOLVED for (device, cve), remove every matching pair.
-        if _unresolved_pairs_2d and patch_resolved_pairs:
-            to_remove = {p for p in patch_resolved_pairs if (p[0], p[1]) in _unresolved_pairs_2d}
-            if to_remove:
-                patch_resolved_pairs -= to_remove
-                log.info(
-                    "Scanner override: removed %d pair(s) from patch_resolved_pairs "
-                    "because raw_df still shows UNRESOLVED — will render as red ☐",
-                    len(to_remove),
-                )
+        # Step 1: reconcile patch evidence against what the scanner still says.
+        #
+        # Patch evidence only ever CHANGES an outcome for a (device, cve) the
+        # scanner reports UNRESOLVED — if the export already says RESOLVED,
+        # resolution.py source 2 resolves the row on its own. So stripping
+        # every UNRESOLVED-overlapping pair (the original unconditional
+        # behaviour, CHANGELOG v0.24 "UNRESOLVED always wins") removed exactly
+        # the pairs the patch report exists to contribute, making its net
+        # effect on resolution status zero.
+        #
+        # Which side wins is now the caller's choice:
+        #   trust_patch_evidence=False (default) — scanner wins, as before.
+        #   trust_patch_evidence=True            — patch evidence wins, because
+        #       N-able can lag a patch install by a full rescan cycle and a
+        #       stale UNRESOLVED is not proof the CVE is still open.
+        #
+        # The opt-in is not a blanket "trust anything the patch tool said":
+        # patch_resolved_pairs only contains rows _vec_pes already qualified as
+        # installed AND version-compliant AND installed on/after the CVE's own
+        # publication/detection date. A pair that survives here has affirmative
+        # evidence, not merely an absence of contradiction — which is what
+        # keeps v0.24's false-positive concern (stale cache entries, mismatched
+        # patch records, product-name formatting drift) addressed.
+        _before_reconcile = len(patch_resolved_pairs)
+        (patch_resolved_pairs, patch_evidence_override_count,
+         _redundant_dropped) = reconcile_patch_evidence(
+            patch_resolved_pairs, _unresolved_pairs_2d,
+            trust_patch_evidence=request.trust_patch_evidence,
+            redundant_pairs_2d=_resolved_pairs_2d,
+        )
+        if _redundant_dropped:
+            log.info(
+                "Patch evidence: dropped %d redundant pair(s) the export already "
+                "reports RESOLVED (source 2 resolves those per-row) — %d pair(s) remain",
+                _redundant_dropped, len(patch_resolved_pairs),
+            )
+        _dropped = _before_reconcile - len(patch_resolved_pairs) - _redundant_dropped
+        if _dropped:
+            log.info(
+                "Scanner override: removed %d pair(s) from patch_resolved_pairs "
+                "because raw_df still shows UNRESOLVED — will render as red ☐ "
+                "(enable trust_patch_evidence to let patch evidence win instead)",
+                _dropped,
+            )
+        if patch_evidence_override_count:
+            log.info(
+                "Patch evidence override: %d device-CVE pair(s) resolved from the patch "
+                "report despite the detections export still showing UNRESOLVED "
+                "(scanner lag) — will render as ☑",
+                patch_evidence_override_count,
+            )
+            warnings.append(
+                f"{patch_evidence_override_count} CVE(s) marked resolved from patch "
+                f"evidence while the detections export still shows UNRESOLVED — "
+                f"N-able rescan pending"
+            )
 
         # Step 2: inject raw RESOLVED pairs (export has no status column).
         if _raw_inject_pairs:
@@ -620,10 +728,16 @@ def run(request: DashboardRequest) -> DashboardResult:
         active_universe_names: set = set()   # ALL active devices (normalised), regardless of check status
         patch_check_active_df = pd.DataFrame()
 
-        if request.include_patch_check_report and request.patch_check_report_path:
+        _check_inputs = (list(request.patch_check_report_paths)
+                         if request.patch_check_report_paths
+                         else ([request.patch_check_report_path]
+                               if request.patch_check_report_path else []))
+        if request.include_patch_check_report and _check_inputs:
             try:
-                log.info("Loading patch status check report: %s", request.patch_check_report_path)
-                check_df      = load_patch_check_report(request.patch_check_report_path)
+                log.info("Loading patch status check report: %s",
+                         ', '.join(map(str, _check_inputs)))
+                check_df      = load_patch_check_report(
+                    _check_inputs if len(_check_inputs) > 1 else _check_inputs[0])
                 check_lookup  = build_patch_check_failure_lookup(check_df)
                 check_devices = set(check_lookup.keys())
 
@@ -860,6 +974,17 @@ def run(request: DashboardRequest) -> DashboardResult:
                 'new_cve_count':       m['new_cve_count'],
                 'resolved_cve_count':  m['resolved_cve_count'],
                 'persisting_cve_count':m['persisting_cve_count'],
+                # Pair-level, full-scope remediation figures for the popup
+                # headline — matches the Month-over-Month Remediation Summary
+                # on the Summary sheet (Previous - Cleared + New == Current).
+                'cleared_pair_count':  m['cleared_previous_unresolved_count'],
+                'cleared_pair_pct':    m['cleared_previous_unresolved_pct'],
+                'new_pair_count':      m['new_unresolved_pair_count'],
+                'previous_pair_count': m['previous_unresolved_pair_count'],
+                'current_pair_count':  m['current_unresolved_pair_count'],
+                'cve_types_fully_cleared_count': m.get('cve_types_fully_cleared_count', 0),
+                'retired_products':    m.get('retired_products', []),
+                'patched_within_period_count': m.get('patched_within_period_count', 0),
             }
 
         return DashboardResult(

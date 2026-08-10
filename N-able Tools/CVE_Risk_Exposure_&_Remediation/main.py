@@ -69,6 +69,23 @@ def select_file(label_var, filetypes=None):
         label_var.set(path)
 
 
+def select_files(label_var, filetypes=None):
+    """
+    Multi-select variant of select_file. Joins the chosen paths with ';' —
+    the format process_reports() splits into DashboardRequest.patch_paths /
+    patch_check_report_paths. Used where reports are exported one per client.
+    """
+    if filetypes is None:
+        filetypes = [
+            ("Data Files",  "*.csv *.xlsx *.xls"),
+            ("CSV Files",   "*.csv"),
+            ("Excel Files", "*.xlsx *.xls"),
+        ]
+    paths = filedialog.askopenfilenames(filetypes=filetypes)
+    if paths:
+        label_var.set(';'.join(paths))
+
+
 # ===========================================================================
 # BACKGROUND WORKER
 # ===========================================================================
@@ -82,11 +99,38 @@ def _run_in_thread(request):
             msg = result.message
             if result.trend_summary:
                 ts = result.trend_summary
+                # Lead with pair-level remediation (full scope — matches the
+                # Month-over-Month Remediation Summary on the Summary sheet).
+                # The CVE-type counts are common-product scoped and can read
+                # "0 resolved" during a month of genuinely good patching (fleet
+                # growth re-seeds old CVE types; retired products are out of
+                # scope), so they're shown second, clearly labelled.
+                msg += "\n\nTrend vs previous report:"
+                if 'cleared_pair_count' in ts:
+                    msg += (
+                        f"\n  \u2714 {ts['cleared_pair_count']:,} of "
+                        f"{ts.get('previous_pair_count', 0):,} previous unresolved "
+                        f"pairs cleared ({ts.get('cleared_pair_pct', 0.0):.1%})"
+                        f"\n  \u25b2 {ts.get('new_pair_count', 0):,} new unresolved pairs"
+                    )
+                    _retired_types = ts.get('cve_types_fully_cleared_count', 0)
+                    _retired_prods = ts.get('retired_products') or []
+                    if _retired_types:
+                        msg += f"\n  \u2714 {_retired_types:,} CVE type(s) fully cleared"
+                        if _retired_prods:
+                            _shown = ', '.join(_retired_prods[:3])
+                            if len(_retired_prods) > 3:
+                                _shown += f" +{len(_retired_prods) - 3} more"
+                            msg += f" (incl. retired products: {_shown})"
+                    _within = ts.get('patched_within_period_count', 0)
+                    if _within:
+                        msg += (f"\n  \u2714 {_within:,} pair(s) detected & patched "
+                                "within the period")
                 msg += (
-                    "\n\nTrend vs previous report:"
                     f"\n  \u25b2 {ts['new_cve_count']:,} new CVE types   "
                     f"\u25bc {ts['resolved_cve_count']:,} resolved   "
                     f"\u23f3 {ts['persisting_cve_count']:,} persisting"
+                    "  (common-product scope)"
                 )
             if result.warnings:
                 msg += "\n\nWarnings:\n" + "\n".join(f"  - {w}" for w in result.warnings)
@@ -184,13 +228,22 @@ def process_reports():
         output_path            = output_path,
         rmm_path               = rmm_path or None,
         skip_rmm               = skip_rmm,
-        patch_path             = patch_path or None,
+        # Entry may hold multiple per-client reports separated by ';'
+        # (askopenfilenames-style). Single path stays on patch_path.
+        patch_path             = (patch_path if patch_path and ';' not in patch_path else None) or None,
+        patch_paths            = ([p.strip() for p in patch_path.split(';') if p.strip()]
+                                  if patch_path and ';' in patch_path else None),
         include_patch          = include_patch,
+        trust_patch_evidence   = include_patch and trust_patch_evidence_var.get(),
         failure_report_path    = failure_var.get() or None,
         include_failure_report = include_failure_var.get(),
         browser_audit_path     = browser_audit_var.get() or None,
         include_browser_audit  = include_browser_audit_var.get(),
-        patch_check_report_path    = patch_check_var.get() or None,
+        patch_check_report_path    = (patch_check_var.get()
+                                      if patch_check_var.get() and ';' not in patch_check_var.get()
+                                      else None) or None,
+        patch_check_report_paths   = ([p.strip() for p in patch_check_var.get().split(';') if p.strip()]
+                                      if patch_check_var.get() and ';' in patch_check_var.get() else None),
         include_patch_check_report = include_patch_check_var.get(),
         prev_report_path       = prev_report_path or None,
         include_trend          = include_trend,
@@ -353,22 +406,34 @@ def open_advanced_dialog():
     """
     dlg = ctk.CTkToplevel(root)
     dlg.title("Advanced Options")
-    dlg.resizable(False, False)
+    # Vertically resizable + scrollable body: the old fixed 560x340 was sized
+    # for two checkboxes and clipped everything added since (the Patch Status
+    # Check and Patch Report sections rendered below the window edge, leaving
+    # their Browse buttons and enable-checkboxes unreachable).
+    dlg.resizable(False, True)
     dlg.grab_set()
 
     dlg.update_idletasks()
     pw = root.winfo_x() + root.winfo_width()  // 2
     ph = root.winfo_y() + root.winfo_height() // 2
-    dlg.geometry(f"560x340+{pw - 280}+{ph - 170}")
+    _dlg_h = min(660, max(400, root.winfo_height() - 80))
+    dlg.geometry(f"584x{_dlg_h}+{pw - 292}+{ph - _dlg_h // 2}")
+    dlg.minsize(584, 400)
 
     PAD = {"padx": 16, "pady": (6, 0)}
 
     ctk.CTkLabel(dlg, text="Advanced Options",
                  font=ctk.CTkFont(size=14, weight="bold")).pack(pady=(14, 8))
 
+    # All option widgets go in a scrollable body; only the Close button stays
+    # pinned to the window bottom. If future options outgrow the window, they
+    # scroll instead of vanishing.
+    body = ctk.CTkScrollableFrame(dlg, fg_color="transparent")
+    body.pack(fill="both", expand=True, padx=4)
+
     # ── Refresh product baselines ────────────────────────────────────────────────
     # Moved here from the main Filters card.
-    _baselines_cb = ctk.CTkCheckBox(dlg, text="Refresh product baselines before run",
+    _baselines_cb = ctk.CTkCheckBox(body, text="Refresh product baselines before run",
                                     variable=sync_baselines_var)
     _baselines_cb.pack(anchor="w", padx=16, pady=(4, 4))
     Tooltip(_baselines_cb, "Pulls the latest known-good software versions before "
@@ -377,18 +442,18 @@ def open_advanced_dialog():
 
     # ── Patching Health Score ────────────────────────────────────────────────────
     # Moved here from the main Filters card.
-    _health_score_cb = ctk.CTkCheckBox(dlg, text="Show Patching Health Score on Summary sheet  ⚠ Beta",
+    _health_score_cb = ctk.CTkCheckBox(body, text="Show Patching Health Score on Summary sheet  ⚠ Beta",
                                        variable=include_health_score_var)
     _health_score_cb.pack(anchor="w", padx=16, pady=(4, 0))
     Tooltip(_health_score_cb, "Adds an experimental A–F grade to the Summary sheet, "
                               "combining resolution rate, critical-CVE coverage, and "
                               "known-exploit coverage. Methodology may still change — "
                               "not recommended for formal client reporting yet.")
-    ctk.CTkLabel(dlg, text="  Scoring methodology is experimental — not for formal reporting",
+    ctk.CTkLabel(body, text="  Scoring methodology is experimental — not for formal reporting",
                  font=("", 11), text_color="#7F6000").pack(anchor="w", padx=16, pady=(0, 4))
 
     # ── Advanced Summary sections (preview) ──────────────────────────────────────
-    _adv_summary_cb = ctk.CTkCheckBox(dlg, text="Advanced Summary sections  ⚠ Preview",
+    _adv_summary_cb = ctk.CTkCheckBox(body, text="Advanced Summary sections  ⚠ Preview",
                                       variable=advanced_summary_var)
     _adv_summary_cb.pack(anchor="w", padx=16, pady=(4, 0))
     Tooltip(_adv_summary_cb, "Adds preview sections to the Summary sheet: Multi-Month "
@@ -397,7 +462,7 @@ def open_advanced_dialog():
                              "Patch-Gap Root Causes (patch-evidence runs). Also records "
                              "health-score history in snapshots/ so trends accumulate. "
                              "Layout may change while the feature settles.")
-    ctk.CTkLabel(dlg, text="  Layout and metrics may change — feedback welcome",
+    ctk.CTkLabel(body, text="  Layout and metrics may change — feedback welcome",
                  font=("", 11), text_color="#7F6000").pack(anchor="w", padx=16, pady=(0, 4))
 
     # ── Patch Status Check Report ────────────────────────────────────────────────
@@ -406,9 +471,9 @@ def open_advanced_dialog():
     # a specific patch failing to install. Adds a "Patch Check Failures" sheet,
     # highlights matching active devices in Top At-Risk Devices, and adds a
     # Summary table so these show up next to the CVE data they may be masking.
-    ctk.CTkLabel(dlg, text="Patch Status Check Report  (CSV or XLSX)",
+    ctk.CTkLabel(body, text="Patch Status Check Report  (CSV or XLSX)",
                  font=ctk.CTkFont(weight="bold")).pack(anchor="w", **PAD)
-    pcf = ctk.CTkFrame(dlg, fg_color="transparent")
+    pcf = ctk.CTkFrame(body, fg_color="transparent")
     pcf.pack(fill="x", padx=16)
     _pce = ctk.CTkEntry(pcf, textvariable=patch_check_var, width=380,
                         state="normal" if include_patch_check_var.get() else "disabled")
@@ -423,7 +488,7 @@ def open_advanced_dialog():
         _pce.configure(state=s)
         _pcb.configure(state=s)
 
-    ctk.CTkCheckBox(dlg, text="Highlight active devices failing patch status check",
+    ctk.CTkCheckBox(body, text="Highlight active devices failing patch status check",
                     variable=include_patch_check_var, command=_toggle_pc).pack(anchor="w", padx=16)
     Tooltip(_pce, "A device here has passed CVE detection but RMM's own automated "
                   "patch-status check is failing for it — meaning RMM can't confirm "
@@ -431,11 +496,48 @@ def open_advanced_dialog():
                   "sheet, in Top At-Risk Devices, and in a dedicated 'Patch Check "
                   "Failures' sheet.")
 
-    # ── Patch Report / Patch Failure Report / Browser Audit ──────────────────────
-    # Disabled for now (commented out). The include_* / *_var names stay
-    # declared elsewhere (defaulting to unset/False) so process_reports(),
-    # _update_ready_hint(), and _update_patch_status() don't need changes —
-    # they just always see "not configured" while this is off.
+    # ── Patch Report ─────────────────────────────────────────────────────────────
+    # Re-enabled: without this picker there was no way to supply a patch report
+    # from the GUI, so include_patch stayed False and every patch-dependent
+    # output (Patch Match Overview, Patch Evidence Notes, Version Drift,
+    # patch-confirmed resolution, N-Day Exposure Age) was silently absent from
+    # the workbook. Browse is multi-select — patch reports are exported one per
+    # client and are concatenated by process_patch_match.
+    ctk.CTkLabel(body, text="Patch Report  (CSV or XLSX — multi-select for per-client)",
+                 font=ctk.CTkFont(weight="bold")).pack(anchor="w", **PAD)
+    pf = ctk.CTkFrame(body, fg_color="transparent")
+    pf.pack(fill="x", padx=16)
+    _pe = ctk.CTkEntry(pf, textvariable=patch_var, width=380,
+                       state="normal" if include_patch_var.get() else "disabled")
+    _pe.pack(side="left")
+    _pb = ctk.CTkButton(pf, text="Browse", width=80,
+                        command=lambda: select_files(patch_var),
+                        state="normal" if include_patch_var.get() else "disabled")
+    _pb.pack(side="left", padx=6)
+
+    def _toggle_p():
+        s = "normal" if include_patch_var.get() else "disabled"
+        _pe.configure(state=s)
+        _pb.configure(state=s)
+        _update_patch_status()
+        _update_ready_hint()
+
+    ctk.CTkCheckBox(body, text="Include Patch Report matching",
+                    variable=include_patch_var, command=_toggle_p).pack(anchor="w", padx=16)
+
+    Tooltip(_pe, "The N-able Patch Overview export (Patch, Client, Site, Device, "
+                 "Status, Discovered / Install Date). Adds Patch Match Overview, "
+                 "Patch Evidence Notes, Version Drift and Patch Lag sheets, resolves "
+                 "CVEs confirmed patched, and enables N-Day Exposure Age. "
+                 "Select several files to supply one report per client.")
+
+    patch_var.trace_add("write", lambda *_: (_update_patch_status(), _update_ready_hint()))
+
+    # ── Patch Failure Report / Browser Audit ─────────────────────────────────────
+    # Still disabled. The include_* / *_var names stay declared elsewhere
+    # (defaulting to unset/False) so process_reports(), _update_ready_hint(),
+    # and _update_patch_status() don't need changes — they just always see
+    # "not configured" while these are off.
     #
     # ctk.CTkLabel(dlg, text="Patch Report  (CSV or XLSX)",
     #              font=ctk.CTkFont(weight="bold")).pack(anchor="w", **PAD)
@@ -457,6 +559,16 @@ def open_advanced_dialog():
     #
     # ctk.CTkCheckBox(dlg, text="Include Patch Report matching",
     #                 variable=include_patch_var, command=_toggle_p).pack(anchor="w", padx=16)
+    #
+    # _tpe = ctk.CTkCheckBox(dlg, text="Trust patch evidence over a stale UNRESOLVED status",
+    #                        variable=trust_patch_evidence_var)
+    # _tpe.pack(anchor="w", padx=32)
+    # Tooltip(_tpe, "N-able's scanner can lag a patch install by a full rescan cycle, so a "
+    #               "CVE can still show UNRESOLVED in the detections export after it has "
+    #               "actually been patched. Enable to let the patch report resolve those "
+    #               "rows. Only applies where the patch report proves the update installed "
+    #               "AND version-compliant AND installed on/after the CVE was published — "
+    #               "an absence of contradiction is never enough on its own.")
     #
     # ctk.CTkLabel(dlg, text="Patch Failure Report  (CSV)",
     #              font=ctk.CTkFont(weight="bold")).pack(anchor="w", **PAD)
@@ -652,7 +764,14 @@ def _inline_field(parent, row, label, variable, width=120, suffix=None):
 
 
 def _filename_or_missing(value, missing="Not selected"):
-    return Path(value).name if value else missing
+    if not value:
+        return missing
+    # Multi-select values are ';'-joined (see select_files) — show a count
+    # plus the first filename rather than pretending it's one file.
+    if ';' in value:
+        parts = [p for p in value.split(';') if p.strip()]
+        return f"{len(parts)} files ({Path(parts[0]).name}, …)"
+    return Path(value).name
 
 
 class Tooltip:
@@ -739,6 +858,9 @@ failure_var = tk.StringVar()
 browser_audit_var = tk.StringVar()
 patch_check_var = tk.StringVar()
 include_patch_var = tk.BooleanVar()
+# Opt-in: let patch evidence resolve CVEs the detections export still shows as
+# UNRESOLVED (N-able scanner lag). Only meaningful alongside include_patch_var.
+trust_patch_evidence_var = tk.BooleanVar()
 include_failure_var = tk.BooleanVar()
 include_browser_audit_var = tk.BooleanVar()
 include_patch_check_var = tk.BooleanVar()

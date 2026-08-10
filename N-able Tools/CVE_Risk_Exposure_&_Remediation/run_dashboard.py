@@ -64,12 +64,19 @@ def build_parser() -> argparse.ArgumentParser:
                    help='Skip RMM merge (CVE export already includes device info)')
     p.add_argument('--patch',     default=None,   metavar='FILE',
                    help='Patch report for patch-match analysis (CSV or XLSX)')
+    p.add_argument('--trust-patch-evidence', action='store_true',
+                   help='Let the patch report resolve a CVE that the detections export still '
+                        'shows as UNRESOLVED. N-able can lag a patch install by a full rescan '
+                        'cycle, so a stale UNRESOLVED is not proof the CVE is still open. Only '
+                        'applies to rows the patch report proves installed AND version-compliant '
+                        'AND installed on/after the CVE publication date. Requires --patch.')
     p.add_argument('--failure-report', default=None, metavar='FILE',
                    help='Patch failure report CSV for failed patch delivery analysis')
-    p.add_argument('--patch-check-report', default=None, metavar='FILE',
+    p.add_argument('--patch-check-report', default=None, metavar='FILE[;FILE...]',
                    help='RMM monitoring-check export (e.g. "Failing Checks") listing devices where '
                         'the Patch Status Check itself is failing to report — distinct from a specific '
-                        'patch failing to install. Adds a "Patch Check Failures" sheet, highlights '
+                        'patch failing to install. Accepts several semicolon-separated files, one per '
+                        'client. Adds a "Patch Check Failures" sheet, highlights '
                         'matching active devices in Top At-Risk Devices, and adds a Summary table.')
     p.add_argument('--previous',  default=None,   metavar='FILE',
                    help='Previous dashboard (.xlsx) for month-over-month trends')
@@ -112,12 +119,18 @@ def main() -> int:
     if args.patch and not Path(args.patch).exists():
         log.error("Patch file not found: %s", args.patch)
         return 1
+    if args.trust_patch_evidence and not args.patch:
+        log.error("--trust-patch-evidence requires --patch (there is no patch report to trust)")
+        return 1
     if args.failure_report and not Path(args.failure_report).exists():
         log.error("Patch failure report not found: %s", args.failure_report)
         return 1
-    if args.patch_check_report and not Path(args.patch_check_report).exists():
-        log.error("Patch status check report not found: %s", args.patch_check_report)
-        return 1
+    _check_report_paths = ([p.strip() for p in args.patch_check_report.split(';') if p.strip()]
+                           if args.patch_check_report else [])
+    for _crp in _check_report_paths:
+        if not Path(_crp).exists():
+            log.error("Patch status check report not found: %s", _crp)
+            return 1
     if args.previous and not Path(args.previous).exists():
         log.error("Previous report not found: %s", args.previous)
         return 1
@@ -130,10 +143,14 @@ def main() -> int:
         skip_rmm               = args.skip_rmm,
         patch_path             = args.patch,
         include_patch          = bool(args.patch),
+        trust_patch_evidence   = args.trust_patch_evidence,
         failure_report_path    = args.failure_report,
         include_failure_report = bool(args.failure_report),
-        patch_check_report_path    = args.patch_check_report,
-        include_patch_check_report = bool(args.patch_check_report),
+        patch_check_report_path    = (_check_report_paths[0]
+                                      if len(_check_report_paths) == 1 else None),
+        patch_check_report_paths   = (_check_report_paths
+                                      if len(_check_report_paths) > 1 else None),
+        include_patch_check_report = bool(_check_report_paths),
         prev_report_path       = args.previous,
         include_trend          = bool(args.previous),
         threshold              = args.threshold,

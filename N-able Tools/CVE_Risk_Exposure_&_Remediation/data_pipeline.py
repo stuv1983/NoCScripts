@@ -327,6 +327,59 @@ def _get_arch(text: str) -> str:
 # drift out of sync with config.py and excel_builder.py the moment either
 # is edited without the other.
 
+# ── Non-CVE patch-type filter ────────────────────────────────────────────────
+# The N-able patch export lists everything the patch tool installs, including
+# items that do NOT correspond to a CVE the vulnerability scanner tracks:
+# antivirus/Defender signature ("Security Intelligence") updates and device
+# driver updates. When such a patch shares a product key with a CVE row it can
+# be matched and mis-classified as "Patched but still detected (rescan
+# required)", inflating that bucket with work that never mapped to a CVE.
+#
+# We drop these rows from the patch report BEFORE matching, so affected CVE
+# rows fall through to their real status (a genuine patch match, a coverage
+# gap, etc.) instead of a spurious rescan-required note.
+#
+# Deliberately conservative — we do NOT drop Windows/OS cumulative updates,
+# .NET updates, or "Security Update (KBxxxxxxx)" OS rollups: those legitimately
+# fix CVEs the scanner reports (e.g. "2026-02 Cumulative Update for Windows
+# Server 2019"). Only clearly non-CVE maintenance categories are removed.
+#
+# Patterns are overridable via config.json → "non_cve_patch_patterns" (a list
+# of case-insensitive regex strings). An empty list disables the filter.
+_DEFAULT_NON_CVE_PATCH_PATTERNS = [
+    r'security intelligence update',   # Defender definition updates (KB2267602)
+    r'defender antivirus',
+    r'antimalware',
+    r'\bdefinition update',
+    r'\bsignature update',
+    r'\bdriver update\b',              # "Dell, Inc. Driver Update", "... Firmware Driver Update"
+    r'\bdriver\b.*\bupdate\b',
+    r'\bfirmware\b',
+    r'\bbios\b',
+    r'\buefi\b',
+]
+
+def _compile_non_cve_patch_re():
+    pats = _CONFIG.get('non_cve_patch_patterns', _DEFAULT_NON_CVE_PATCH_PATTERNS)
+    if not pats:
+        return None
+    try:
+        return re.compile('|'.join(f'(?:{p})' for p in pats), re.IGNORECASE)
+    except re.error as exc:
+        log.warning("Invalid non_cve_patch_patterns in config (%s) — using defaults", exc)
+        return re.compile('|'.join(f'(?:{p})' for p in _DEFAULT_NON_CVE_PATCH_PATTERNS),
+                          re.IGNORECASE)
+
+_NON_CVE_PATCH_RE = _compile_non_cve_patch_re()
+
+def _is_non_cve_patch(patch_name) -> bool:
+    """True if a patch name is a non-CVE maintenance item (AV signature or
+    driver/firmware update) that should not be matched against CVE rows."""
+    if _NON_CVE_PATCH_RE is None or patch_name is None:
+        return False
+    return bool(_NON_CVE_PATCH_RE.search(str(patch_name)))
+
+
 def _detect_product(text):
     t = _norm_text(str(text))
     for key, product in PRODUCT_MAP:
@@ -976,18 +1029,39 @@ def _apply_cascade_resolution(df: pd.DataFrame) -> pd.DataFrame:
 
 def process_patch_match(patch_path, cve_df, min_score=9.0, as_of_date=None):
     """
-    Match CVE detections against a patch report.
+    Match CVE detections against one or more patch reports.
+
+    patch_path — a single path, or a list/tuple of paths (one report per
+    client). Multiple files are validated individually (so a bad file names
+    itself in the error) and concatenated; the Client column disambiguates
+    rows, so per-client exports can simply be stacked.
+
+    Clients present in the CVE data but absent from every supplied patch
+    report get 'No patch report supplied for client' instead of
+    'Not found in patch report', so a missing input file is never mistaken
+    for a genuine coverage gap.
 
     as_of_date — optional report-generation timestamp. Used as the anchor for
     'N Days Exposed' so the count is frozen at the time the report was built
     (matching merge_data's Days Since Last Response behaviour) rather than
     recalculated on every run. Defaults to now.
     """
-    patch  = load_data(patch_path)
-    miss_p = {'Client', 'Site', 'Device', 'Status', 'Patch',
-              'Discovered / Install Date'} - set(patch.columns)
-    if miss_p:
-        raise ValueError(f'Patch report missing required columns: {", ".join(sorted(miss_p))}')
+    _REQ_PATCH_COLS = {'Client', 'Site', 'Device', 'Status', 'Patch',
+                       'Discovered / Install Date'}
+    _paths = list(patch_path) if isinstance(patch_path, (list, tuple)) else [patch_path]
+    _frames = []
+    for _pp in _paths:
+        _pf = load_data(_pp)
+        miss_p = _REQ_PATCH_COLS - set(_pf.columns)
+        if miss_p:
+            raise ValueError(
+                f'Patch report {_pp!r} missing required columns: '
+                f'{", ".join(sorted(miss_p))}')
+        _frames.append(_pf)
+    patch = _frames[0] if len(_frames) == 1 else pd.concat(_frames, ignore_index=True)
+    if len(_frames) > 1:
+        log.info("Patch match: concatenated %d patch reports (%d rows, %d clients)",
+                 len(_frames), len(patch), patch['Client'].nunique())
 
     cve    = _drop_internal(cve_df)
     miss_c = {'Vulnerability Name', 'Name', 'Affected Products'} - set(cve.columns)
@@ -1020,6 +1094,22 @@ def process_patch_match(patch_path, cve_df, min_score=9.0, as_of_date=None):
     filtered_rows = len(cve)
 
     patch = patch.copy()
+
+    # Drop non-CVE maintenance patches (AV signature / driver / firmware)
+    # before matching — see _is_non_cve_patch. Keeps OS/.NET CVE rollups.
+    if _NON_CVE_PATCH_RE is not None and 'Patch' in patch.columns:
+        _non_cve_mask = patch['Patch'].apply(_is_non_cve_patch)
+        _dropped = int(_non_cve_mask.sum())
+        if _dropped:
+            _by_name = (patch.loc[_non_cve_mask, 'Patch'].astype(str)
+                        .str.slice(0, 60).value_counts())
+            log.info("Patch match: filtered %d non-CVE patch row(s) "
+                     "(AV signature / driver / firmware) across %d distinct patch name(s)",
+                     _dropped, len(_by_name))
+            for _nm, _cnt in _by_name.head(8).items():
+                log.debug("  dropped %5d × %s", _cnt, _nm)
+            patch = patch[~_non_cve_mask].copy()
+
     patch['_ck']  = patch['Client'].map(_norm_compact)
     patch['_sk']  = patch['Site'].map(_norm_compact)
     patch['_dk']  = patch['Device'].map(_norm_compact)
@@ -1067,11 +1157,27 @@ def process_patch_match(patch_path, cve_df, min_score=9.0, as_of_date=None):
     _matched_label = best['Status'].astype(str).str.strip().map(STATUS_LABEL).fillna(
         'Matched - ' + best['Status'].astype(str).str.lower()
     )
+    # Clients that actually have rows in the supplied patch report(s). CVE
+    # rows for any other client are labelled 'No patch report supplied for
+    # client' rather than 'Not found in patch report' — a missing input file
+    # is an input limitation, not a coverage gap, and must not feed the
+    # patch-gap root-cause counts or health score (diagnostics excludes the
+    # label; classify_root_cause has no rule for it).
+    _patch_clients = set(patch['_ck'].dropna()) - {''}
+    _client_cover  = best['_ck'].isin(_patch_clients)
+
     best['Patch Match Result'] = pd.NA
     best.loc[_has_patch & ~_arch_mism,   'Patch Match Result'] = _matched_label[_has_patch & ~_arch_mism]
     best.loc[_has_patch & _arch_mism,    'Patch Match Result'] = 'Device in patch report - product not found'
     best.loc[~_has_patch & _in_devices,  'Patch Match Result'] = 'Device in patch report - product not found'
     best.loc[~_has_patch & ~_in_devices, 'Patch Match Result'] = 'Not found in patch report'
+    best.loc[~_has_patch & ~_in_devices & ~_client_cover,
+             'Patch Match Result'] = 'No patch report supplied for client'
+    _no_report_n = int((best['Patch Match Result'] == 'No patch report supplied for client').sum())
+    if _no_report_n:
+        _absent = sorted(set(best.loc[~_client_cover, 'Customer'].astype(str).str.strip()) - {''})
+        log.info("Patch match: %d row(s) for client(s) with no patch report supplied: %s",
+                 _no_report_n, ', '.join(_absent) or '(unnamed)')
 
     # ── Fixed version & baseline (vectorised) ────────────────────────────────
     _pk_s = best.get('_pk', pd.Series([''] * len(best), index=best.index))
@@ -1640,6 +1746,50 @@ def compute_trends(current_df, previous_df, threshold,
         if previous_unresolved_pair_count else 0.0
     )
 
+    # Full-scope CVE-type clearance — companion to resolved_cve_count, which is
+    # common-product-restricted and therefore reports 0 when every fully-cleared
+    # CVE type belonged to a product that disappeared between reports (e.g. an
+    # uninstalled MySQL 5.7 taking 300+ CVE types with it). This full-scope count
+    # includes those, so the GUI popup / log can give credit for retired products
+    # instead of headlining "0 resolved".
+    prev_all_cve_ids        = set(prev_t['_CVE_Key'].unique())
+    cve_types_fully_cleared = prev_all_cve_ids - cur_all_cve_ids
+    retired_products        = sorted(set(prev_t['Base Product'].unique())
+                                     - set(cur_t['Base Product'].unique()))
+
+    # ── Detected & patched within period ─────────────────────────────────────
+    # A (device, CVE) pair that never appeared in the previous report but shows
+    # up in the current report already marked RESOLVED was detected AND patched
+    # between the two reports. It is invisible to every other trend bucket:
+    # _active_trend_scope drops RESOLVED rows from the current side, and the
+    # pair was never on the previous side, so it is neither "cleared" (wasn't
+    # previously unresolved) nor "new" (isn't unresolved now). It's real
+    # remediation work, so it gets its own credit line.
+    #
+    # Deliberately disjoint from cleared_previous_unresolved_count: pairs that
+    # WERE in the previous report (any status) are excluded here — previously
+    # unresolved ones are already counted as "cleared", and previously resolved
+    # ones weren't patched this period. Requires the current input to include
+    # RESOLVED rows (a full export); with an unresolved-only export this is 0
+    # because there is nothing to detect it from.
+    patched_within_period_count = 0
+    _sc_cur = ('Threat Status' if 'Threat Status' in cur.columns
+               else 'Status'   if 'Status'        in cur.columns
+               else None)
+    if _sc_cur is not None:
+        _cur_scores = pd.to_numeric(cur['Vulnerability Score'], errors='coerce').fillna(0)
+        _cur_res    = cur[(_cur_scores >= threshold)
+                          & cur[_sc_cur].astype(str).str.strip().str.upper().eq('RESOLVED')]
+        if not _cur_res.empty:
+            _cur_res_2d  = set(zip(_cur_res['_Name_Key'], _cur_res['_CVE_Key']))
+            # ALL previous pairs, any status, no threshold — "not in the
+            # previous report" means not present there in any form.
+            _prev_all_2d = set(zip(
+                _normalize_device_col(previous_df['Name']),
+                previous_df['Vulnerability Name'].astype(str).apply(extract_cve_id),
+            ))
+            patched_within_period_count = len(_cur_res_2d - _prev_all_2d)
+
     metrics = {
         'cur_cves':             snap_cur_cves,
         'prev_cves':            snap_prev_cves,
@@ -1675,6 +1825,16 @@ def compute_trends(current_df, previous_df, threshold,
         'cleared_previous_unresolved_count': cleared_previous_unresolved_count,
         'cleared_previous_unresolved_pct':   cleared_previous_unresolved_pct,
         'new_unresolved_pair_count':         new_unresolved_pair_count_full,
+        # Full-scope CVE-type clearance (see comment above prev_all_cve_ids):
+        # counts CVE types unresolved last period and completely absent now,
+        # INCLUDING types that left with a retired/uninstalled product —
+        # deliberately different from resolved_cve_count (common-product scope).
+        'cve_types_fully_cleared_count':     len(cve_types_fully_cleared),
+        'retired_products':                  retired_products,
+        # Pairs RESOLVED in the current report that never appeared in the
+        # previous report at all — detected and patched between reports.
+        # 0 when the current input is an unresolved-only export.
+        'patched_within_period_count':       patched_within_period_count,
     }
 
     cur_prod      = cur_t.groupby('Base Product')['_Name_Key'].nunique()
@@ -1793,11 +1953,17 @@ def build_patch_failure_lookup(failure_df: pd.DataFrame) -> dict:
 # of a device silently falling out of patch management (agent broken, WMI/
 # service issue, etc.) rather than a specific patch failing.
 
-def load_patch_check_report(file_path: str) -> 'pd.DataFrame':
+def load_patch_check_report(file_path) -> 'pd.DataFrame':
     """
-    Parse an RMM monitoring-check export (e.g. N-able 'Failing Checks' /
-    Daily Safety Check report) and return the rows where a patch-status
-    check is failing.
+    Parse one or more RMM monitoring-check exports (e.g. N-able 'Failing
+    Checks' / Daily Safety Check report) and return the rows where a
+    patch-status check is failing.
+
+    file_path — a single path, or a list/tuple of paths (one export per
+    client). Multiple files are parsed individually and concatenated; the
+    Customer Name / Asset Name columns disambiguate rows, so per-client
+    exports simply stack. This mirrors process_patch_match's per-client
+    handling of the patch overview report.
 
     Expected columns (case-insensitive, order-independent):
       Check Status, Check Frequency, Check Type, Check Description,
@@ -1809,6 +1975,18 @@ def load_patch_check_report(file_path: str) -> 'pd.DataFrame':
     report typically is) or is a broader export mixing other check types
     (antivirus, disk space, etc.) together.
     """
+    _paths = list(file_path) if isinstance(file_path, (list, tuple)) else [file_path]
+    _frames = [_load_patch_check_report_single(p) for p in _paths]
+    if len(_frames) == 1:
+        return _frames[0]
+    combined = pd.concat(_frames, ignore_index=True)
+    log.info("Patch status check: concatenated %d export(s) → %d failing patch-check row(s)",
+             len(_frames), len(combined))
+    return combined.reset_index(drop=True)
+
+
+def _load_patch_check_report_single(file_path: str) -> 'pd.DataFrame':
+    """Parse a single RMM monitoring-check export. See load_patch_check_report."""
     df = load_data(file_path)
 
     rename = {}

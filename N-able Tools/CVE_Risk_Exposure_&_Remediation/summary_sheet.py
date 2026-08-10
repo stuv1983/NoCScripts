@@ -1612,7 +1612,7 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
             row += 2
         else:
             _bands = get_band_formats(workbook)
-            _age_unres = ~_compute_resolved_series(triage_dedup)
+            _age_unres = _is_unr
             _age_kev   = (triage_dedup['CISA KEV'].astype(str).str.strip().str.lower()
                           .isin(['yes', 'y', 'true', '1'])
                           if 'CISA KEV' in triage_dedup.columns
@@ -1782,7 +1782,7 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         # rule build_product_sheets applies — guarantees this table can
         # never again show a different "unresolved" verdict for a CVE than
         # the product sheet the reader would go check it against.
-        _unr_df = triage_dedup[~_compute_resolved_series(triage_dedup)].copy()
+        _unr_df = triage_dedup[_is_unr].copy()
         if not _unr_df.empty:
             _agg = _unr_df.groupby('Name', as_index=False).agg(
                 cve_count   =('Vulnerability Name', 'nunique'),
@@ -1871,8 +1871,26 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
         ws.merge_range(row,0,row,3,'  Month-over-Month Patching Progress',sect_fmt); row+=1
         ws.write(row,0,'Metric',hdr_fmt); ws.write(row,1,'Count',hdr_fmt)
         ws.write(row,2,'Direction',hdr_fmt); ws.write(row,3,'',hdr_fmt); row+=1
+        # 'Device+CVE pairs cleared' and 'CVE types fully cleared' are the
+        # full-scope figures (same population as the Remediation Summary above,
+        # including products retired entirely between reports). The old
+        # headline here was resolved_cve_count — common-product scope — which
+        # legitimately reads 0 whenever every fully-cleared CVE type left with
+        # a retired product, or fleet growth re-seeded old types onto new
+        # devices, burying a month of real patching under "no change".
         for label,value,good in [
-            ('CVE types resolved / patched',    m.get('resolved_cve_count',0),   True),
+            ('Device+CVE pairs cleared (patched)',
+                 m.get('cleared_previous_unresolved_count',0),        True),
+            ('CVE types fully cleared',
+                 m.get('cve_types_fully_cleared_count',
+                       m.get('resolved_cve_count',0)),                True),
+            # Pairs RESOLVED in current but absent from the previous report
+            # entirely — detected AND patched between reports. Disjoint from
+            # 'pairs cleared' above (those were previously unresolved). Reads 0
+            # when the current input is an unresolved-only export, since the
+            # RESOLVED rows needed to detect it aren't in the file.
+            ('Detected & patched within period',
+                 m.get('patched_within_period_count',0),              True),
             ('CVE types newly introduced',       m.get('new_cve_count',0),        False),
             ('CVE types persisting (unpatched)', m.get('persisting_cve_count',0), False),
             ('Devices fully remediated',         m.get('remediated_devices',0),   True),
@@ -1883,6 +1901,13 @@ def build_client_summary_sheet(workbook, filtered_df, triage_df, threshold,
             else:
                 vf=red_fmt if value>0 else val_fmt; ds=f'\u25b2  {value:,}  (increase)'    if value>0 else '\u2014  no change'; df2=trend_dn if value>0 else trend_eq
             ws.write(row,0,label,lbl_fmt); ws.write(row,1,value,vf); ws.merge_range(row,2,row,3,ds,df2)
+            row+=1
+        _retired = m.get('retired_products') or []
+        if _retired:
+            _shown = ', '.join(_retired[:4]) + (f'  +{len(_retired)-4} more' if len(_retired) > 4 else '')
+            ws.merge_range(row,0,row,3,
+                f'\u2714  Product(s) retired since previous report (all their CVEs cleared): {_shown}',
+                note_fmt)
             row+=1
 
     row+=1
