@@ -292,14 +292,11 @@ def open_date_picker():
 # ===========================================================================
 
 def _find_cve_repo() -> Path:
-    default = Path(_CVE_REPO_DEFAULT)
-    if default.exists():
-        return default
     here = Path(sys.argv[0]).resolve().parent
     for c in (here / "cvelistV5", here.parent / "cvelistV5"):
         if c.exists():
             return c
-    return default
+    return Path(_CVE_REPO_DEFAULT)
 
 
 def update_cve_list():
@@ -975,6 +972,8 @@ def _update_patch_status(*_):
         parts.append(f"Failure: {_filename_or_missing(failure_var.get())}")
     if include_browser_audit_var.get():
         parts.append(f"Browser: {_filename_or_missing(browser_audit_var.get())}")
+    if include_patch_check_var.get():
+        parts.append(f"Patch Check: {_filename_or_missing(patch_check_var.get())}")
     patch_status_var.set(
         "Patch evidence: " + "  |  ".join(parts)
         if parts else
@@ -1010,7 +1009,7 @@ for _var in (
     _var.trace_add("write", _update_ready_hint)
 
 for _var in (patch_var, failure_var, include_patch_var, include_failure_var,
-             browser_audit_var, include_browser_audit_var):
+             browser_audit_var, include_browser_audit_var, patch_check_var, include_patch_check_var):
     _var.trace_add("write", _update_patch_status)
 
 # Apply initial state.

@@ -99,10 +99,40 @@ def classify_patch_gap(patch_match_result: str,
 # DATA LOADING & NORMALISATION
 # ==============================================================================
 def load_data(file_path: str) -> pd.DataFrame:
-    """Load a CSV or Excel file into a DataFrame."""
-    if file_path.lower().endswith(('.xlsx', '.xls')):
-        return pd.read_excel(file_path, engine=_XLSX_ENGINE)
-    return pd.read_csv(file_path)
+    """Load a CSV or Excel file into a DataFrame.
+
+    Failures are re-raised as ValueError with an actionable message. The raw
+    pandas/OS errors surface straight to the user's error dialog via the
+    orchestrator's catch-all, and "[Errno 13] Permission denied" tells nobody
+    that the real fix is to close the file in Excel — by far the most common
+    failure on Windows.
+    """
+    _is_excel = file_path.lower().endswith(('.xlsx', '.xls'))
+    try:
+        if _is_excel:
+            return pd.read_excel(file_path, engine=_XLSX_ENGINE)
+        return pd.read_csv(file_path)
+    except FileNotFoundError:
+        raise ValueError(f"File not found:\n{file_path}") from None
+    except PermissionError:
+        raise ValueError(
+            f"Cannot read the file — it may be open in Excel or another program:\n"
+            f"{file_path}\n\nClose it and try again."
+        ) from None
+    except UnicodeDecodeError as exc:
+        raise ValueError(
+            f"Could not decode the text in:\n{file_path}\n\n"
+            f"The file may not be a UTF-8 CSV, or may actually be an Excel file "
+            f"saved with a .csv extension. ({exc})"
+        ) from None
+    except ValueError:
+        raise                      # already actionable (e.g. our own messages)
+    except Exception as exc:
+        _kind = 'Excel workbook' if _is_excel else 'CSV file'
+        raise ValueError(
+            f"Could not read the {_kind}:\n{file_path}\n\n"
+            f"{type(exc).__name__}: {exc}"
+        ) from None
 
 
 # Approximate CVSS scores derived from N-able's Severity text labels, used
@@ -528,7 +558,13 @@ def load_vulnerability_data(file_path: str) -> pd.DataFrame:
                     int(_has_real.sum()), len(df), int(_cve_ids[_has_real].nunique()),
                 )
     except Exception as _cvss_err:
-        log.debug('CVSS cache apply skipped: %s', _cvss_err)
+        # Not fatal, but not cosmetic either: without the cache the scores stay
+        # at the coarse severity-band approximations (9.0/7.0/5.0/2.0), and the
+        # user's Minimum CVE Score filter is applied against those instead of
+        # real CVSS. Warn so a filtered-out CVE can be explained.
+        log.warning('Could not apply cached CVSS scores (%s) — Vulnerability Score '
+                    'remains the approximate severity-band value, and the score '
+                    'threshold will be applied against that.', _cvss_err)
 
     df['Vulnerability Name'] = df['Vulnerability Name'].fillna('Unknown CVE')
     df['Name_Join']          = _normalize_device_col(df['Name'])
@@ -1269,7 +1305,12 @@ def load_previous_report(file_path):
                                 normalize_device_name(str(_row[_ni] or '')),
                                 extract_cve_id(str(_row[_vi] or '')),
                             ))
-                except Exception:
+                except Exception as _sheet_err:
+                    # Skipping a sheet silently loses every checkbox-resolved pair
+                    # on it, which under-reports month-over-month "resolved" counts
+                    # with no visible symptom. Name the sheet so it's diagnosable.
+                    log.warning("Could not read resolved checkboxes from previous-report "
+                                "sheet '%s': %s", _ws.title, _sheet_err)
                     continue
             _wb_ro.close()
         except ImportError:
@@ -1286,7 +1327,9 @@ def load_previous_report(file_path):
                         checked['Vulnerability Name'].apply(extract_cve_id),
                     ):
                         resolved_pairs.add((nk, ck))
-                except Exception:
+                except Exception as _sheet_err:
+                    log.warning("Could not read resolved checkboxes from previous-report "
+                                "sheet '%s': %s", sheet, _sheet_err)
                     continue
 
         log.info(
