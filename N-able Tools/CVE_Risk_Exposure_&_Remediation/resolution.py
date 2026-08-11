@@ -17,11 +17,14 @@ to flag.
 """
 from __future__ import annotations
 
+import logging
 from typing import Dict, Optional, Set, Tuple, List
 
 import pandas as pd
 
 from data_pipeline import _detect_product, normalize_device_name, extract_cve_id
+
+log = logging.getLogger(__name__)
 
 
 def get_sheet_product_key(raw_affected_products, base_product: str) -> str:
@@ -275,6 +278,17 @@ def compute_resolved_series(
         # Defensive fallback for an unexpected groupby row-count mismatch —
         # should not happen, but fail toward "status column only" rather
         # than raise mid-report-generation.
+        #
+        # Logged loudly: this path silently drops patch-evidence resolution,
+        # so every downstream number built on it (product-sheet checkboxes,
+        # the Resolution Status table, the Health Score) understates what is
+        # actually resolved. A silent degradation here looks like real data.
+        log.warning(
+            "Resolution flags fell back to status-column-only: groupby produced "
+            "%d flag(s) for %d row(s). Patch-evidence resolution is NOT applied "
+            "for this run — resolved counts will be understated.",
+            len(flags), len(df),
+        )
         status_col = ('Threat Status' if 'Threat Status' in df.columns
                       else 'Status' if 'Status' in df.columns else None)
         is_resolved = (df[status_col].astype(str).str.strip().str.upper().eq('RESOLVED')

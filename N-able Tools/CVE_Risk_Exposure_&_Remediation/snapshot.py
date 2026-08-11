@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -176,10 +178,38 @@ def get_root_cause_trend(output_path: str, months: int = 6) -> dict[str, list]:
 # ==============================================================================
 
 def _write_json(path: Path, data) -> None:
-    with open(path, 'w', encoding='utf-8') as fh:
-        json.dump(data, fh, indent=2, default=str)
+    """Write JSON via a temp file in the same directory + os.replace.
+
+    index.json is a read-modify-write accumulator holding the entire run
+    history, so a plain open('w') + json.dump interrupted partway (process
+    killed, machine sleep, or two runs saving concurrently) truncates it and
+    permanently loses every prior entry. os.replace() is atomic on the same
+    filesystem, so readers always see either the old or the new complete file.
+    Matches the pattern already used in cve_lookup.py and version_sync.py.
+    """
+    path = Path(path)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name, suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+            json.dump(data, fh, indent=2, default=str)
+        os.replace(tmp, str(path))
+    except Exception:
+        try: os.unlink(tmp)
+        except OSError: pass
+        raise
 
 
-def _read_json(path: Path):
-    with open(path, 'r', encoding='utf-8') as fh:
-        return json.load(fh)
+def _read_json(path: Path, default=None):
+    """Read JSON, returning `default` if the file is missing or corrupt.
+
+    A snapshot written before the atomic-write fix above (or damaged by any
+    other means) must not take out the whole history window — load_history()
+    skips non-dict results and save() rebuilds a non-list index, so returning
+    the default here degrades one file instead of the entire trend.
+    """
+    try:
+        with open(path, 'r', encoding='utf-8') as fh:
+            return json.load(fh)
+    except (OSError, ValueError) as exc:
+        log.warning("Ignoring unreadable snapshot file %s: %s", path, exc)
+        return default

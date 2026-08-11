@@ -345,14 +345,11 @@ def open_date_picker():
 # ===========================================================================
 
 def _find_cve_repo() -> Path:
-    default = Path(_CVE_REPO_DEFAULT)
-    if default.exists():
-        return default
     here = Path(sys.argv[0]).resolve().parent
     for c in (here / "cvelistV5", here.parent / "cvelistV5"):
         if c.exists():
             return c
-    return default
+    return Path(_CVE_REPO_DEFAULT)
 
 
 def update_cve_list():
@@ -522,11 +519,32 @@ def open_advanced_dialog():
         s = "normal" if include_patch_var.get() else "disabled"
         _pe.configure(state=s)
         _pb.configure(state=s)
+        _tpe.configure(state=s)
         _update_patch_status()
         _update_ready_hint()
 
     ctk.CTkCheckBox(body, text="Include Patch Report matching",
                     variable=include_patch_var, command=_toggle_p).pack(anchor="w", padx=16)
+
+    # Without this the patch report cannot change the outcome of the one case
+    # it is most often supplied for: the scanner still reporting UNRESOLVED for
+    # a CVE the patch report proves installed and version-compliant. Those are
+    # exactly the "contested" pairs reconcile_patch_evidence() drops when this
+    # is off (see resolution.py), so leaving it unreachable made the patch
+    # report's net effect on resolution status zero for that scenario. It was
+    # orphaned in the commented-out block below when the Patch Report picker
+    # above was re-enabled and lifted out of it.
+    _tpe = ctk.CTkCheckBox(body,
+                           text="Trust patch evidence over a stale UNRESOLVED status",
+                           variable=trust_patch_evidence_var,
+                           state="normal" if include_patch_var.get() else "disabled")
+    _tpe.pack(anchor="w", padx=32)
+    Tooltip(_tpe, "N-able's scanner can lag a patch install by a full rescan cycle, so a "
+                  "CVE can still show UNRESOLVED in the detections export after it has "
+                  "actually been patched. Enable to let the patch report resolve those "
+                  "rows. Only applies where the patch report proves the update installed "
+                  "AND version-compliant AND installed on/after the CVE was published — "
+                  "an absence of contradiction is never enough on its own.")
 
     Tooltip(_pe, "The N-able Patch Overview export (Patch, Client, Site, Device, "
                  "Status, Discovered / Install Date). Adds Patch Match Overview, "
@@ -563,15 +581,8 @@ def open_advanced_dialog():
     # ctk.CTkCheckBox(dlg, text="Include Patch Report matching",
     #                 variable=include_patch_var, command=_toggle_p).pack(anchor="w", padx=16)
     #
-    # _tpe = ctk.CTkCheckBox(dlg, text="Trust patch evidence over a stale UNRESOLVED status",
-    #                        variable=trust_patch_evidence_var)
-    # _tpe.pack(anchor="w", padx=32)
-    # Tooltip(_tpe, "N-able's scanner can lag a patch install by a full rescan cycle, so a "
-    #               "CVE can still show UNRESOLVED in the detections export after it has "
-    #               "actually been patched. Enable to let the patch report resolve those "
-    #               "rows. Only applies where the patch report proves the update installed "
-    #               "AND version-compliant AND installed on/after the CVE was published — "
-    #               "an absence of contradiction is never enough on its own.")
+    # (The "Trust patch evidence" checkbox that used to sit here is now LIVE,
+    #  next to the Patch Report picker above — do not re-add it here.)
     #
     # ctk.CTkLabel(dlg, text="Patch Failure Report  (CSV)",
     #              font=ctk.CTkFont(weight="bold")).pack(anchor="w", **PAD)
@@ -1097,6 +1108,8 @@ def _update_patch_status(*_):
         parts.append(f"Failure: {_filename_or_missing(failure_var.get())}")
     if include_browser_audit_var.get():
         parts.append(f"Browser: {_filename_or_missing(browser_audit_var.get())}")
+    if include_patch_check_var.get():
+        parts.append(f"Patch Check: {_filename_or_missing(patch_check_var.get())}")
     patch_status_var.set(
         "Patch evidence: " + "  |  ".join(parts)
         if parts else
@@ -1132,7 +1145,7 @@ for _var in (
     _var.trace_add("write", _update_ready_hint)
 
 for _var in (patch_var, failure_var, include_patch_var, include_failure_var,
-             browser_audit_var, include_browser_audit_var):
+             browser_audit_var, include_browser_audit_var, patch_check_var, include_patch_check_var):
     _var.trace_add("write", _update_patch_status)
 
 # Apply initial state.
