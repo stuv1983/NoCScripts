@@ -144,6 +144,19 @@ INV_REQUIRED = (INV_DEVICE, INV_CLIENT)
 # Output sheet holding one row per device.
 DEVICES_SHEET = "Devices"
 
+# Devices that need chasing: no RMM record at all, or an agent that has stopped
+# checking in.  Written to their own sheet so they can be worked as a list.
+MISSING_SHEET = "Missing from RMM"
+WHY_NO_RMM = "Not in RMM inventory"
+WHY_NEVER = "Never responded"
+WHY_STALE = "No recent response"
+WHY_ORDER = (WHY_NO_RMM, WHY_NEVER, WHY_STALE)
+WHY_STYLE = {
+    WHY_NO_RMM: "Missing",     # red - patched by something we cannot see
+    WHY_NEVER: "Missing",      # red - in the RMM but has never called home
+    WHY_STALE: "Installing",   # yellow - was fine, has gone quiet
+}
+
 # Where a device turned up.
 SEEN_BOTH = "In both reports"
 SEEN_ONLY_1 = "Report 1 only"
@@ -157,7 +170,8 @@ SEEN_STYLE = {
     SEEN_BOTH: None,
 }
 
-# Days since last check-in before a device is flagged.
+# Days since last check-in before a device is flagged.  The upper figure is the
+# default for the "not seen for" box in the GUI and can be changed per run.
 STALE_WARN_DAYS = 7
 STALE_BAD_DAYS = 30
 
@@ -464,9 +478,13 @@ def collect_devices(prev_rows, prev_lookup, curr_rows, curr_lookup, prev_focus, 
         entry["device"] = entry["device"] or info["device"]
         entry["inventory"] = info
 
+    now = dt.datetime.now()
     for key, entry in devices.items():
-        entry.setdefault("inventory", None)
+        info = entry.setdefault("inventory", None) or {}
         entry["device"] = entry["device"] or key
+        entry["last_seen"] = info.get("last_seen")
+        entry["last_seen_text"] = info.get("last_seen_text")
+        entry["days"] = (now - entry["last_seen"]).days if entry["last_seen"] else None
         if entry["in1"] and entry["in2"]:
             entry["seen"] = SEEN_BOTH
         elif entry["in1"]:
@@ -478,7 +496,7 @@ def collect_devices(prev_rows, prev_lookup, curr_rows, curr_lookup, prev_focus, 
     return devices
 
 
-def _write_devices(wb, devices, styles):
+def _write_devices(wb, devices, styles, stale_days):
     ws = wb.create_sheet(DEVICES_SHEET)
     counted = ["Installed", "Pending", "Installing", "Reboot Required", "Failed",
                "Missing", "Ignored"]
@@ -497,15 +515,13 @@ def _write_devices(wb, devices, styles):
                   key=lambda e: (order.get(e["seen"], 99), str(e["client"]).lower(),
                                  str(e["device"]).lower()))
 
-    now = dt.datetime.now()
     for out_row, entry in enumerate(rows, start=2):
         info = entry["inventory"] or {}
-        last_seen = info.get("last_seen")
-        days = (now - last_seen).days if last_seen else None
+        days = entry["days"]
         total_patches = sum(entry["counts"].values())
         values = ([entry["client"], entry["site"], entry["device"], entry["seen"],
                    info.get("type"), info.get("os"),
-                   last_seen or info.get("last_seen_text"), days, info.get("age")] +
+                   entry["last_seen"] or entry["last_seen_text"], days, info.get("age")] +
                   [entry["counts"].get(name, 0) for name in counted] +
                   [total_patches, entry["was_bad"]] +
                   [entry[outcome] for outcome in OUTCOMES])
@@ -523,10 +539,10 @@ def _write_devices(wb, devices, styles):
             # "Never", or a format we do not know.  Either way it needs a flag.
             # A device with nothing in the field at all is left alone, so an
             # export without that column does not come out solid red.
-            if info.get("last_seen_text"):
+            if entry["last_seen_text"]:
                 styles["Missing"].apply(ws.cell(row=out_row, column=col["Last Response"]))
         elif days > STALE_WARN_DAYS:
-            style = styles["Missing"] if days > STALE_BAD_DAYS else styles["Installing"]
+            style = styles["Missing"] if days > stale_days else styles["Installing"]
             style.apply(ws.cell(row=out_row, column=col["Days Since"]))
 
         for name in ("Failed", "Missing"):
@@ -539,6 +555,62 @@ def _write_devices(wb, devices, styles):
 
     _finish_sheet(ws, columns, len(rows) + 1)
     return collections.Counter(entry["seen"] for entry in devices.values())
+
+
+def why_missing(entry, stale_days):
+    """Why a device needs chasing, or None if it is checking in normally.
+
+    Only devices carrying patch rows can be "not in the RMM inventory" - a device
+    that exists solely in the inventory is by definition in the RMM.
+    """
+    if entry["inventory"] is None:
+        return WHY_NO_RMM
+    if entry["days"] is None:
+        # "Never", or a date we could not read.  A blank field tells us nothing,
+        # so it is not treated as a fault.
+        return WHY_NEVER if entry["last_seen_text"] else None
+    return WHY_STALE if entry["days"] > stale_days else None
+
+
+def _write_missing(wb, devices, styles, stale_days):
+    """Sheet of devices with no RMM record or a silent agent."""
+    ws = wb.create_sheet(MISSING_SHEET)
+    columns = ["Client", "Site", "Device", "Why", "Last Response", "Days Since",
+               "Seen in", "Type", "OS", "Device Age", "Patches",
+               "Was Failed/Missing", OUT_OUTSTANDING]
+    _style_header(ws, columns, [26, 20, 24, 20, 20, 12, 16, 14, 40, 12, 10, 18, 13])
+    col = {name: i for i, name in enumerate(columns, start=1)}
+
+    order = {name: i for i, name in enumerate(WHY_ORDER)}
+    flagged = []
+    for entry in devices.values():
+        why = why_missing(entry, stale_days)
+        if why:
+            flagged.append((why, entry))
+    # Worst first: no RMM record, then never seen, then longest silent.
+    flagged.sort(key=lambda pair: (order.get(pair[0], 99), -(pair[1]["days"] or 0),
+                                   str(pair[1]["client"]).lower(),
+                                   str(pair[1]["device"]).lower()))
+
+    for out_row, (why, entry) in enumerate(flagged, start=2):
+        info = entry["inventory"] or {}
+        values = [entry["client"], entry["site"], entry["device"], why,
+                  entry["last_seen"] or entry["last_seen_text"], entry["days"],
+                  entry["seen"], info.get("type"), info.get("os"), info.get("age"),
+                  sum(entry["counts"].values()), entry["was_bad"],
+                  entry[OUT_OUTSTANDING]]
+        for col_idx, value in enumerate(values, start=1):
+            cell = ws.cell(row=out_row, column=col_idx, value=value)
+            if isinstance(value, (dt.datetime, dt.date)):
+                cell.number_format = "dd-mmm-yyyy hh:mm"
+        styles[WHY_STYLE[why]].apply(ws.cell(row=out_row, column=col["Why"]))
+        if entry["days"] is not None:
+            styles[WHY_STYLE[why]].apply(ws.cell(row=out_row, column=col["Days Since"]))
+        if entry[OUT_OUTSTANDING]:
+            styles["Missing"].apply(ws.cell(row=out_row, column=col[OUT_OUTSTANDING]))
+
+    _finish_sheet(ws, columns, len(flagged) + 1)
+    return collections.Counter(why for why, _entry in flagged)
 
 
 def write_output(path, rows, lookup, prev_statuses, prev_devices, prev_focus,
@@ -668,13 +740,24 @@ def write_output(path, rows, lookup, prev_statuses, prev_devices, prev_focus,
     _write_followup(wb, followup_rows, styles)
 
     log("Building the device report ...")
+    stale_days = options["stale_days"]
     devices = collect_devices(prev_rows, prev_lookup, rows, lookup, prev_focus, inventory)
-    seen_counts = _write_devices(wb, devices, styles)
+    seen_counts = _write_devices(wb, devices, styles, stale_days)
     log(f"  {len(devices):,} devices across both reports and the inventory")
+
+    # Without an inventory there is nothing to be missing from, so the sheet is
+    # skipped rather than listing every device as absent from the RMM.
+    if inventory:
+        why_counts = _write_missing(wb, devices, styles, stale_days)
+        log(f"  {sum(why_counts.values()):,} devices missing from the RMM or not "
+            f"responding within {stale_days} days")
+    else:
+        why_counts = collections.Counter()
+        log(f"  no device inventory supplied - skipping the '{MISSING_SHEET}' sheet")
 
     _write_summary(wb, status_counts, change_counts, transitions, outcome_counts,
                    selected, options, styles, total, written, len(prev_focus),
-                   seen_counts)
+                   seen_counts, why_counts, bool(inventory), devices)
 
     wb.save(path)
     log(f"Saved {written:,} rows to {path}")
@@ -687,6 +770,8 @@ def write_output(path, rows, lookup, prev_statuses, prev_devices, prev_focus,
         "written": written,
         "seen_counts": seen_counts,
         "device_total": len(devices),
+        "why_counts": why_counts,
+        "had_inventory": bool(inventory),
     }
 
 
@@ -715,7 +800,7 @@ def _write_followup(wb, followup_rows, styles):
 
 def _write_summary(wb, status_counts, change_counts, transitions, outcome_counts,
                    selected, options, styles, total, written, focus_total,
-                   seen_counts):
+                   seen_counts, why_counts, had_inventory, devices):
     ws = wb.create_sheet("Summary")
     bold = Font(bold=True)
     ws.column_dimensions["A"].width = 42
@@ -759,6 +844,22 @@ def _write_summary(wb, status_counts, change_counts, transitions, outcome_counts
         r += 1
     ws.cell(row=r, column=1, value=f"See the '{DEVICES_SHEET}' sheet for the detail.")
     r += 2
+
+    if had_inventory:
+        stale_days = options["stale_days"]
+        responding = sum(1 for e in devices.values()
+                         if why_missing(e, stale_days) is None)
+        r = heading(r, "Device check-in (last response)")
+        ws.cell(row=r, column=1, value=f"Responding within {stale_days} days").font = bold
+        ws.cell(row=r, column=2, value=responding).font = bold
+        r += 1
+        for why in WHY_ORDER:
+            label = (f"{why} ({stale_days}+ days)" if why == WHY_STALE else why)
+            styles[WHY_STYLE[why]].apply(ws.cell(row=r, column=1, value=label))
+            ws.cell(row=r, column=2, value=why_counts.get(why, 0))
+            r += 1
+        ws.cell(row=r, column=1, value=f"See the '{MISSING_SHEET}' sheet for the detail.")
+        r += 2
 
     r = heading(r, "Legend")
     for status in HIGHLIGHT_STATUSES:
@@ -811,6 +912,7 @@ def _write_summary(wb, status_counts, change_counts, transitions, outcome_counts
         ("Rows in current report", total),
         ("Rows written", written),
         ("Rows filtered", filter_labels[options["filter_mode"]]),
+        ("Flag devices not seen for", f"{options['stale_days']} days"),
         ("Highlight scope", "Entire row" if options["whole_row"] else "Status cell only"),
         ("New rows", "Fill entire row" if options["new_fills_row"] else "Mark Change column"),
         ("Generated", dt.datetime.now().strftime("%Y-%m-%d %H:%M")),
@@ -873,6 +975,7 @@ class PatchReportApp(ttk.Frame):
         self.new_fills_row = tk.BooleanVar(value=False)
         self.whole_row = tk.BooleanVar(value=True)
         self.include_dropped = tk.BooleanVar(value=False)
+        self.stale_days = tk.StringVar(value=str(STALE_BAD_DAYS))
         self.filter_mode = tk.StringVar(value=FILTER_ALL)
         self.open_when_done = tk.BooleanVar(value=True)
         self.status_text = tk.StringVar(value="Select both reports to begin.")
@@ -1028,8 +1131,20 @@ class PatchReportApp(ttk.Frame):
         ttk.Checkbutton(opts, text="Open the output file when finished",
                         variable=self.open_when_done).grid(row=3, column=0, sticky="w", pady=2)
 
+        stale_frame = ttk.Frame(frame)
+        stale_frame.grid(row=3, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(stale_frame, text="Treat a device as missing from the RMM after:").grid(
+            row=0, column=0, sticky="w")
+        ttk.Spinbox(stale_frame, from_=1, to=3650, width=6,
+                    textvariable=self.stale_days).grid(row=0, column=1, padx=6)
+        ttk.Label(stale_frame,
+                  text=("days without a response. Those devices, plus any with no RMM "
+                        "record at all, are listed on the '%s' sheet." % MISSING_SHEET),
+                  foreground="#777777", wraplength=560, justify="left").grid(
+            row=0, column=2, sticky="w")
+
         rows_frame = ttk.Frame(frame)
-        rows_frame.grid(row=3, column=0, sticky="w", pady=(8, 0))
+        rows_frame.grid(row=4, column=0, sticky="w", pady=(8, 0))
         ttk.Label(rows_frame, text="Rows to output:").grid(row=0, column=0, sticky="w", padx=(0, 10))
         for i, (mode, text) in enumerate([
             (FILTER_ALL, "All"),
@@ -1049,7 +1164,9 @@ class PatchReportApp(ttk.Frame):
         self.progress = ttk.Progressbar(frame, mode="determinate", maximum=100)
         self.progress.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
 
-        self.log_widget = tk.Text(frame, height=12, wrap="none", state="disabled",
+        # Deliberately short: this is the only row that stretches, so the log
+        # takes whatever height is left rather than forcing the window taller.
+        self.log_widget = tk.Text(frame, height=8, wrap="none", state="disabled",
                                   font=("Consolas", 9))
         self.log_widget.grid(row=1, column=0, sticky="nsew")
         scroll = ttk.Scrollbar(frame, orient="vertical", command=self.log_widget.yview)
@@ -1162,6 +1279,15 @@ class PatchReportApp(ttk.Frame):
         if os.path.abspath(output) in (os.path.abspath(previous), os.path.abspath(current)):
             messagebox.showerror(APP_TITLE, "The output file must not overwrite a source report.")
             return
+        try:
+            stale_days = int(str(self.stale_days.get()).strip())
+            if stale_days < 1:
+                raise ValueError
+        except ValueError:
+            messagebox.showwarning(
+                APP_TITLE, "'Treat a device as missing from the RMM after' needs a "
+                           "whole number of days, 1 or more.")
+            return
 
         options = {
             "statuses": {s: v.get() for s, v in self.status_vars.items()},
@@ -1169,6 +1295,7 @@ class PatchReportApp(ttk.Frame):
             "new_fills_row": self.new_fills_row.get(),
             "whole_row": self.whole_row.get(),
             "include_dropped": self.include_dropped.get(),
+            "stale_days": stale_days,
             "filter_mode": self.filter_mode.get(),
             "excluded_clients": [name for name, var in self.client_vars.items() if var.get()],
         }
@@ -1222,6 +1349,14 @@ class PatchReportApp(ttk.Frame):
         for name in SEEN_ORDER:
             self.log(f"  {name:<20}{result['seen_counts'].get(name, 0):>8,}")
         self.log("")
+        if result["had_inventory"]:
+            why_counts = result["why_counts"]
+            self.log(f"Missing from the RMM: {sum(why_counts.values()):,} devices")
+            for name in WHY_ORDER:
+                self.log(f"  {name:<22}{why_counts.get(name, 0):>8,}")
+        else:
+            self.log("Missing from the RMM: no device inventory supplied.")
+        self.log("")
         self.log("Current status totals:")
         for status, count in sorted(result["status_counts"].items(), key=lambda kv: -kv[1]):
             self.log(f"  {status:<20}{count:>8,}")
@@ -1256,8 +1391,10 @@ class PatchReportApp(ttk.Frame):
 def main():
     root = tk.Tk()
     root.title(APP_TITLE)
-    root.geometry("960x920")
-    root.minsize(820, 720)
+    root.geometry("1000x980")
+    # Only the log stretches, so the floor is roughly the fixed content plus a
+    # couple of visible log lines.
+    root.minsize(900, 880)
     try:
         ttk.Style().theme_use("vista")
     except tk.TclError:
