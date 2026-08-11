@@ -718,8 +718,8 @@ def write_output(path, rows, lookup, prev_statuses, prev_devices, prev_focus,
 
     # Anything that was Failed or Missing in report 1 and is absent from report 2.
     # These are almost always superseded versions - the old Chrome / Defender
-    # definition disappears once a newer one is offered - so they are counted on
-    # the Summary but kept off the follow-up sheet unless explicitly asked for.
+    # definition disappears once a newer one is offered - so they are counted in
+    # the run log but kept off the follow-up sheet unless explicitly asked for.
     for key, focus in prev_focus.items():
         if key in seen_focus:
             continue
@@ -755,9 +755,10 @@ def write_output(path, rows, lookup, prev_statuses, prev_devices, prev_focus,
         why_counts = collections.Counter()
         log(f"  no device inventory supplied - skipping the '{MISSING_SHEET}' sheet")
 
-    _write_summary(wb, status_counts, change_counts, transitions, outcome_counts,
-                   selected, options, styles, total, written, len(prev_focus),
-                   seen_counts, why_counts, bool(inventory), devices)
+    # Summary sheet turned off - the same figures are reported in the run log.
+    # _write_summary(wb, status_counts, change_counts, transitions, outcome_counts,
+    #                selected, options, styles, total, written, len(prev_focus),
+    #                seen_counts, why_counts, bool(inventory), devices)
 
     wb.save(path)
     log(f"Saved {written:,} rows to {path}")
