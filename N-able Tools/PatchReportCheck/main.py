@@ -128,6 +128,16 @@ IN_FLIGHT = {"pending", "installing", "reboot required"}
 REQUIRED_COLUMNS = ["Client", "Site", "Device", "Status", "Patch"]
 DATE_COLUMN = "Discovered / Install Date"
 
+# Last check-in, carried on every sheet so a row can always be judged on how
+# current the device behind it is.  Both come from the device inventory.
+RESPONSE_COLUMN = "Last Response"
+DAYS_COLUMN = "Days Since"
+
+# Column order for the follow-up sheet.  The row lists built in write_output
+# follow it exactly, so the two must be changed together.
+FOLLOWUP_COLUMNS = ["Client", "Site", "Device", RESPONSE_COLUMN, DAYS_COLUMN,
+                    "Patch", "Report 1 Status", "Report 2 Status", DATE_COLUMN]
+
 # Clients that are ticked for exclusion the first time the list is built.
 DEFAULT_EXCLUDED_CLIENTS = ("Pop-Up Health", "SEN", "Energy Power Systems")
 
@@ -427,7 +437,43 @@ def _finish_sheet(ws, columns, last_row):
     ws.auto_filter.ref = f"A1:{get_column_letter(len(columns))}{max(last_row, 1)}"
 
 
-def collect_devices(prev_rows, prev_lookup, curr_rows, curr_lookup, prev_focus, inventory):
+# A last response carries a time; a patch discovery date does not.
+DATE_FORMATS = {RESPONSE_COLUMN: "dd-mmm-yyyy hh:mm"}
+DEFAULT_DATE_FORMAT = "dd-mmm-yyyy"
+
+
+def _write_row(ws, out_row, columns, values):
+    """Write one row, giving each date cell the format its column calls for."""
+    if len(values) != len(columns):
+        # Caught here rather than letting zip() quietly drop the tail and write
+        # a sheet whose columns no longer line up with their headers.
+        raise ValueError(f"{len(values)} values for {len(columns)} columns")
+    for col_idx, (name, value) in enumerate(zip(columns, values), start=1):
+        cell = ws.cell(row=out_row, column=col_idx, value=value)
+        if isinstance(value, (dt.datetime, dt.date)):
+            cell.number_format = DATE_FORMATS.get(name, DEFAULT_DATE_FORMAT)
+
+
+def response_age(info, now):
+    """(value to show, whole days since) for one device's last response.
+
+    Falls back to the raw text so "Never" - or a date we cannot parse - is shown
+    rather than left blank, in which case there is no day count to give.
+    """
+    last_seen = (info or {}).get("last_seen")
+    if last_seen:
+        return last_seen, (now - last_seen).days
+    return (info or {}).get("last_seen_text"), None
+
+
+def collect_responses(inventory):
+    """{clean device name: (last response, days since)} for every sheet to share."""
+    now = dt.datetime.now()
+    return {key: response_age(info, now) for key, info in inventory.items()}
+
+
+def collect_devices(prev_rows, prev_lookup, curr_rows, curr_lookup, prev_focus,
+                    inventory, responses):
     """One record per device across both reports and the inventory."""
     devices = {}
 
@@ -478,13 +524,11 @@ def collect_devices(prev_rows, prev_lookup, curr_rows, curr_lookup, prev_focus, 
         entry["device"] = entry["device"] or info["device"]
         entry["inventory"] = info
 
-    now = dt.datetime.now()
     for key, entry in devices.items():
         info = entry.setdefault("inventory", None) or {}
         entry["device"] = entry["device"] or key
-        entry["last_seen"] = info.get("last_seen")
         entry["last_seen_text"] = info.get("last_seen_text")
-        entry["days"] = (now - entry["last_seen"]).days if entry["last_seen"] else None
+        entry["response"], entry["days"] = responses.get(key, (None, None))
         if entry["in1"] and entry["in2"]:
             entry["seen"] = SEEN_BOTH
         elif entry["in1"]:
@@ -502,8 +546,8 @@ def _write_devices(wb, devices, styles, stale_days):
                "Missing", "Ignored"]
     # The four outcome columns break "Was Failed/Missing" down in full, so the
     # row adds up: was_bad == outstanding + in progress + resolved + dropped.
-    columns = (["Client", "Site", "Device", "Seen in", "Type", "OS", "Last Response",
-                "Days Since", "Device Age"] + counted +
+    columns = (["Client", "Site", "Device", "Seen in", "Type", "OS", RESPONSE_COLUMN,
+                DAYS_COLUMN, "Device Age"] + counted +
                ["Patches", "Was Failed/Missing"] + list(OUTCOMES))
     widths = ([26, 20, 24, 16, 14, 44, 20, 12, 12] + [11] * len(counted) +
               [10, 18, 13, 12, 11, 19])
@@ -521,14 +565,11 @@ def _write_devices(wb, devices, styles, stale_days):
         total_patches = sum(entry["counts"].values())
         values = ([entry["client"], entry["site"], entry["device"], entry["seen"],
                    info.get("type"), info.get("os"),
-                   entry["last_seen"] or entry["last_seen_text"], days, info.get("age")] +
+                   entry["response"], days, info.get("age")] +
                   [entry["counts"].get(name, 0) for name in counted] +
                   [total_patches, entry["was_bad"]] +
                   [entry[outcome] for outcome in OUTCOMES])
-        for col_idx, value in enumerate(values, start=1):
-            cell = ws.cell(row=out_row, column=col_idx, value=value)
-            if isinstance(value, (dt.datetime, dt.date)):
-                cell.number_format = "dd-mmm-yyyy hh:mm"
+        _write_row(ws, out_row, columns, values)
 
         style_name = SEEN_STYLE[entry["seen"]]
         if style_name:
@@ -540,10 +581,10 @@ def _write_devices(wb, devices, styles, stale_days):
             # A device with nothing in the field at all is left alone, so an
             # export without that column does not come out solid red.
             if entry["last_seen_text"]:
-                styles["Missing"].apply(ws.cell(row=out_row, column=col["Last Response"]))
+                styles["Missing"].apply(ws.cell(row=out_row, column=col[RESPONSE_COLUMN]))
         elif days > STALE_WARN_DAYS:
             style = styles["Missing"] if days > stale_days else styles["Installing"]
-            style.apply(ws.cell(row=out_row, column=col["Days Since"]))
+            style.apply(ws.cell(row=out_row, column=col[DAYS_COLUMN]))
 
         for name in ("Failed", "Missing"):
             if entry["counts"].get(name):
@@ -575,7 +616,7 @@ def why_missing(entry, stale_days):
 def _write_missing(wb, devices, styles, stale_days):
     """Sheet of devices with no RMM record or a silent agent."""
     ws = wb.create_sheet(MISSING_SHEET)
-    columns = ["Client", "Site", "Device", "Why", "Last Response", "Days Since",
+    columns = ["Client", "Site", "Device", "Why", RESPONSE_COLUMN, DAYS_COLUMN,
                "Seen in", "Type", "OS", "Device Age", "Patches",
                "Was Failed/Missing", OUT_OUTSTANDING]
     _style_header(ws, columns, [26, 20, 24, 20, 20, 12, 16, 14, 40, 12, 10, 18, 13])
@@ -595,17 +636,14 @@ def _write_missing(wb, devices, styles, stale_days):
     for out_row, (why, entry) in enumerate(flagged, start=2):
         info = entry["inventory"] or {}
         values = [entry["client"], entry["site"], entry["device"], why,
-                  entry["last_seen"] or entry["last_seen_text"], entry["days"],
+                  entry["response"], entry["days"],
                   entry["seen"], info.get("type"), info.get("os"), info.get("age"),
                   sum(entry["counts"].values()), entry["was_bad"],
                   entry[OUT_OUTSTANDING]]
-        for col_idx, value in enumerate(values, start=1):
-            cell = ws.cell(row=out_row, column=col_idx, value=value)
-            if isinstance(value, (dt.datetime, dt.date)):
-                cell.number_format = "dd-mmm-yyyy hh:mm"
+        _write_row(ws, out_row, columns, values)
         styles[WHY_STYLE[why]].apply(ws.cell(row=out_row, column=col["Why"]))
         if entry["days"] is not None:
-            styles[WHY_STYLE[why]].apply(ws.cell(row=out_row, column=col["Days Since"]))
+            styles[WHY_STYLE[why]].apply(ws.cell(row=out_row, column=col[DAYS_COLUMN]))
         if entry[OUT_OUTSTANDING]:
             styles["Missing"].apply(ws.cell(row=out_row, column=col[OUT_OUTSTANDING]))
 
@@ -619,14 +657,19 @@ def write_output(path, rows, lookup, prev_statuses, prev_devices, prev_focus,
     new_style = styles["__new__"]
     selected = {s for s in HIGHLIGHT_STATUSES if options["statuses"].get(s)}
 
-    columns = ["Client", "Site", "Device", "Status", "Patch", DATE_COLUMN,
-               "Previous Status", "Change"]
-    widths = [26, 20, 24, 16, 62, 20, 18, 16]
+    columns = ["Client", "Site", "Device", RESPONSE_COLUMN, DAYS_COLUMN, "Status",
+               "Patch", DATE_COLUMN, "Previous Status", "Change"]
+    widths = [26, 20, 24, 20, 12, 16, 62, 20, 18, 16]
 
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Patch Report"
     _style_header(ws, columns, widths)
+    col = {name: i for i, name in enumerate(columns, start=1)}
+
+    # Every sheet reports the same check-in figures for a device, so they are
+    # worked out once here and looked up by device name.
+    responses = collect_responses(inventory)
 
     status_counts = {}
     change_counts = {}
@@ -646,6 +689,7 @@ def write_output(path, rows, lookup, prev_statuses, prev_devices, prev_focus,
         status = str(cell_at(row, lookup, "Status") or "").strip()
         change, prev_text = classify(status, key, prev_statuses, prev_devices)
         is_new = change in (CHG_NEW_DEVICE, CHG_NEW_PATCH)
+        response, days = responses.get(key[0], (None, None))
 
         status_counts[status or "(blank)"] = status_counts.get(status or "(blank)", 0) + 1
         change_counts[change] = change_counts.get(change, 0) + 1
@@ -660,10 +704,12 @@ def write_output(path, rows, lookup, prev_statuses, prev_devices, prev_focus,
             outcome = outcome_for(status)
             outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
             was = " / ".join(sorted(focus["statuses"]))
-            followup_rows.append((outcome, [
+            followup_rows.append((outcome, [   # in FOLLOWUP_COLUMNS order
                 display(cell_at(row, lookup, "Client")),
                 display(cell_at(row, lookup, "Site")),
                 display(cell_at(row, lookup, "Device")),
+                response,
+                days,
                 display(cell_at(row, lookup, "Patch")),
                 was,
                 status,
@@ -679,6 +725,8 @@ def write_output(path, rows, lookup, prev_statuses, prev_devices, prev_focus,
             display(cell_at(row, lookup, "Client")),
             display(cell_at(row, lookup, "Site")),
             display(cell_at(row, lookup, "Device")),
+            response,
+            days,
             status,
             display(cell_at(row, lookup, "Patch")),
             cell_at(row, lookup, DATE_COLUMN),
@@ -693,22 +741,20 @@ def write_output(path, rows, lookup, prev_statuses, prev_devices, prev_focus,
         elif status_hl is not None and options["whole_row"]:
             row_hl = status_hl
 
-        for col_idx, value in enumerate(values, start=1):
-            cell = ws.cell(row=out_row, column=col_idx, value=value)
-            if isinstance(value, (dt.datetime, dt.date)):
-                cell.number_format = "dd-mmm-yyyy"
-            if row_hl is not None:
-                row_hl.apply(cell)
+        _write_row(ws, out_row, columns, values)
+        if row_hl is not None:
+            for col_idx in range(1, len(columns) + 1):
+                row_hl.apply(ws.cell(row=out_row, column=col_idx))
 
         # When the row is not filled wholesale, the Status cell still carries
         # its own colour.
         if status_hl is not None and row_hl is None:
-            status_hl.apply(ws.cell(row=out_row, column=4))
+            status_hl.apply(ws.cell(row=out_row, column=col["Status"]))
 
         # New rows are flagged in the Change column even when the row is filled
         # by status, so nothing new can hide behind a status colour.
         if is_new and options["highlight_new"] and not options["new_fills_row"]:
-            new_style.apply(ws.cell(row=out_row, column=8))
+            new_style.apply(ws.cell(row=out_row, column=col["Change"]))
 
         out_row += 1
         written += 1
@@ -727,10 +773,13 @@ def write_output(path, rows, lookup, prev_statuses, prev_devices, prev_focus,
         outcome_counts[OUT_DROPPED] = outcome_counts.get(OUT_DROPPED, 0) + 1
         if not options["include_dropped"]:
             continue
-        followup_rows.append((OUT_DROPPED, [
+        response, days = responses.get(key[0], (None, None))
+        followup_rows.append((OUT_DROPPED, [   # in FOLLOWUP_COLUMNS order
             display(cell_at(row, prev_lookup, "Client")),
             display(cell_at(row, prev_lookup, "Site")),
             display(cell_at(row, prev_lookup, "Device")),
+            response,
+            days,
             display(cell_at(row, prev_lookup, "Patch")),
             " / ".join(sorted(focus["statuses"])),
             "",
@@ -741,7 +790,8 @@ def write_output(path, rows, lookup, prev_statuses, prev_devices, prev_focus,
 
     log("Building the device report ...")
     stale_days = options["stale_days"]
-    devices = collect_devices(prev_rows, prev_lookup, rows, lookup, prev_focus, inventory)
+    devices = collect_devices(prev_rows, prev_lookup, rows, lookup, prev_focus,
+                              inventory, responses)
     seen_counts = _write_devices(wb, devices, styles, stale_days)
     log(f"  {len(devices):,} devices across both reports and the inventory")
 
@@ -778,23 +828,21 @@ def write_output(path, rows, lookup, prev_statuses, prev_devices, prev_focus,
 
 def _write_followup(wb, followup_rows, styles):
     ws = wb.create_sheet(FOLLOWUP_SHEET)
-    columns = ["Client", "Site", "Device", "Patch", "Report 1 Status",
-               "Report 2 Status", "Discovered / Install Date"]
-    _style_header(ws, columns, [26, 20, 24, 62, 16, 18, 22])
+    columns = FOLLOWUP_COLUMNS
+    _style_header(ws, columns, [26, 20, 24, 20, 12, 62, 16, 18, 22])
+    at = {name: i for i, name in enumerate(columns)}  # index into a values list
 
     order = {name: i for i, name in enumerate(OUTCOMES)}
-    followup_rows.sort(
-        key=lambda r: (order.get(r[0], 99), str(r[1][0]), str(r[1][2]), str(r[1][3])))
+    followup_rows.sort(key=lambda r: (order.get(r[0], 99), str(r[1][at["Client"]]),
+                                      str(r[1][at["Device"]]), str(r[1][at["Patch"]])))
 
     for out_row, (outcome, values) in enumerate(followup_rows, start=2):
         # The whole row is coloured by its report 2 status.  Rows that dropped
         # off the report have no status, so they take the outcome's colour.
-        style = styles.get(values[5]) or styles[OUTCOME_STYLE[outcome]]
-        for col_idx, value in enumerate(values, start=1):
-            cell = ws.cell(row=out_row, column=col_idx, value=value)
-            if isinstance(value, (dt.datetime, dt.date)):
-                cell.number_format = "dd-mmm-yyyy"
-            style.apply(cell)
+        style = styles.get(values[at["Report 2 Status"]]) or styles[OUTCOME_STYLE[outcome]]
+        _write_row(ws, out_row, columns, values)
+        for col_idx in range(1, len(columns) + 1):
+            style.apply(ws.cell(row=out_row, column=col_idx))
 
     _finish_sheet(ws, columns, len(followup_rows) + 1)
 
