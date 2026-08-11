@@ -270,8 +270,8 @@ def write_output(path, rows, lookup, prev_statuses, prev_devices, prev_focus,
     selected = {s for s in HIGHLIGHT_STATUSES if options["statuses"].get(s)}
 
     columns = ["Client", "Site", "Device", "Status", "Patch", DATE_COLUMN,
-               "Previous Status", "Change", "Follow-up"]
-    widths = [26, 20, 24, 16, 62, 20, 18, 16, 20]
+               "Previous Status", "Change"]
+    widths = [26, 20, 24, 16, 62, 20, 18, 16]
 
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -310,16 +310,15 @@ def write_output(path, rows, lookup, prev_statuses, prev_devices, prev_focus,
             outcome = outcome_for(status)
             outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
             was = " / ".join(sorted(focus["statuses"]))
-            followup_rows.append([
+            followup_rows.append((outcome, [
                 display(cell_at(row, lookup, "Client")),
                 display(cell_at(row, lookup, "Site")),
                 display(cell_at(row, lookup, "Device")),
                 display(cell_at(row, lookup, "Patch")),
                 was,
                 status,
-                outcome,
                 cell_at(row, lookup, DATE_COLUMN),
-            ])
+            ]))
 
         if options["filter_mode"] == FILTER_CHANGED and change == CHG_UNCHANGED:
             continue
@@ -335,7 +334,6 @@ def write_output(path, rows, lookup, prev_statuses, prev_devices, prev_focus,
             cell_at(row, lookup, DATE_COLUMN),
             prev_text,
             change,
-            outcome,
         ]
 
         status_hl = styles.get(status) if status in selected else None
@@ -362,10 +360,6 @@ def write_output(path, rows, lookup, prev_statuses, prev_devices, prev_focus,
         if is_new and options["highlight_new"] and not options["new_fills_row"]:
             new_style.apply(ws.cell(row=out_row, column=8))
 
-        # Follow-up outcome always gets its own colour - this is the focus.
-        if outcome:
-            styles[OUTCOME_STYLE[outcome]].apply(ws.cell(row=out_row, column=9))
-
         out_row += 1
         written += 1
 
@@ -378,16 +372,15 @@ def write_output(path, rows, lookup, prev_statuses, prev_devices, prev_focus,
             continue
         row = focus["row"]
         outcome_counts[OUT_DROPPED] = outcome_counts.get(OUT_DROPPED, 0) + 1
-        followup_rows.append([
+        followup_rows.append((OUT_DROPPED, [
             display(cell_at(row, prev_lookup, "Client")),
             display(cell_at(row, prev_lookup, "Site")),
             display(cell_at(row, prev_lookup, "Device")),
             display(cell_at(row, prev_lookup, "Patch")),
             " / ".join(sorted(focus["statuses"])),
             "",
-            OUT_DROPPED,
             None,
-        ])
+        ]))
 
     _write_followup(wb, followup_rows, styles)
     _write_summary(wb, status_counts, change_counts, transitions, outcome_counts,
@@ -408,21 +401,22 @@ def write_output(path, rows, lookup, prev_statuses, prev_devices, prev_focus,
 def _write_followup(wb, followup_rows, styles):
     ws = wb.create_sheet("Failed & Missing Follow-up")
     columns = ["Client", "Site", "Device", "Patch", "Report 1 Status",
-               "Report 2 Status", "Outcome", "Discovered / Install Date"]
-    _style_header(ws, columns, [26, 20, 24, 62, 16, 18, 20, 22])
+               "Report 2 Status", "Discovered / Install Date"]
+    _style_header(ws, columns, [26, 20, 24, 62, 16, 18, 22])
 
     order = {name: i for i, name in enumerate(OUTCOMES)}
-    followup_rows.sort(key=lambda r: (order.get(r[6], 99), str(r[0]), str(r[2]), str(r[3])))
+    followup_rows.sort(
+        key=lambda r: (order.get(r[0], 99), str(r[1][0]), str(r[1][2]), str(r[1][3])))
 
-    for out_row, values in enumerate(followup_rows, start=2):
+    for out_row, (outcome, values) in enumerate(followup_rows, start=2):
+        # The whole row is coloured by its report 2 status.  Rows that dropped
+        # off the report have no status, so they take the outcome's colour.
+        style = styles.get(values[5]) or styles[OUTCOME_STYLE[outcome]]
         for col_idx, value in enumerate(values, start=1):
             cell = ws.cell(row=out_row, column=col_idx, value=value)
             if isinstance(value, (dt.datetime, dt.date)):
                 cell.number_format = "dd-mmm-yyyy"
-        style = styles.get(values[5]) if values[5] else None
-        if style is not None:
-            style.apply(ws.cell(row=out_row, column=6))
-        styles[OUTCOME_STYLE[values[6]]].apply(ws.cell(row=out_row, column=7))
+            style.apply(cell)
 
     _finish_sheet(ws, columns, len(followup_rows) + 1)
 
