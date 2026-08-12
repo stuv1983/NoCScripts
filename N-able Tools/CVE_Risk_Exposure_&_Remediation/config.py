@@ -16,6 +16,15 @@ from typing import Set
 log = logging.getLogger(__name__)
 
 # Pre-compiled once here; imported everywhere else.
+#   CVE-        literal prefix (IGNORECASE tolerates 'cve-' in hand-edited data)
+#   \d{4}       the year portion — always exactly four digits
+#   \d{4,7}     the sequence number — 4 digits minimum per the CVE ID syntax;
+#               the upper bound of 7 covers every ID MITRE has issued while
+#               refusing to swallow adjacent digits from surrounding text
+#               (e.g. a version number concatenated after the ID in a
+#               HYPERLINK formula).
+# The capture group lets extract_cve_id() pull the bare ID out of any
+# surrounding text (raw cell, Excel HYPERLINK formula, prose).
 CVE_PATTERN = re.compile(r'(CVE-\d{4}-\d{4,7})', re.IGNORECASE)
 
 # Minimal built-in fallback used ONLY when config.json is absent in test/CI

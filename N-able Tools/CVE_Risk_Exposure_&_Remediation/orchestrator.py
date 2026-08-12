@@ -34,6 +34,7 @@ from data_pipeline import (
     load_patch_failure_report, build_patch_failure_lookup,
     load_patch_check_report, build_patch_check_failure_lookup,
     load_browser_audit, merge_browser_audit_into_drift,
+    check_customer_consistency,
 )
 from diagnostics import compute_patch_diagnostics, classify_root_cause
 from resolution import reconcile_patch_evidence
@@ -311,6 +312,17 @@ def run(request: DashboardRequest) -> DashboardResult:
                       source_name=Path(request.rmm_path).name,
                       warnings=warnings)
 
+        # Customer safety net — refuse to merge exports that belong to
+        # different customers (or a single file mixing several). This was
+        # fully implemented and tested in data_pipeline but never invoked, so
+        # a device report from the wrong client could merge silently. Runs
+        # BEFORE merge_data so a mismatch aborts before any mixing occurs;
+        # the ValueError it raises surfaces as the run's failure message.
+        check_customer_consistency({
+            'Detections export': df_vuln,
+            'Device report':     df_rmm,
+        })
+
         merged_df = merge_data(df_vuln, df_rmm, request.skip_rmm,
                                exclude_missing_rmm=request.exclude_missing_rmm,
                                as_of_date=run_ts)
@@ -428,6 +440,14 @@ def run(request: DashboardRequest) -> DashboardResult:
             log.info("Loading previous report for trend: %s", request.prev_report_path)
             prev_df, prev_resolved_pairs, prev_source_type = load_previous_report(request.prev_report_path)
             prev_report_name = Path(request.prev_report_path).name
+
+            # Same customer safety net as the current-month inputs: a previous
+            # report from a different client would silently poison every trend
+            # metric (its pairs read as "resolved" because they vanish).
+            check_customer_consistency({
+                'Detections export': df_vuln,
+                'Previous report':   prev_df,
+            })
             inventory_set    = (set(df_rmm['Device_Join'].unique())
                                 if df_rmm is not None else None)
 

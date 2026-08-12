@@ -15,6 +15,7 @@ Author : Stu Villanti <s.villanti@kenstra.com>
 """
 
 import logging
+import math
 import subprocess
 import sys
 import threading
@@ -202,6 +203,12 @@ def process_reports():
     except ValueError:
         messagebox.showerror("Error",
             f"Minimum CVE Score must be a number (e.g. 9.0).\nCurrent value: {score_var.get()!r}")
+        return
+    # float() accepts 'nan'/'inf', which pass the except above but make every
+    # score comparison False — the run would "succeed" with an empty report.
+    if not math.isfinite(threshold) or not (0.0 <= threshold <= 10.0):
+        messagebox.showerror("Error",
+            f"Minimum CVE Score must be between 0.0 and 10.0.\nCurrent value: {score_var.get()!r}")
         return
 
     if not show_all_dates_var.get() and date_var.get().strip():

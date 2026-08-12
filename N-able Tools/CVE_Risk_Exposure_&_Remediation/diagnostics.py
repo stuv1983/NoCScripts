@@ -112,6 +112,16 @@ def classify_baseline_root_cause(row) -> Optional[str]:
 
 def classify_root_cause(row) -> Optional[str]:
     """Returns internal cause code or None. No shadow_it guessing — no path data available."""
+    # A row the SCANNER already reports RESOLVED is not a patch gap of any
+    # kind — classifying it (e.g. as coverage_gap because the closed CVE's
+    # device is absent from the patch report) inflates gap counts and health
+    # penalties with work that is already done. process_patch_match filters
+    # these before matching; this guard keeps the classifier honest if a
+    # caller ever feeds it unfiltered rows. Only 'Threat Status' is checked:
+    # the 'Status' column on patch-match output is the PATCH install status
+    # by contract (see contracts.check_patch_match) and never holds RESOLVED.
+    if str(row.get("Threat Status", "")).strip().upper() == "RESOLVED":
+        return None
     pmr = str(row.get("Patch Match Result",          "")).strip()
     res = str(row.get("Patch Evidence Status","Unresolved")).strip()
     vcr = str(row.get("Version Check Result",        "")).strip()
@@ -248,6 +258,21 @@ def compute_patch_diagnostics(patch_full_df: pd.DataFrame,
         if df.empty:
             return {"patch_lag_df": _e, "version_drift_df": _e,
                     "root_cause_df": _e, "health_score": _no_h}
+
+    # Same reasoning for rows the SCANNER already marks RESOLVED: they are
+    # closed work, not patch gaps. Excluding them here (not just in
+    # classify_root_cause) also keeps them out of the health-score
+    # denominator (total_pairs=len(df)) — leaving them in would silently
+    # dilute every penalty percentage with rows that cannot have a cause.
+    if "Threat Status" in df.columns:
+        _resolved = df["Threat Status"].astype(str).str.strip().str.upper().eq("RESOLVED")
+        if _resolved.any():
+            log.info("Diagnostics: excluding %d row(s) already RESOLVED in the "
+                     "detections export", int(_resolved.sum()))
+            df = df[~_resolved].copy()
+            if df.empty:
+                return {"patch_lag_df": _e, "version_drift_df": _e,
+                        "root_cause_df": _e, "health_score": _no_h}
 
     df["_cause"]          = df.apply(classify_root_cause, axis=1)
     df["_baseline_cause"] = df.apply(classify_baseline_root_cause, axis=1)

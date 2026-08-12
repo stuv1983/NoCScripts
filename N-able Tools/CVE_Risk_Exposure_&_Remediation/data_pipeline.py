@@ -380,17 +380,37 @@ def _is_non_cve_patch(patch_name) -> bool:
     return bool(_NON_CVE_PATCH_RE.search(str(patch_name)))
 
 
-def _detect_product(text):
-    t = _norm_text(str(text))
-    for key, product in PRODUCT_MAP:
-        if _norm_text(key) in t: return product
+# PRODUCT_MAP keys are normalised ONCE here rather than on every call —
+# _detect_product previously re-ran _norm_text over the whole map per row,
+# which multiplied a fleet-scale export (rows × map entries) into millions of
+# redundant regex substitutions. PRODUCT_MAP is bound at import and never
+# mutated in-process (cve_lookup's auto-add writes to config.json for the
+# NEXT run), so both the normalised copy and the lru_cache below are safe.
+_PRODUCT_MAP_NORM = [(_norm_text(k), v) for k, v in PRODUCT_MAP]
+
+@_lru_cache(maxsize=65536)
+def _detect_product_cached(text: str) -> str:
+    t = _norm_text(text)
+    for key, product in _PRODUCT_MAP_NORM:
+        if key in t: return product
     return ''
+
+def _detect_product(text):
+    return _detect_product_cached(str(text))
 
 def _extract_kbs(text) -> list:
     return sorted({kb.upper() for kb in _KB_RE.findall(str(text))})
 
+# Cached core returns an immutable tuple (lru_cache must never hand out a
+# mutable list that one caller could mutate for everyone). Fleet exports
+# repeat the same 'Vulnerability Name' across hundreds of devices, so the
+# regex runs once per distinct string instead of once per row.
+@_lru_cache(maxsize=65536)
+def _extract_cves_cached(text: str) -> tuple:
+    return tuple(sorted({c.upper() for c in _CVE_RE.findall(text)}))
+
 def _extract_cves(text) -> list:
-    return sorted({c.upper() for c in _CVE_RE.findall(str(text))})
+    return list(_extract_cves_cached(str(text)))
 
 def _extract_best_version(text) -> str:
     versions = _VERSION_RE.findall(str(text))
@@ -536,27 +556,45 @@ def _vec_pes(status_s, vcr_s, inst_dt_s, cve_max_s):
 # ==============================================================================
 
 def load_vulnerability_data(file_path: str) -> pd.DataFrame:
-    if str(file_path).lower().endswith(('.xlsx', '.xls')):
-        xl = pd.ExcelFile(file_path, engine=_XLSX_ENGINE)
-        if 'Raw Data' in xl.sheet_names:
-            log.info("Detected dashboard workbook — reading 'Raw Data' sheet")
-            df = xl.parse('Raw Data')
+    # Same actionable error translation as load_data() — this loader reads the
+    # file itself (it needs sheet selection), so without this wrapper the most
+    # common failure on Windows ("[Errno 13] Permission denied" because the
+    # export is open in Excel) reached the user as a raw OS error.
+    try:
+        if str(file_path).lower().endswith(('.xlsx', '.xls')):
+            xl = pd.ExcelFile(file_path, engine=_XLSX_ENGINE)
+            if 'Raw Data' in xl.sheet_names:
+                log.info("Detected dashboard workbook — reading 'Raw Data' sheet")
+                df = xl.parse('Raw Data')
+            else:
+                df = xl.parse(xl.sheet_names[0])
         else:
-            df = xl.parse(xl.sheet_names[0])
-    else:
-        try:
-            df = pd.read_csv(file_path, dtype_backend='pyarrow')
-        except (TypeError, ImportError):
-            # TypeError: pandas < 2.0 doesn't recognise the dtype_backend
-            #            keyword argument at all.
-            # ImportError: pandas recognises the argument but the pyarrow
-            #            package itself isn't installed — this is the
-            #            actual failure mode on a real "pyarrow missing"
-            #            environment, and a bare `except TypeError` never
-            #            catches it, so this would previously crash the
-            #            whole load instead of gracefully falling back to
-            #            the default (numpy-backed) CSV reader.
-            df = pd.read_csv(file_path)
+            try:
+                df = pd.read_csv(file_path, dtype_backend='pyarrow')
+            except (TypeError, ImportError):
+                # TypeError: pandas < 2.0 doesn't recognise the dtype_backend
+                #            keyword argument at all.
+                # ImportError: pandas recognises the argument but the pyarrow
+                #            package itself isn't installed — this is the
+                #            actual failure mode on a real "pyarrow missing"
+                #            environment, and a bare `except TypeError` never
+                #            catches it, so this would previously crash the
+                #            whole load instead of gracefully falling back to
+                #            the default (numpy-backed) CSV reader.
+                df = pd.read_csv(file_path)
+    except FileNotFoundError:
+        raise ValueError(f"Vulnerability report not found:\n{file_path}") from None
+    except PermissionError:
+        raise ValueError(
+            f"Cannot read the vulnerability report — it may be open in Excel "
+            f"or another program:\n{file_path}\n\nClose it and try again."
+        ) from None
+    except UnicodeDecodeError as exc:
+        raise ValueError(
+            f"Could not decode the text in:\n{file_path}\n\n"
+            f"The file may not be a UTF-8 CSV, or may actually be an Excel file "
+            f"saved with a .csv extension. ({exc})"
+        ) from None
 
     df = _rename_cve_columns(df)
 
@@ -983,6 +1021,14 @@ def _apply_cascade_resolution(df: pd.DataFrame) -> pd.DataFrame:
         _unresolved = df[df['Patch Evidence Status'].astype(str).str.strip() == 'Unresolved']
     else:
         _unresolved = df.iloc[0:0]
+
+    # (device, product) → first arch-qualified key. The arch-agnostic
+    # fallback below previously scanned every best_ver key per unresolved row
+    # (O(rows × keys)); this dict makes it a single lookup.
+    _bv_first_by_dev_pk: dict[tuple, tuple] = {}
+    for _k in best_ver:
+        _bv_first_by_dev_pk.setdefault(_k[:2], _k)
+
     for idx, row in _unresolved.iterrows():
         device  = str(row['Name'])
         pk      = str(row.get('_cascade_pk', ''))
@@ -996,8 +1042,8 @@ def _apply_cascade_resolution(df: pd.DataFrame) -> pd.DataFrame:
             key = key_exact
         elif key_neutral in best_ver and not cve_arch:
             key = key_neutral
-        elif not cve_arch and any(k[:2] == (device, pk) for k in best_ver):
-            key = next(k for k in best_ver if k[:2] == (device, pk))
+        elif not cve_arch and (device, pk) in _bv_first_by_dev_pk:
+            key = _bv_first_by_dev_pk[(device, pk)]
         else:
             continue
 
@@ -1093,6 +1139,32 @@ def process_patch_match(patch_path, cve_df, min_score=9.0, as_of_date=None):
         cve = cve[pd.to_numeric(cve['Vulnerability Score'], errors='coerce').fillna(0) >= min_score]
     filtered_rows = len(cve)
 
+    # ── Scanner-RESOLVED filter ──────────────────────────────────────────────
+    # A CVE the detections export already marks RESOLVED must not enter patch
+    # matching at all: it needs no patch evidence (resolution.py source 2
+    # resolves it per-row from the status column), and if the device happens
+    # to be absent from the patch report the row would otherwise come out as
+    # 'Not found in patch report' — feeding classify_root_cause a fake
+    # coverage_gap, penalising the health score, and inflating the patch-gap
+    # warnings for a CVE that is already closed. The scanner's own status
+    # lives in 'Threat Status', or in '_cve_status_orig' when the export
+    # shipped it as a bare 'Status' column (renamed above to avoid colliding
+    # with the patch report's install-status column).
+    _scanner_col = ('Threat Status'     if 'Threat Status'     in cve.columns
+                    else '_cve_status_orig' if '_cve_status_orig' in cve.columns
+                    else None)
+    if _scanner_col is not None:
+        _resolved_mask = (cve[_scanner_col].astype(str).str.strip()
+                          .str.upper().eq('RESOLVED'))
+        _n_resolved = int(_resolved_mask.sum())
+        if _n_resolved:
+            log.info(
+                "Patch match: excluded %d row(s) the detections export already "
+                "marks RESOLVED — they need no patch evidence and must not be "
+                "classified as patch gaps", _n_resolved,
+            )
+            cve = cve[~_resolved_mask].copy()
+
     patch = patch.copy()
 
     # Drop non-CVE maintenance patches (AV signature / driver / firmware)
@@ -1133,6 +1205,18 @@ def process_patch_match(patch_path, cve_df, min_score=9.0, as_of_date=None):
                 cve[dc].astype(str).str.replace(' UTC', '', regex=False),
                 errors='coerce', utc=True).dt.tz_localize(None)
 
+    # Tag each CVE row with its identity BEFORE the merge. pd.merge always
+    # returns a fresh RangeIndex over the (possibly exploded) result — it does
+    # NOT preserve the left frame's index — so the previous pattern of
+    # reset_index() AFTER the merge put the exploded row number in 'index',
+    # which is unique per row, making drop_duplicates a silent no-op: a CVE
+    # row matching several patch rows (e.g. multiple Chrome updates on one
+    # device) survived once per match, duplicating rows in every downstream
+    # sheet and defeating the status-rank sort that was supposed to keep only
+    # the best match.
+    cve = cve.reset_index(drop=True)
+    cve['_orig_row'] = range(len(cve))
+
     merged = cve.merge(
         patch[['_ck', '_sk', '_dk', '_pk', 'Status', 'Patch', '_pd', '_sr', '_kbs', '_pv']]
               .rename(columns={'_ck': '_mck'}),
@@ -1140,10 +1224,11 @@ def process_patch_match(patch_path, cve_df, min_score=9.0, as_of_date=None):
         right_on=['_mck', '_sk', '_dk', '_pk'],
         how='left', suffixes=('', '_p'),
     )
+    # Best match per original CVE row: highest install-status rank first,
+    # most recent install date as tie-break, then keep the first occurrence
+    # of each pre-merge row id.
     merged = merged.sort_values(['_sr', '_pd'], ascending=[False, False], na_position='last')
-    # Avoid MultiIndex.from_product overflow: keep best match per original CVE row.
-    merged = merged.reset_index(drop=False)
-    best   = merged.drop_duplicates(subset='index', keep='first').drop(columns='index')
+    best   = merged.drop_duplicates(subset='_orig_row', keep='first')
 
     # ── Patch Match Result (vectorised) ──────────────────────────────────────
     _has_patch  = best['Patch'].notna()
@@ -1193,7 +1278,12 @@ def process_patch_match(patch_path, cve_df, min_score=9.0, as_of_date=None):
         lambda v: ', '.join(v) if isinstance(v, list) else '')
 
     # ── Version Check Result (vectorised) ────────────────────────────────────
-    _status_s  = best['Status'].astype(str).str.strip()
+    # fillna('') BEFORE astype(str): a row with no patch match has Status=NaN,
+    # and astype(str) alone turns that into the literal string 'nan' — which is
+    # truthy, so _vec_vcr labelled every unmatched row 'Patch not yet
+    # installed' instead of 'No patch evidence' (and the 'No patch evidence'
+    # colour key in patch_sheets.py could never fire).
+    _status_s  = best['Status'].fillna('').astype(str).str.strip()
     _pv_s      = best['Matched Patch Version'].astype(str).str.strip()
     _fv_s      = best['Fixed Version Used'].astype(str).str.strip()
     _bl_s      = best['Product Baseline'].astype(str).str.strip()
@@ -1238,22 +1328,27 @@ def process_patch_match(patch_path, cve_df, min_score=9.0, as_of_date=None):
     _today_ts = (pd.Timestamp(as_of_date) if as_of_date is not None
                  else pd.Timestamp.now()).normalize()
 
-    def _n_days_exposed(row):
-        # Skip rows already confirmed patched
-        if str(row.get('Patch Evidence Status', '')).strip() == 'Patch confirmed - pending rescan':
-            return '✓ Patched'
-        dp = row.get('Date Published', pd.NaT)
-        fd = row.get('First detected',  pd.NaT)
-        anchor = dp if not pd.isna(dp) else fd
-        if pd.isna(anchor):
-            return '—'
-        try:
-            days = (_today_ts - pd.Timestamp(anchor)).days
-            return max(days, 0)
-        except Exception:
-            return '—'
-
-    best['N Days Exposed'] = best.apply(_n_days_exposed, axis=1)
+    # Vectorised: the previous row-by-row .apply dominated patch-match time on
+    # fleet-scale exports (hundreds of thousands of rows). Anchor precedence is
+    # unchanged — Date Published (public disclosure) first, First detected as
+    # the conservative fallback; both columns were already parsed to datetimes
+    # above, so this is pure Series arithmetic.
+    _dp_s = (pd.to_datetime(best['Date Published'], errors='coerce')
+             if 'Date Published' in best.columns
+             else pd.Series(pd.NaT, index=best.index))
+    _fd_s = (pd.to_datetime(best['First detected'], errors='coerce')
+             if 'First detected' in best.columns
+             else pd.Series(pd.NaT, index=best.index))
+    _anchor_s = _dp_s.fillna(_fd_s)
+    # Int64 (nullable) before object keeps whole-number days as ints in Excel
+    # (a plain float path would render 12.0 instead of 12).
+    _days_exposed = ((_today_ts - _anchor_s).dt.days.clip(lower=0)
+                     .astype('Int64').astype(object))
+    _days_exposed[_anchor_s.isna()] = '—'
+    _pes_confirmed = (best['Patch Evidence Status'].astype(str).str.strip()
+                      .eq('Patch confirmed - pending rescan'))
+    _days_exposed[_pes_confirmed] = '✓ Patched'
+    best['N Days Exposed'] = _days_exposed
 
     # Insert N Days Exposed immediately after Date Published (or First detected)
     _cols = best.columns.tolist()
@@ -1370,15 +1465,19 @@ def load_previous_report(file_path):
         target = _data_sheets[0]
         df = xl.parse(target)
 
+        # Shared normalisation — same helper as load_vulnerability_data.
+        # Must run BEFORE the missing-column check (as the raw-export branch
+        # below already does): a Raw Data sheet carrying source-style headers
+        # ('Asset Name', 'CVE ID') is fixed by the rename, and validating
+        # first would reject a file the very next line makes valid.
+        df = _rename_cve_columns(df)
+
         missing = {'Name', 'Vulnerability Name'} - set(df.columns)
         if missing:
             raise ValueError(
                 f"Previous report sheet '{target}' is missing columns: {', '.join(sorted(missing))}.\n"
                 "Please load a dashboard generated by this tool."
             )
-
-        # Shared normalisation — same helper as load_vulnerability_data.
-        df = _rename_cve_columns(df)
 
         df['_Name_Key'] = _normalize_device_col(df['Name'])
         df['_CVE_Key']  = df['Vulnerability Name'].astype(str).apply(extract_cve_id)
